@@ -2,9 +2,9 @@ name: MicroBenchmarks
 
 on:
   push:
-    branches: [ main, shotover-proxy-0.7.3, release-0.7.x ]
+    branches: [ main, release-0.7.x ]
   pull_request:
-    branches: [ main, shotover-proxy-0.7.3, release-0.7.x ]
+    branches: [ main, release-0.7.x ]
   # `workflow_dispatch` allows CodSpeed to trigger backtest
   # performance analysis in order to generate initial data.
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
   benchmarks:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           # this line means that only the main branch writes to the cache

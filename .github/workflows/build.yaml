@@ -2,9 +2,9 @@ name: Build
 
 on:
   push:
-    branches: [ main, shotover-proxy-0.7.3, release-0.7.x ]
+    branches: [ main, release-0.7.x ]
   pull_request:
-    branches: [ main, shotover-proxy-0.7.3, release-0.7.x ]
+    branches: [ main, release-0.7.x ]
 
 # Cancel already running jobs
 concurrency:
@@ -30,11 +30,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: cache custom ubuntu packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: shotover-proxy/build/packages
           key: ubuntu-22.04-packages
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         # We purposefully dont cache here as build_and_test will always be the bottleneck
         # so we should leave the cache alone so build_and_test can make more use of it.
       - name: Install ubuntu packages
