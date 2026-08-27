@@ -59,6 +59,8 @@ chain:
 | [KafkaSinkSingle](#kafkasinksingle)                      | ✅          | Beta                  |
 | [NullSink](#nullsink)                                    | ✅          | Beta                  |
 | [ParallelMap](#parallelmap)                              | ✅          | Alpha                 |
+| [PostgresRedactColumn](#postgresredactcolumn)            | ❌          | Alpha                 |
+| [PostgresSinkSingle](#postgressinksingle)                | ✅          | Alpha                 |
 | [QueryCounter](#querycounter)                            | ❌          | Alpha                 |
 | [QueryTypeFilter](#querytypefilter)                      | ❌          | Alpha                 |
 | [ValkeyCache](#valkeyCache)                              | ❌          | Alpha                 |
@@ -434,6 +436,51 @@ If we have parallelism of 3 then we would have 3 instances of the chain: C1, C2,
           name: "valkey-sink"
           remote_address: "127.0.0.1:6379"
           connect_timeout_ms: 3000
+```
+
+### PostgresRedactColumn
+
+This transform will replace the value of a named result column with a fixed
+replacement string in every row returned to the client. NULL values stay NULL.
+
+The column is matched by name against the row shape in the most recent
+`RowDescription` seen on the connection, which covers both the simple and the
+extended query protocol. The replacement is written as a text format value, so
+redacting a column fetched in binary format hands the client bytes it may fail
+to decode - still redacted, just less politely.
+
+```yaml
+- PostgresRedactColumn:
+    name: "redact-salary"
+    # The result column name to redact, matched exactly.
+    column: "salary"
+    replacement: "[REDACTED]"
+```
+
+### PostgresSinkSingle
+
+This transform will send/receive postgres messages to a single postgres instance.
+
+```yaml
+- PostgresSinkSingle:
+    name: "postgres-sink"
+    # The address of the upstream postgres instance
+    remote_address: "127.0.0.1:5432"
+
+    # Timeout in milliseconds for the sink to connect to the destination
+    connect_timeout_ms: 3000
+
+    # When this field is provided TLS is used when connecting to the remote address.
+    # Removing this field will disable TLS.
+    #tls:
+    #  # Path to the certificate authority file, typically named ca.crt.
+    #  certificate_authority_path: "tls/ca.crt"
+    #  # Path to the certificate file, typically named with a .crt extension.
+    #  certificate_path: "tls/localhost.crt"
+    #  # Path to the private key file, typically named with a .key extension.
+    #  private_key_path: "tls/localhost.key"
+    #  # Enable/disable verifying the hostname of the destination's certificate.
+    #  verify_hostname: true
 ```
 
 ### QueryCounter

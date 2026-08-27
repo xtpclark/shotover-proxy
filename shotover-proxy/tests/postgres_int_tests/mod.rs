@@ -22,10 +22,7 @@ async fn passthrough_standard() {
     assert_eq!(rows[0].get::<_, String>("two"), "text");
 
     // Prepared statement reused with different parameters.
-    let statement = client
-        .prepare("SELECT $1::int4 + $2::int4")
-        .await
-        .unwrap();
+    let statement = client.prepare("SELECT $1::int4 + $2::int4").await.unwrap();
     for (a, b) in [(1, 2), (40, 2), (-1, 1)] {
         let rows = client.query(&statement, &[&a, &b]).await.unwrap();
         assert_eq!(rows[0].get::<_, i32>(0), a + b);
@@ -61,10 +58,7 @@ async fn passthrough_standard() {
 
     // An error inside an explicit transaction, then rollback and reuse.
     client.batch_execute("BEGIN").await.unwrap();
-    client
-        .query("SELECT 1/0", &[])
-        .await
-        .unwrap_err();
+    client.query("SELECT 1/0", &[]).await.unwrap_err();
     client.batch_execute("ROLLBACK").await.unwrap();
     let rows = client.query("SELECT 3::int4", &[]).await.unwrap();
     assert_eq!(rows[0].get::<_, i32>(0), 3);
