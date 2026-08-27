@@ -29,7 +29,8 @@ kafka = [
 ]
 valkey = ["dep:redis-protocol", "dep:csv", "dep:crc16"]
 opensearch = ["dep:atoi", "dep:http", "dep:httparse"]
-default = ["cassandra", "valkey", "kafka", "opensearch"]
+postgres = []
+default = ["cassandra", "valkey", "kafka", "opensearch", "postgres"]
 
 [dependencies]
 uds = { version = "0.4.2", features = ["tokio"] }

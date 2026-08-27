@@ -10,6 +10,7 @@ use crate::tls::{AcceptError, TlsAcceptor};
 use crate::transforms::chain::{TransformChain, TransformChainBuilder};
 use crate::transforms::{ChainState, TransformContextBuilder, TransformContextConfig};
 use anyhow::{Result, anyhow};
+use bytes::BytesMut;
 use futures::future::join_all;
 use futures::{SinkExt, StreamExt};
 use metrics::{Counter, Gauge, counter, gauge};
@@ -543,10 +544,16 @@ pub fn spawn_read_write_tasks<
     in_tx: mpsc::Sender<Messages>,
     mut out_rx: UnboundedReceiver<Messages>,
     out_tx: UnboundedSender<Messages>,
+    read_buffer_seed: Option<BytesMut>,
 ) {
     let (decoder, encoder) = codec.build();
     let mut reader = FramedRead::new(rx, decoder);
     let mut writer = FramedWrite::new(tx, encoder);
+    if let Some(seed) = read_buffer_seed {
+        // Bytes already consumed from the socket before the codec took over
+        // (e.g. by a protocol negotiation prologue) are decoded first.
+        reader.read_buffer_mut().extend_from_slice(&seed);
+    }
 
     // Shutdown flows
     //
@@ -672,6 +679,23 @@ impl<C: CodecBuilder + 'static> Handler<C> {
 
         let local_addr = stream.local_addr()?;
 
+        // Postgres clients negotiate SSL/GSS encryption with untagged pre-startup requests
+        // expecting raw single byte answers, which must happen before the codec (and for TLS,
+        // before the TLS accept) takes over the stream.
+        #[allow(unused_mut)]
+        let mut read_buffer_seed = None;
+        #[allow(unused_mut)]
+        let mut stream = stream;
+        #[cfg(feature = "postgres")]
+        if self.codec.protocol() == MessageType::Postgres {
+            use crate::codec::postgres::{SourcePrologue, source_prologue};
+            match source_prologue(&mut stream, self.tls.is_some()).await? {
+                SourcePrologue::Plaintext { prefix } => read_buffer_seed = Some(prefix),
+                SourcePrologue::TlsRequested => {}
+                SourcePrologue::Disconnected => return Ok(()),
+            }
+        }
+
         if let Some(tls) = &self.tls {
             let tls_stream = match tls.accept(stream).await {
                 Ok(x) => x,
@@ -679,10 +703,26 @@ impl<C: CodecBuilder + 'static> Handler<C> {
                 Err(AcceptError::Failure(err)) => return Err(err),
             };
             let (rx, tx) = tokio::io::split(tls_stream);
-            spawn_read_write_tasks(self.codec.clone(), rx, tx, in_tx, out_rx, out_tx.clone());
+            spawn_read_write_tasks(
+                self.codec.clone(),
+                rx,
+                tx,
+                in_tx,
+                out_rx,
+                out_tx.clone(),
+                read_buffer_seed,
+            );
         } else {
             let (rx, tx) = stream.into_split();
-            spawn_read_write_tasks(self.codec.clone(), rx, tx, in_tx, out_rx, out_tx.clone());
+            spawn_read_write_tasks(
+                self.codec.clone(),
+                rx,
+                tx,
+                in_tx,
+                out_rx,
+                out_tx.clone(),
+                read_buffer_seed,
+            );
         };
 
         let result = self
@@ -904,6 +944,8 @@ impl PendingRequests {
             MessageType::Kafka => PendingRequests::Unsupported,
             #[cfg(feature = "opensearch")]
             MessageType::OpenSearch => PendingRequests::Unsupported,
+            #[cfg(feature = "postgres")]
+            MessageType::Postgres => PendingRequests::Ordered(vec![]),
             MessageType::Dummy => PendingRequests::Unsupported,
         }
     }

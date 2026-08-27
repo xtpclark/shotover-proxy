@@ -47,6 +47,7 @@ If we absolutely need unsafe code, it should be isolated within a separate small
         not(feature = "valkey"),
         not(feature = "kafka"),
         not(feature = "opensearch"),
+        not(feature = "postgres"),
     ),
     allow(dead_code, unused_imports, unused_variables, unused_mut)
 )]
@@ -55,9 +56,10 @@ If we absolutely need unsafe code, it should be isolated within a separate small
     not(feature = "valkey"),
     not(feature = "kafka"),
     not(feature = "opensearch"),
+    not(feature = "postgres"),
 ))]
 compile_error!(
-    "At least one protocol feature must be enabled, e.g. `cassandra`, `valkey`, `kafka` or `opensearch`"
+    "At least one protocol feature must be enabled, e.g. `cassandra`, `valkey`, `kafka`, `opensearch` or `postgres`"
 );
 
 pub mod codec;

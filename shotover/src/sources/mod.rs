@@ -7,6 +7,8 @@ use crate::sources::cassandra::CassandraSourceConfig;
 use crate::sources::kafka::KafkaSourceConfig;
 #[cfg(feature = "opensearch")]
 use crate::sources::opensearch::OpenSearchSourceConfig;
+#[cfg(feature = "postgres")]
+use crate::sources::postgres::PostgresSourceConfig;
 #[cfg(feature = "valkey")]
 use crate::sources::valkey::ValkeySourceConfig;
 use anyhow::Result;
@@ -23,6 +25,8 @@ pub mod cassandra;
 pub mod kafka;
 #[cfg(feature = "opensearch")]
 pub mod opensearch;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 #[cfg(feature = "valkey")]
 pub mod valkey;
 
@@ -91,6 +95,8 @@ pub enum SourceConfig {
     Kafka(KafkaSourceConfig),
     #[cfg(feature = "opensearch")]
     OpenSearch(OpenSearchSourceConfig),
+    #[cfg(feature = "postgres")]
+    Postgres(PostgresSourceConfig),
 }
 
 impl SourceConfig {
@@ -108,6 +114,8 @@ impl SourceConfig {
             SourceConfig::Kafka(r) => r.build(trigger_shutdown_rx, hot_reload_listeners).await,
             #[cfg(feature = "opensearch")]
             SourceConfig::OpenSearch(r) => r.build(trigger_shutdown_rx, hot_reload_listeners).await,
+            #[cfg(feature = "postgres")]
+            SourceConfig::Postgres(r) => r.build(trigger_shutdown_rx, hot_reload_listeners).await,
         }
     }
 
@@ -121,6 +129,8 @@ impl SourceConfig {
             SourceConfig::Kafka(r) => &r.name,
             #[cfg(feature = "opensearch")]
             SourceConfig::OpenSearch(r) => &r.name,
+            #[cfg(feature = "postgres")]
+            SourceConfig::Postgres(r) => &r.name,
         }
     }
 
@@ -134,6 +144,8 @@ impl SourceConfig {
             SourceConfig::Kafka(r) => &r.chain,
             #[cfg(feature = "opensearch")]
             SourceConfig::OpenSearch(r) => &r.chain,
+            #[cfg(feature = "postgres")]
+            SourceConfig::Postgres(r) => &r.chain,
         }
     }
 }

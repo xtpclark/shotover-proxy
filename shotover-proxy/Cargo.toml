@@ -58,9 +58,10 @@ cassandra = ["shotover/cassandra"]
 kafka = ["shotover/kafka"]
 valkey = ["shotover/valkey"]
 opensearch = ["shotover/opensearch"]
+postgres = ["shotover/postgres"]
 cassandra-cpp-driver-tests = ["test-helpers/cassandra-cpp-driver-tests"]
 kafka-cpp-driver-tests = ["test-helpers/kafka-cpp-driver-tests"]
-default = ["cassandra", "kafka", "valkey", "opensearch"]
+default = ["cassandra", "kafka", "valkey", "opensearch", "postgres"]
 
 [[bench]]
 name = "windsock"

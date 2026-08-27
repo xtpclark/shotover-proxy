@@ -102,6 +102,14 @@ impl Transform for QueryCounter {
                 Some(Frame::OpenSearch(_)) => {
                     todo!();
                 }
+                #[cfg(feature = "postgres")]
+                Some(Frame::Postgres(frame)) => {
+                    if let Some(name) = crate::frame::postgres::query_name(frame) {
+                        self.increment_counter(name, "postgres");
+                    } else {
+                        self.increment_counter("unknown".to_string(), "postgres");
+                    }
+                }
                 None => {
                     self.increment_counter("unknown".to_string(), "none");
                 }

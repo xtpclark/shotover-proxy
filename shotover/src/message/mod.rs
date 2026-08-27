@@ -28,6 +28,8 @@ pub enum Metadata {
     Kafka,
     #[cfg(feature = "opensearch")]
     OpenSearch,
+    #[cfg(feature = "postgres")]
+    Postgres,
 }
 
 /// Protocol-agnostic classification of error responses produced by transforms.
@@ -86,6 +88,32 @@ impl Metadata {
             )),
             #[cfg(feature = "opensearch")]
             Metadata::OpenSearch => unimplemented!(),
+            #[cfg(feature = "postgres")]
+            Metadata::Postgres => {
+                use crate::frame::postgres::{BackendMessage, PostgresFrame};
+                let severity = match error_type {
+                    MessageErrorType::Internal => "ERROR",
+                    MessageErrorType::Rejected => "ERROR",
+                };
+                Frame::Postgres(PostgresFrame::Response(vec![
+                    BackendMessage::ErrorResponse {
+                        fields: vec![
+                            (b'S', severity.to_owned()),
+                            (b'V', severity.to_owned()),
+                            // XX000 internal_error, 42501 insufficient_privilege for rejections.
+                            (
+                                b'C',
+                                match error_type {
+                                    MessageErrorType::Internal => "XX000".to_owned(),
+                                    MessageErrorType::Rejected => "42501".to_owned(),
+                                },
+                            ),
+                            (b'M', error),
+                        ],
+                    },
+                    BackendMessage::ReadyForQuery { status: b'I' },
+                ]))
+            }
         }))
     }
 }
@@ -376,6 +404,8 @@ impl Message {
                 MessageType::Dummy => nonzero!(1u32),
                 #[cfg(feature = "opensearch")]
                 MessageType::OpenSearch => todo!(),
+                #[cfg(feature = "postgres")]
+                MessageType::Postgres => nonzero!(1u32),
             },
             MessageInner::Modified { frame } | MessageInner::Parsed { frame, .. } => {
                 match frame.as_ref() {
@@ -388,6 +418,8 @@ impl Message {
                     Frame::Dummy => nonzero!(1u32),
                     #[cfg(feature = "opensearch")]
                     Frame::OpenSearch(_) => todo!(),
+                    #[cfg(feature = "postgres")]
+                    Frame::Postgres(_) => nonzero!(1u32),
                 }
             }
         })
@@ -420,6 +452,8 @@ impl Message {
             Some(Frame::Dummy) => todo!(),
             #[cfg(feature = "opensearch")]
             Some(Frame::OpenSearch(_)) => todo!(),
+            #[cfg(feature = "postgres")]
+            Some(Frame::Postgres(frame)) => crate::frame::postgres::query_type(frame),
             None => QueryType::ReadWrite,
         }
     }
@@ -477,6 +511,8 @@ impl Message {
                 MessageType::Dummy => Err(anyhow!("Dummy has no metadata")),
                 #[cfg(feature = "opensearch")]
                 MessageType::OpenSearch => Err(anyhow!("OpenSearch has no metadata")),
+                #[cfg(feature = "postgres")]
+                MessageType::Postgres => Ok(Metadata::Postgres),
             },
             MessageInner::Parsed { frame, .. } | MessageInner::Modified { frame } => {
                 match frame.as_ref() {
@@ -489,6 +525,8 @@ impl Message {
                     Frame::Dummy => Err(anyhow!("dummy has no metadata")),
                     #[cfg(feature = "opensearch")]
                     Frame::OpenSearch(_) => Err(anyhow!("OpenSearch has no metadata")),
+                    #[cfg(feature = "postgres")]
+                    Frame::Postgres(_) => Ok(Metadata::Postgres),
                 }
             }
         }
@@ -521,6 +559,20 @@ impl Message {
             },
             #[cfg(feature = "opensearch")]
             MessageType::OpenSearch => false,
+            #[cfg(feature = "postgres")]
+            MessageType::Postgres => {
+                use crate::frame::postgres::{FrontendMessage, PostgresFrame};
+                match self.frame() {
+                    Some(Frame::Postgres(PostgresFrame::Request(message))) => matches!(
+                        message,
+                        FrontendMessage::Terminate
+                            | FrontendMessage::CopyData(_)
+                            | FrontendMessage::Flush
+                            | FrontendMessage::CancelRequest { .. }
+                    ),
+                    _ => false,
+                }
+            }
             MessageType::Dummy => true,
         }
     }
@@ -548,6 +600,8 @@ impl Message {
                 Metadata::Kafka => unimplemented!(),
                 #[cfg(feature = "opensearch")]
                 Metadata::OpenSearch => unimplemented!(),
+                #[cfg(feature = "postgres")]
+                Metadata::Postgres => unimplemented!(),
             },
             // reachable with feature = cassandra
             #[allow(unreachable_code)]
@@ -587,6 +641,8 @@ impl Message {
                     Frame::Dummy => None,
                     #[cfg(feature = "opensearch")]
                     Frame::OpenSearch(_) => None,
+                    #[cfg(feature = "postgres")]
+                    Frame::Postgres(_) => None,
                 }
             }
             None => None,

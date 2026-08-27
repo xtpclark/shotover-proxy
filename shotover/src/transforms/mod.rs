@@ -28,6 +28,8 @@ pub mod null;
 #[cfg(all(feature = "alpha-transforms", feature = "opensearch"))]
 pub mod opensearch;
 pub mod parallel_map;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod query_counter;
 pub mod tee;
 #[cfg(feature = "cassandra")]

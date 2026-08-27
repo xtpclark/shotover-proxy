@@ -13,6 +13,8 @@ use cassandra_protocol::compression::Compression;
 use kafka::KafkaFrame;
 #[cfg(feature = "opensearch")]
 pub use opensearch::OpenSearchFrame;
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresFrame;
 #[cfg(feature = "valkey")]
 pub use redis_protocol::resp2::types::BytesFrame as ValkeyFrame;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -23,6 +25,8 @@ pub mod cassandra;
 pub mod kafka;
 #[cfg(feature = "opensearch")]
 pub mod opensearch;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 #[cfg(feature = "valkey")]
 pub mod valkey;
 pub mod value;
@@ -37,6 +41,8 @@ pub enum MessageType {
     Kafka,
     #[cfg(feature = "opensearch")]
     OpenSearch,
+    #[cfg(feature = "postgres")]
+    Postgres,
     Dummy,
 }
 
@@ -51,6 +57,8 @@ impl MessageType {
             MessageType::Kafka => true,
             #[cfg(feature = "opensearch")]
             MessageType::OpenSearch => true,
+            #[cfg(feature = "postgres")]
+            MessageType::Postgres => true,
             MessageType::Dummy => false,
         }
     }
@@ -67,6 +75,8 @@ impl From<&CodecState> for MessageType {
             CodecState::Kafka { .. } => Self::Kafka,
             #[cfg(feature = "opensearch")]
             CodecState::OpenSearch => Self::OpenSearch,
+            #[cfg(feature = "postgres")]
+            CodecState::Postgres { .. } => Self::Postgres,
             CodecState::Dummy => Self::Dummy,
         }
     }
@@ -89,6 +99,8 @@ impl Frame {
             Frame::Dummy => CodecState::Dummy,
             #[cfg(feature = "opensearch")]
             Frame::OpenSearch(_) => CodecState::OpenSearch,
+            #[cfg(feature = "postgres")]
+            Frame::Postgres(frame) => CodecState::Postgres(frame.as_codec_state()),
         }
     }
 }
@@ -107,6 +119,8 @@ pub enum Frame {
     Dummy,
     #[cfg(feature = "opensearch")]
     OpenSearch(OpenSearchFrame),
+    #[cfg(feature = "postgres")]
+    Postgres(PostgresFrame),
 }
 
 impl Frame {
@@ -131,6 +145,9 @@ impl Frame {
             MessageType::OpenSearch => Ok(Box::new(Frame::OpenSearch(
                 OpenSearchFrame::from_bytes(&bytes)?,
             ))),
+            #[cfg(feature = "postgres")]
+            MessageType::Postgres => PostgresFrame::from_bytes(bytes, codec_state.as_postgres())
+                .map(|x| Box::new(Frame::Postgres(x))),
         }
     }
 
@@ -145,6 +162,8 @@ impl Frame {
             Frame::Dummy => "Dummy",
             #[cfg(feature = "opensearch")]
             Frame::OpenSearch(_) => "OpenSearch",
+            #[cfg(feature = "postgres")]
+            Frame::Postgres(_) => "Postgres",
         }
     }
 
@@ -159,6 +178,8 @@ impl Frame {
             Frame::Dummy => MessageType::Dummy,
             #[cfg(feature = "opensearch")]
             Frame::OpenSearch(_) => MessageType::OpenSearch,
+            #[cfg(feature = "postgres")]
+            Frame::Postgres(_) => MessageType::Postgres,
         }
     }
 
@@ -218,6 +239,17 @@ impl Frame {
             )),
         }
     }
+
+    #[cfg(feature = "postgres")]
+    pub fn into_postgres(self) -> Result<PostgresFrame> {
+        match self {
+            Frame::Postgres(frame) => Ok(frame),
+            frame => Err(anyhow!(
+                "Expected postgres frame but received {} frame",
+                frame.name()
+            )),
+        }
+    }
 }
 
 impl Display for Frame {
@@ -232,6 +264,8 @@ impl Display for Frame {
             Frame::Dummy => write!(f, "Shotover internal dummy message"),
             #[cfg(feature = "opensearch")]
             Frame::OpenSearch(frame) => write!(f, "OpenSearch: {frame:?}"),
+            #[cfg(feature = "postgres")]
+            Frame::Postgres(frame) => write!(f, "Postgres {frame}"),
         }
     }
 }

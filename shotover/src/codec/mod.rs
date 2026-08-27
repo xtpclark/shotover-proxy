@@ -7,6 +7,8 @@ use core::fmt;
 #[cfg(feature = "kafka")]
 use kafka::KafkaCodecState;
 use metrics::{Histogram, histogram};
+#[cfg(feature = "postgres")]
+use postgres::PostgresCodecState;
 use tokio_util::codec::{Decoder, Encoder};
 
 #[cfg(feature = "cassandra")]
@@ -15,6 +17,8 @@ pub mod cassandra;
 pub mod kafka;
 #[cfg(feature = "opensearch")]
 pub mod opensearch;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 #[cfg(feature = "valkey")]
 pub mod valkey;
 
@@ -65,6 +69,8 @@ pub enum CodecState {
     Dummy,
     #[cfg(feature = "opensearch")]
     OpenSearch,
+    #[cfg(feature = "postgres")]
+    Postgres(PostgresCodecState),
 }
 
 impl CodecState {
@@ -84,6 +90,16 @@ impl CodecState {
             CodecState::Kafka(state) => *state,
             _ => {
                 panic!("This is a {self:?}, expected CodecState::Kafka")
+            }
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    pub fn as_postgres(&self) -> PostgresCodecState {
+        match self {
+            CodecState::Postgres(state) => *state,
+            _ => {
+                panic!("This is a {self:?}, expected CodecState::Postgres")
             }
         }
     }
