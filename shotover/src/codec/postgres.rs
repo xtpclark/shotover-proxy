@@ -78,6 +78,27 @@ pub async fn source_prologue(
     }
 }
 
+/// Sends an SSLRequest on a fresh connection to a postgres server and reads the
+/// raw single byte answer. The TLS handshake may only begin after an 'S' answer.
+pub async fn sink_tls_prologue(stream: &mut TcpStream) -> Result<()> {
+    let mut request = [0u8; 8];
+    request[0..4].copy_from_slice(&8i32.to_be_bytes());
+    request[4..8].copy_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+    stream.write_all(&request).await?;
+    let mut answer = [0u8; 1];
+    stream.read_exact(&mut answer).await?;
+    match answer[0] {
+        b'S' => Ok(()),
+        b'N' => Err(anyhow!(
+            "This postgres server does not support TLS but the sink has TLS configured"
+        )),
+        other => Err(anyhow!(
+            "Unexpected answer {:?} to SSLRequest",
+            other as char
+        )),
+    }
+}
+
 /// Per message connection level state needed to parse and reencode postgres messages.
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub struct PostgresCodecState {

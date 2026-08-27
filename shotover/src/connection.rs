@@ -42,6 +42,17 @@ impl SinkConnection {
         let (connection_closed_tx, connection_closed_rx) = mpsc::channel(1);
 
         if let Some(tls) = tls.as_ref() {
+            // Postgres servers expect an SSLRequest and answer it with a raw 'S' before
+            // the TLS handshake may begin, so the handshake runs over a prepared stream.
+            #[cfg(feature = "postgres")]
+            let tls_stream = if codec_builder.protocol() == crate::frame::MessageType::Postgres {
+                let mut tcp_stream = tcp::tcp_stream(connect_timeout, destination).await?;
+                crate::codec::postgres::sink_tls_prologue(&mut tcp_stream).await?;
+                tls.connect_over_stream(host, tcp_stream).await?
+            } else {
+                tls.connect(connect_timeout, host).await?
+            };
+            #[cfg(not(feature = "postgres"))]
             let tls_stream = tls.connect(connect_timeout, host).await?;
             let (rx, tx) = split(tls_stream);
             spawn_read_write_tasks(

@@ -227,6 +227,21 @@ impl TlsConnector {
             .await
             .context("Failed to establish TLS connection to destination")
     }
+
+    /// Performs the TLS handshake over an already established TCP stream.
+    /// Used by protocols that negotiate on the plain stream before the handshake
+    /// (e.g. the postgres SSLRequest).
+    pub async fn connect_over_stream<A: ToHostname + std::fmt::Debug>(
+        &self,
+        address: A,
+        tcp_stream: TcpStream,
+    ) -> Result<TlsStreamClient<TcpStream>> {
+        let servername = address.to_servername()?;
+        self.connector
+            .connect(servername, tcp_stream)
+            .await
+            .context("Failed to establish TLS connection to destination")
+    }
 }
 
 #[derive(Debug)]

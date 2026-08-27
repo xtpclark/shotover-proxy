@@ -104,6 +104,13 @@ sets are buffered in full while passing through shotover.
 Authentication is passed through to the sink database: shotover holds no credentials.
 cleartext, md5 and SCRAM-SHA-256 all work unmodified.
 
+SCRAM channel binding (`SCRAM-SHA-256-PLUS`) cannot pass through when shotover terminates
+TLS, because the client would bind its proof to shotover's certificate while the server
+verifies against its own. This is a property of SCRAM's downgrade protection, not something
+a credential-less proxy can work around. When shotover terminates TLS in front of a
+channel-binding-capable server, clients must not use channel binding (libpq
+`channel_binding=disable`), or the deployment must use a non-SCRAM auth method.
+
 ## Valkey
 
 ```yaml
