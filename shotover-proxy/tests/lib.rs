@@ -10,6 +10,8 @@ mod cassandra_int_tests;
 mod kafka_int_tests;
 #[cfg(all(feature = "alpha-transforms", feature = "opensearch"))]
 mod opensearch_int_tests;
+#[cfg(feature = "postgres")]
+mod postgres_int_tests;
 #[cfg(feature = "valkey")]
 mod runner;
 #[cfg(feature = "valkey")]
