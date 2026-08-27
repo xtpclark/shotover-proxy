@@ -1,0 +1,9 @@
+sources:
+  - Postgres:
+      name: "postgres"
+      listen_addr: "127.0.0.1:15432"
+      chain:
+        - PostgresSinkSingle:
+            name: "postgres-sink"
+            remote_address: "127.0.0.1:5432"
+            connect_timeout_ms: 3000

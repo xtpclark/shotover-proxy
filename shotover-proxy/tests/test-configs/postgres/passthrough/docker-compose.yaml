@@ -1,0 +1,9 @@
+services:
+  postgres-one:
+    image: postgres:18
+    container_name: postgres-one
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: shotover
