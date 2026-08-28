@@ -29,7 +29,7 @@ kafka = [
 ]
 valkey = ["dep:redis-protocol", "dep:csv", "dep:crc16"]
 opensearch = ["dep:atoi", "dep:http", "dep:httparse"]
-postgres = []
+postgres = ["dep:pg_query"]
 default = ["cassandra", "valkey", "kafka", "opensearch", "postgres"]
 
 [dependencies]
@@ -50,6 +50,7 @@ governor = { version = "0.10", default-features = false, features = [
 nonzero_ext = "0.3.0"
 version-compare = { version = "0.2", optional = true }
 rand = { workspace = true }
+pg_query = { version = "6", optional = true }
 lz4_flex = { version = "0.13.0", optional = true }
 clap.workspace = true
 itertools.workspace = true

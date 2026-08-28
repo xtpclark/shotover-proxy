@@ -1140,34 +1140,270 @@ pub fn query_name(frame: &PostgresFrame) -> Option<String> {
 }
 
 /// Classifies a request for QueryCounter and QueryTypeFilter.
-pub fn query_type(frame: &PostgresFrame) -> crate::message::QueryType {
+/// The result of statically analysing a SQL string with the real postgres grammar.
+/// Drives both query classification (QueryCounter/QueryTypeFilter) and read/write-split routing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SqlAnalysis {
+    pub query_type: crate::message::QueryType,
+    /// True iff every statement is a pure read: safe to route to a read replica.
+    /// A statement is NOT replica-safe if it writes (incl. a data-modifying CTE), is DDL,
+    /// takes row locks (FOR UPDATE/SHARE), does SELECT INTO, calls a known writing function
+    /// (nextval/setval), or is anything the analysis could not prove read-only.
+    pub replica_safe: bool,
+    /// The statement changes session state that later statements may depend on
+    /// (SET, named PREPARE, LISTEN, DECLARE CURSOR, temp table): once seen, the whole
+    /// session must pin to the primary so that state is visible to subsequent requests.
+    pub pins_session: bool,
+}
+
+/// Functions that write despite appearing inside an otherwise read-only statement.
+/// A `SELECT nextval('s')` must go to the primary or it errors on a read-only replica.
+fn is_writing_function(name: &str) -> bool {
+    let bare = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+    matches!(
+        bare.as_str(),
+        "nextval" | "setval" | "pg_logical_emit_message" | "pg_create_restore_point"
+    )
+}
+
+/// Analyses a SQL string using the postgres grammar (libpg_query via pg_query).
+/// Falls back to a keyword heuristic when the parser cannot parse the string.
+pub fn analyze_sql(sql: &str) -> SqlAnalysis {
     use crate::message::QueryType;
-    match frame {
-        PostgresFrame::Request(
-            FrontendMessage::Query { query } | FrontendMessage::Parse { query, .. },
-        ) => {
-            let first_word = query
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_ascii_uppercase();
-            match first_word.as_str() {
-                "SELECT" | "SHOW" | "FETCH" | "EXPLAIN" | "VALUES" | "TABLE" => QueryType::Read,
-                "INSERT" | "UPDATE" | "DELETE" | "COPY" | "MERGE" => QueryType::Write,
-                "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "GRANT" | "REVOKE" | "COMMENT" => {
-                    QueryType::SchemaChange
+    use pg_query::NodeEnum;
+
+    let parsed = match pg_query::parse(sql) {
+        Ok(parsed) => parsed,
+        // An empty statement (e.g. just a comment) is a harmless read; anything else that
+        // fails to parse is routed conservatively via the keyword fallback.
+        Err(_) => {
+            return SqlAnalysis {
+                query_type: query_type_by_keyword(sql),
+                replica_safe: false,
+                pins_session: false,
+            };
+        }
+    };
+
+    // These helpers walk the ENTIRE parse tree, so a DML statement hidden in a CTE
+    // (WITH x AS (INSERT ...) SELECT ...) is caught here as a write.
+    let writes_tables = !parsed.dml_tables().is_empty();
+    let ddl_tables = !parsed.ddl_tables().is_empty();
+    let writing_function = parsed.functions().iter().any(|f| is_writing_function(f));
+
+    let mut replica_safe = !writes_tables && !ddl_tables && !writing_function;
+    let mut pins_session = false;
+    let mut saw_read = false;
+    let mut saw_write = writes_tables;
+    let mut saw_ddl = ddl_tables;
+
+    for stmt in &parsed.protobuf.stmts {
+        let Some(node) = stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
+            continue;
+        };
+        match node {
+            NodeEnum::SelectStmt(select) => {
+                // Row-level locks and SELECT INTO both write, so they leave the replica-safe set.
+                if !select.locking_clause.is_empty() || select.into_clause.is_some() {
+                    replica_safe = false;
+                    saw_write = true;
+                } else {
+                    saw_read = true;
                 }
-                _ => QueryType::ReadWrite,
             }
+            NodeEnum::VariableShowStmt(_) => saw_read = true,
+            NodeEnum::VariableSetStmt(_) => {
+                replica_safe = false;
+                pins_session = true;
+            }
+            NodeEnum::PrepareStmt(_)
+            | NodeEnum::DeclareCursorStmt(_)
+            | NodeEnum::ListenStmt(_)
+            | NodeEnum::UnlistenStmt(_)
+            | NodeEnum::DeallocateStmt(_) => {
+                replica_safe = false;
+                pins_session = true;
+            }
+            NodeEnum::CreateStmt(create) => {
+                saw_ddl = true;
+                replica_safe = false;
+                // A temporary table lives only on its own backend, so the session must pin.
+                if create
+                    .relation
+                    .as_ref()
+                    .map(|r| r.relpersistence == "t")
+                    .unwrap_or(false)
+                {
+                    pins_session = true;
+                }
+            }
+            NodeEnum::TransactionStmt(_) => {
+                // Transaction control is routed to the primary/current node by the router.
+                replica_safe = false;
+            }
+            NodeEnum::InsertStmt(_)
+            | NodeEnum::UpdateStmt(_)
+            | NodeEnum::DeleteStmt(_)
+            | NodeEnum::MergeStmt(_)
+            | NodeEnum::CopyStmt(_) => {
+                saw_write = true;
+                replica_safe = false;
+            }
+            // Anything not positively identified as a read is treated as a write.
+            _ => {
+                replica_safe = false;
+                saw_write = true;
+            }
+        }
+    }
+
+    let query_type = if saw_ddl {
+        QueryType::SchemaChange
+    } else if saw_write {
+        QueryType::Write
+    } else if saw_read {
+        QueryType::Read
+    } else {
+        QueryType::ReadWrite
+    };
+
+    SqlAnalysis {
+        query_type,
+        replica_safe,
+        pins_session,
+    }
+}
+
+/// Keyword-only fallback classifier, used when the grammar parser cannot parse the string.
+fn query_type_by_keyword(sql: &str) -> crate::message::QueryType {
+    use crate::message::QueryType;
+    let first_word = sql.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+    match first_word.as_str() {
+        "SELECT" | "SHOW" | "FETCH" | "EXPLAIN" | "VALUES" | "TABLE" => QueryType::Read,
+        "INSERT" | "UPDATE" | "DELETE" | "COPY" | "MERGE" => QueryType::Write,
+        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "GRANT" | "REVOKE" | "COMMENT" => {
+            QueryType::SchemaChange
         }
         _ => QueryType::ReadWrite,
     }
 }
 
+/// Analyses the SQL carried by a request frame, if it carries any.
+pub fn analyze_frame(frame: &PostgresFrame) -> Option<SqlAnalysis> {
+    match frame {
+        PostgresFrame::Request(
+            FrontendMessage::Query { query } | FrontendMessage::Parse { query, .. },
+        ) => Some(analyze_sql(query)),
+        _ => None,
+    }
+}
+
+pub fn query_type(frame: &PostgresFrame) -> crate::message::QueryType {
+    analyze_frame(frame)
+        .map(|analysis| analysis.query_type)
+        .unwrap_or(crate::message::QueryType::ReadWrite)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::QueryType;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_analyze_reads_are_replica_safe() {
+        for sql in [
+            "SELECT * FROM orders",
+            "SELECT count(*) FROM orders WHERE id > 5",
+            "SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.cust",
+            "WITH recent AS (SELECT * FROM orders LIMIT 10) SELECT * FROM recent",
+            "SHOW server_version",
+            "VALUES (1), (2)",
+        ] {
+            let a = analyze_sql(sql);
+            assert!(a.replica_safe, "expected replica-safe: {sql}");
+            assert!(!a.pins_session, "expected no session pin: {sql}");
+            assert_eq!(a.query_type, QueryType::Read, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_analyze_writes_and_locks_go_to_primary() {
+        // Plain writes.
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1 WHERE id = 2",
+            "DELETE FROM t WHERE id = 2",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+        ] {
+            let a = analyze_sql(sql);
+            assert!(!a.replica_safe, "write must not be replica-safe: {sql}");
+            assert_eq!(a.query_type, QueryType::Write, "{sql}");
+        }
+        // The subtle cases that a keyword classifier gets wrong:
+        // a data-modifying CTE under a leading SELECT, and row-locking reads.
+        for sql in [
+            "WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x",
+            "WITH x AS (UPDATE t SET a=1 RETURNING id) SELECT * FROM x",
+            "SELECT * FROM t FOR UPDATE",
+            "SELECT * FROM t FOR SHARE",
+            "SELECT nextval('my_seq')",
+            "SELECT * INTO new_t FROM t",
+        ] {
+            let a = analyze_sql(sql);
+            assert!(
+                !a.replica_safe,
+                "hidden write must not be replica-safe: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_analyze_ddl_is_schema_change() {
+        for sql in ["CREATE TABLE t (a int)", "ALTER TABLE t ADD COLUMN b int", "DROP TABLE t"] {
+            let a = analyze_sql(sql);
+            assert!(!a.replica_safe, "{sql}");
+            assert_eq!(a.query_type, QueryType::SchemaChange, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_analyze_session_state_pins() {
+        for sql in [
+            "SET search_path = myschema",
+            "PREPARE p AS SELECT 1",
+            "LISTEN channel",
+            "DECLARE c CURSOR FOR SELECT * FROM t",
+            "CREATE TEMP TABLE tmp (a int)",
+        ] {
+            let a = analyze_sql(sql);
+            assert!(a.pins_session, "expected session pin: {sql}");
+            assert!(!a.replica_safe, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_analyze_unparseable_is_conservative() {
+        // Garbage that libpg_query rejects must never be called replica-safe.
+        let a = analyze_sql("NOT VALID SQL @#$");
+        assert!(!a.replica_safe);
+    }
+
+    #[test]
+    fn test_analyze_frame_classifies_query_and_parse() {
+        let read = PostgresFrame::Request(FrontendMessage::Query {
+            query: "SELECT 1".to_owned(),
+        });
+        assert_eq!(query_type(&read), QueryType::Read);
+        let write = PostgresFrame::Request(FrontendMessage::Parse {
+            statement_name: "s".to_owned(),
+            query: "DELETE FROM t".to_owned(),
+            parameter_data_types: vec![],
+        });
+        assert_eq!(query_type(&write), QueryType::Write);
+        // A non-SQL frame has no analysis.
+        assert!(analyze_frame(&PostgresFrame::Request(FrontendMessage::Sync)).is_none());
+    }
 
     fn round_trip(bytes: &[u8], state: PostgresCodecState) -> PostgresFrame {
         let frame = PostgresFrame::from_bytes(Bytes::copy_from_slice(bytes), state).unwrap();
