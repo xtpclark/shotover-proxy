@@ -111,6 +111,13 @@ a credential-less proxy can work around. When shotover terminates TLS in front o
 channel-binding-capable server, clients must not use channel binding (libpq
 `channel_binding=disable`), or the deployment must use a non-SCRAM auth method.
 
+Note on `QueryTypeFilter` with postgres: the generic error response used when a request is
+filtered ends with a `ReadyForQuery`, which is correct for the simple query protocol but desyncs
+an extended-protocol client (it delivers two `ReadyForQuery` for one `Sync`). `AllowList` mode is
+also unusable with postgres because non-query messages (including the startup message) classify as
+`ReadWrite` and would be filtered. Use `QueryTypeFilter` on postgres only with simple-query
+workloads and `DenyList` mode; protocol-state-aware error responses are a follow-up.
+
 ## Valkey
 
 ```yaml

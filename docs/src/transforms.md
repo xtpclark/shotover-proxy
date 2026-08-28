@@ -482,6 +482,25 @@ mapping are follow-ups.
     #  verify_hostname: true
 ```
 
+Known limitations of this release:
+
+- **No failover re-probe.** Topology is probed once and cached for the life of the process; if
+  the primary is demoted, writes keep going to the old primary until Shotover is restarted.
+- **Session pinning is permanent.** Once a session issues session state it pins to the primary and
+  never returns to read-splitting, so a long-lived pooled connection that prepares a named
+  statement early stops offloading reads for the rest of its life.
+- **Only complete read units offload.** A read offloads to a replica only when its batch is
+  self-terminating (a simple query, or a `Parse/Bind/Describe/Execute/Sync` that arrives together);
+  a read whose pipeline is split across TCP reads, or that ends in `Flush` rather than `Sync`, runs
+  on the primary. This trades a little offload for correctness.
+- **Backend auth is trust/cleartext only, one credential.** md5/SCRAM origination to replicas and
+  per-user credential mapping (a pgbouncer-style userlist) are follow-ups.
+- **No cluster-side query cancellation.** A `CancelRequest` is not routed to the node running the
+  query.
+- The writing-function detection used for routing is best-effort (see the note on function
+  classification); a `SELECT` that calls an unlisted writing or session-mutating function may be
+  routed to a replica.
+
 ### PostgresRedactColumn
 
 This transform will replace the value of a named result column with a fixed
@@ -492,15 +511,17 @@ The column is matched by name against the row shape from the result's
 redacting a column fetched in binary format hands the client bytes it may fail
 to decode - still redacted, just less politely.
 
+The shape is tracked per prepared statement (established by a `Describe`), so
+cached prepared statements and paginated portals (JDBC `setFetchSize`) redact
+correctly even though they re-execute without a `Describe`.
+
 This is a security control, so it fails **closed**: if it cannot determine the
 row shape for a set of rows it is about to pass on, it replaces the whole
 response with an error rather than risk leaking an unredacted value. Two
-consequences worth knowing before you deploy it:
+cases fail closed:
 
-- A driver that caches a prepared statement and skips `Describe` on
-  re-execution produces rows with no `RowDescription` in that exchange; those
-  queries error instead of returning data. Correctly redacting cached
-  statements needs per-portal shape tracking, which is a planned follow-up.
+- An `Execute` of a statement that was never `Describe`d in this connection —
+  the shape is genuinely unknown, so the query errors rather than risk a leak.
 - `COPY ... TO STDOUT` carries rows outside `DataRow` messages and cannot be
   redacted here, so **any** COPY-based read through a chain containing this
   transform fails closed regardless of which columns the table has. `pg_dump`
