@@ -1277,7 +1277,11 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
 /// Keyword-only fallback classifier, used when the grammar parser cannot parse the string.
 fn query_type_by_keyword(sql: &str) -> crate::message::QueryType {
     use crate::message::QueryType;
-    let first_word = sql.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+    let first_word = sql
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
     match first_word.as_str() {
         "SELECT" | "SHOW" | "FETCH" | "EXPLAIN" | "VALUES" | "TABLE" => QueryType::Read,
         "INSERT" | "UPDATE" | "DELETE" | "COPY" | "MERGE" => QueryType::Write,
@@ -1360,7 +1364,11 @@ mod tests {
 
     #[test]
     fn test_analyze_ddl_is_schema_change() {
-        for sql in ["CREATE TABLE t (a int)", "ALTER TABLE t ADD COLUMN b int", "DROP TABLE t"] {
+        for sql in [
+            "CREATE TABLE t (a int)",
+            "ALTER TABLE t ADD COLUMN b int",
+            "DROP TABLE t",
+        ] {
             let a = analyze_sql(sql);
             assert!(!a.replica_safe, "{sql}");
             assert_eq!(a.query_type, QueryType::SchemaChange, "{sql}");

@@ -60,6 +60,7 @@ chain:
 | [NullSink](#nullsink)                                    | ✅          | Beta                  |
 | [ParallelMap](#parallelmap)                              | ✅          | Alpha                 |
 | [PostgresRedactColumn](#postgresredactcolumn)            | ❌          | Alpha                 |
+| [PostgresSinkCluster](#postgressinkcluster)              | ✅          | Alpha                 |
 | [PostgresSinkSingle](#postgressinksingle)                | ✅          | Alpha                 |
 | [QueryCounter](#querycounter)                            | ❌          | Alpha                 |
 | [QueryTypeFilter](#querytypefilter)                      | ❌          | Alpha                 |
@@ -436,6 +437,49 @@ If we have parallelism of 3 then we would have 3 instances of the chain: C1, C2,
           name: "valkey-sink"
           remote_address: "127.0.0.1:6379"
           connect_timeout_ms: 3000
+```
+
+### PostgresSinkCluster
+
+This transform routes queries across a PostgreSQL primary and its read replicas, sending
+writes to the primary and replica-safe reads to a replica. Read/write classification uses the
+real postgres grammar (libpg_query), so a data-modifying CTE under a leading `SELECT`, a
+`SELECT ... FOR UPDATE`, `SELECT INTO`, and `SELECT nextval(...)` all correctly route to the
+primary. Node roles are discovered by probing each contact point with `pg_is_in_recovery()`.
+
+Routing is conservative and correct-by-construction: transactions pin to the primary for their
+duration; a session that issues session state (`SET`, a named `PREPARE`/`Parse`, `LISTEN`,
+`DECLARE CURSOR`, a temporary table) pins to the primary from that point on; anything the
+grammar cannot prove to be a pure read goes to the primary. A read routed to a replica may be
+stale by the replication lag — a session needing read-your-writes should wrap the read in a
+transaction.
+
+Authentication: the client authenticates against the primary by passthrough (no client-facing
+credential store, real client auth). Replica connections are originated by the proxy using a
+configured backend password plus the `user`/`database` captured from the client's startup — the
+standard pooler model. Only trust and cleartext `password` backend auth are supported for
+originated replica connections in this release; md5/SCRAM origination and per-user credential
+mapping are follow-ups.
+
+```yaml
+- PostgresSinkCluster:
+    name: "pg-cluster"
+    # Candidate backend hosts. Each is probed with pg_is_in_recovery() to
+    # decide which is the primary and which are read replicas.
+    first_contact_points:
+      - "primary.example.com:5432"
+      - "replica-1.example.com:5432"
+      - "replica-2.example.com:5432"
+    # User and backend password used to originate replica connections and to probe topology.
+    username: "app"
+    password: "secret"
+    # Database used only for the pg_is_in_recovery() probe (optional, defaults to "postgres").
+    probe_database: "postgres"
+    connect_timeout_ms: 3000
+    # Optional TLS to the backends, as for PostgresSinkSingle.
+    #tls:
+    #  certificate_authority_path: "tls/ca.crt"
+    #  verify_hostname: true
 ```
 
 ### PostgresRedactColumn
