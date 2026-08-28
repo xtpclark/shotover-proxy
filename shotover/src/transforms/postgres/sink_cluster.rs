@@ -267,6 +267,13 @@ impl PostgresSinkCluster {
     fn decide_target(&mut self, requests: &mut [Message]) -> Target {
         let mut has_deciding_read = false;
         let mut has_primary_only = false;
+        // A batch is self-terminating if it ends its own response cycle with a ReadyForQuery — it
+        // contains a Sync or a simple Query. Only such a batch may open a replica unit: it drains
+        // fully within one exchange() call (see route + note_unit_boundary), so a replica unit never
+        // spans batches. A partial extended-query pipeline (Parse/Bind/Execute with no Sync) would
+        // otherwise leave responses outstanding on the replica that a later pin would strand,
+        // violating the one-response-per-request invariant. Partial pipelines go to the primary.
+        let mut self_terminating = false;
         for request in requests.iter_mut() {
             match classify_request(request) {
                 RequestRoute::ReplicaRead => has_deciding_read = true,
@@ -284,13 +291,14 @@ impl PostgresSinkCluster {
                 }
                 RequestRoute::Primary => has_primary_only = true,
             }
+            if is_self_terminating(request) {
+                self_terminating = true;
+            }
         }
 
-        // A pinned session must run on the primary even if a replica-routed unit is still open:
-        // the session-state statement itself has to execute on the primary, not just be recorded as
-        // a future pin (otherwise a named prepare runs on the replica and its later Execute, now
-        // routed to the primary, fails with "prepared statement does not exist"). Overriding the
-        // open unit here abandons at most an un-Synced replica read pipeline, which is safe.
+        // A pinned session runs on the primary. Because a replica unit never spans batches (only
+        // self-terminating batches go to the replica), there is never an outstanding replica unit to
+        // strand here — the override is safe and just keeps a pinned session on the primary.
         if self.session_pinned {
             self.unit_target = Some(Target::Primary);
             return Target::Primary;
@@ -301,7 +309,7 @@ impl PostgresSinkCluster {
         if self.in_transaction {
             return Target::Primary;
         }
-        if has_deciding_read && !has_primary_only && self.replica_available() {
+        if has_deciding_read && !has_primary_only && self_terminating && self.replica_available() {
             Target::Replica
         } else {
             Target::Primary
@@ -546,6 +554,17 @@ enum RequestRoute {
     Neutral,
 }
 
+/// True if the request ends its own response cycle with a ReadyForQuery: a Sync (extended protocol)
+/// or a simple Query. A batch containing one drains fully within a single exchange() call.
+fn is_self_terminating(request: &mut Message) -> bool {
+    matches!(
+        request.frame(),
+        Some(Frame::Postgres(PostgresFrame::Request(
+            FrontendMessage::Sync | FrontendMessage::Query { .. }
+        )))
+    )
+}
+
 fn classify_request(request: &mut Message) -> RequestRoute {
     match request.frame() {
         Some(Frame::Postgres(PostgresFrame::Request(message))) => match message {
@@ -768,6 +787,29 @@ mod tests {
             },
         )));
         assert!(matches!(classify_request(&mut bind), RequestRoute::Neutral));
+    }
+
+    #[test]
+    fn test_is_self_terminating() {
+        // Only a Sync or a simple Query ends its own response cycle; a partial extended pipeline
+        // does not and therefore must not open a replica unit.
+        assert!(is_self_terminating(&mut query("SELECT 1")));
+        let mut sync = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
+            FrontendMessage::Sync,
+        )));
+        assert!(is_self_terminating(&mut sync));
+        assert!(!is_self_terminating(&mut parse("", "SELECT 1")));
+        let mut execute = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
+            FrontendMessage::Execute {
+                portal_name: "".to_owned(),
+                max_rows: 0,
+            },
+        )));
+        assert!(!is_self_terminating(&mut execute));
+        let mut flush = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
+            FrontendMessage::Flush,
+        )));
+        assert!(!is_self_terminating(&mut flush));
     }
 
     #[test]
