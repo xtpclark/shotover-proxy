@@ -1,6 +1,6 @@
-use crate::frame::postgres::{BackendMessage, PostgresFrame};
+use crate::frame::postgres::{BackendMessage, FrontendMessage, PostgresFrame};
 use crate::frame::{Frame, MessageType};
-use crate::message::{Message, Messages};
+use crate::message::{Message, MessageId, Messages};
 use crate::transforms::{
     ChainState, DownChainProtocol, Transform, TransformBuilder, TransformConfig,
     TransformContextBuilder, TransformContextConfig, UpChainProtocol,
@@ -9,22 +9,27 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Replaces the value of a named result column with a fixed replacement string in every DataRow
 /// flowing back to the client.
 ///
+/// # Row-shape tracking
+/// To redact by column name the transform needs the row shape (which column index carries the
+/// name). In the simple query protocol the RowDescription and its DataRows share one response, so
+/// the shape is always present. In the extended protocol the RowDescription arrives with a Describe
+/// response while DataRows arrive with Execute responses — and a driver that caches a prepared
+/// statement (asyncpg, psycopg3, pgjdbc past prepareThreshold) sends Describe only once, then
+/// re-executes with no Describe. So the transform watches the request stream too: a Describe
+/// establishes a statement's shape, Bind records portal→statement, and each Execute's response is
+/// redacted using its statement's remembered shape (matched to the request by id). This keeps cached
+/// statements and paginated portals (JDBC setFetchSize) working.
+///
 /// # Fail-closed
-/// This is a security control, so it fails CLOSED: if it cannot determine the row shape for a set
-/// of DataRows it is about to pass to the client, it replaces the whole response with an error
-/// rather than risk leaking an unredacted value. The row shape comes from a RowDescription. In the
-/// simple query protocol the RowDescription and its DataRows share one response, so the shape is
-/// always known. In the extended protocol the RowDescription arrives with the Describe response and
-/// the DataRows with the Execute response; the shape is carried across from Describe to Execute and
-/// reset at each result boundary, so a driver that CACHES a prepared statement and skips Describe on
-/// re-execution produces DataRows with no established shape — those queries error rather than leak.
-/// COPY output (which carries rows outside DataRow messages) and any server response that cannot be
-/// parsed also fail closed. The correct fix that keeps cached statements working is per-portal shape
-/// tracking; that is a deferred follow-up.
+/// It is a security control, so when it genuinely cannot determine the shape for a set of DataRows —
+/// an Execute of a statement it never saw Described — it replaces the whole response with an error
+/// rather than risk leaking an unredacted value. COPY output (rows outside DataRow messages) and any
+/// unparseable response also fail closed.
 ///
 /// NULL values stay NULL. The replacement is written as a text-format value: redacting a column
 /// fetched in binary format hands the client bytes it may fail to decode — still redacted.
@@ -80,7 +85,9 @@ impl TransformBuilder for PostgresRedactColumnBuilder {
         Box::new(PostgresRedactColumn {
             column: self.column.clone(),
             replacement: self.replacement.clone(),
-            shape: Shape::Unknown,
+            statement_shapes: HashMap::new(),
+            portal_statements: HashMap::new(),
+            pending: HashMap::new(),
         })
     }
 
@@ -97,24 +104,35 @@ impl TransformBuilder for PostgresRedactColumnBuilder {
     }
 }
 
-/// The row shape for the DataRows currently being returned.
+/// A known row shape for a statement's result. Absence from the map means the shape is unknown.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Shape {
-    /// No RowDescription has established the shape for the upcoming rows — cannot redact safely.
-    Unknown,
-    /// Shape known; the redacted column is absent from this result.
+    /// The redacted column is absent from this statement's result.
     Absent,
-    /// Shape known; redact this column index.
+    /// Redact this column index.
     At(usize),
+}
+
+/// What a request in flight will produce, so its response can be interpreted when it comes back.
+#[derive(Debug, Clone)]
+enum Awaiting {
+    /// A Describe: its RowDescription (or NoData) establishes the shape of this statement.
+    Describe(String),
+    /// An Execute: its DataRows are redacted using this statement's remembered shape.
+    Execute(String),
+    /// A simple Query: its response train carries its own RowDescription.
+    SimpleQuery,
 }
 
 pub struct PostgresRedactColumn {
     column: String,
     replacement: String,
-    /// The row shape for the result currently in flight. Persists across response trains so an
-    /// extended-protocol Describe establishes the shape for the following Execute, and resets at
-    /// each result boundary so a cached statement that skips Describe fails closed.
-    shape: Shape,
+    /// Remembered result shape per prepared statement name, learned from a Describe/RowDescription.
+    statement_shapes: HashMap<String, Shape>,
+    /// Portal name -> prepared statement name, from Bind, so an Execute can find its shape.
+    portal_statements: HashMap<String, String>,
+    /// Requests in flight that produce a shape-relevant response, keyed by request id.
+    pending: HashMap<MessageId, Awaiting>,
 }
 
 #[async_trait]
@@ -127,6 +145,12 @@ impl Transform for PostgresRedactColumn {
         &mut self,
         chain_state: &'shorter mut ChainState<'longer>,
     ) -> Result<Messages> {
+        // On the way down, learn what each request will produce (which statement a Describe
+        // establishes, which statement an Execute reads, portal→statement from Bind).
+        for request in chain_state.requests.iter_mut() {
+            self.note_request(request);
+        }
+
         let mut responses = chain_state.call_next_transform().await?;
         for response in &mut responses {
             // Only postgres server responses are candidates; skip Dummy and anything else.
@@ -174,9 +198,78 @@ fn fail_closed_response(original: &mut Message, reason: &str) -> Message {
 }
 
 impl PostgresRedactColumn {
+    /// Records, from a request travelling down the chain, what its response will mean.
+    fn note_request(&mut self, request: &mut Message) {
+        let id = request.id();
+        let Some(Frame::Postgres(PostgresFrame::Request(message))) = request.frame() else {
+            return;
+        };
+        match message {
+            // A re-Parse of a name invalidates any remembered shape for it.
+            FrontendMessage::Parse { statement_name, .. } => {
+                self.statement_shapes.remove(statement_name);
+            }
+            FrontendMessage::Bind {
+                portal_name,
+                statement_name,
+                ..
+            } => {
+                self.portal_statements
+                    .insert(portal_name.clone(), statement_name.clone());
+            }
+            FrontendMessage::Describe { kind, name } => {
+                // 'S' describes a statement directly; 'P' describes a portal — resolve to its
+                // statement so all portals of a statement share the one remembered shape.
+                let statement = if *kind == b'S' {
+                    name.clone()
+                } else {
+                    self.portal_statements
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                self.pending.insert(id, Awaiting::Describe(statement));
+            }
+            FrontendMessage::Execute { portal_name, .. } => {
+                let statement = self
+                    .portal_statements
+                    .get(portal_name)
+                    .cloned()
+                    .unwrap_or_default();
+                self.pending.insert(id, Awaiting::Execute(statement));
+            }
+            FrontendMessage::Query { .. } => {
+                self.pending.insert(id, Awaiting::SimpleQuery);
+            }
+            FrontendMessage::Close { kind, name } => {
+                if *kind == b'S' {
+                    self.statement_shapes.remove(name);
+                } else {
+                    self.portal_statements.remove(name);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Redacts a single server response in place, or returns Err with a reason if the result cannot
     /// be redacted safely (the caller then fails the response closed).
     fn redact_response(&mut self, response: &mut Message) -> Result<(), String> {
+        // What request produced this response tells us which statement's shape applies.
+        let awaiting = response
+            .request_id()
+            .and_then(|id| self.pending.remove(&id));
+        let statement = match &awaiting {
+            Some(Awaiting::Describe(s)) | Some(Awaiting::Execute(s)) => Some(s.clone()),
+            _ => None,
+        };
+        // An Execute starts from its statement's remembered shape; everything else starts unknown
+        // and relies on a RowDescription within the response itself.
+        let mut shape: Option<Shape> = match &awaiting {
+            Some(Awaiting::Execute(s)) => self.statement_shapes.get(s).copied(),
+            _ => None,
+        };
+
         let mut modified = false;
         let mut fail: Option<String> = None;
         {
@@ -186,13 +279,25 @@ impl PostgresRedactColumn {
             for message in messages.iter_mut() {
                 match message {
                     BackendMessage::RowDescription { fields } => {
-                        self.shape = match fields.iter().position(|f| f.name == self.column) {
+                        let resolved = match fields.iter().position(|f| f.name == self.column) {
                             Some(index) => Shape::At(index),
                             None => Shape::Absent,
                         };
+                        shape = Some(resolved);
+                        if let Some(statement) = &statement {
+                            self.statement_shapes.insert(statement.clone(), resolved);
+                        }
                     }
-                    BackendMessage::DataRow { values } => match self.shape {
-                        Shape::At(index) => {
+                    // A described statement that returns no rows: remember it as having no columns.
+                    BackendMessage::NoData => {
+                        shape = Some(Shape::Absent);
+                        if let Some(statement) = &statement {
+                            self.statement_shapes
+                                .insert(statement.clone(), Shape::Absent);
+                        }
+                    }
+                    BackendMessage::DataRow { values } => match shape {
+                        Some(Shape::At(index)) => {
                             if let Some(value) = values.get_mut(index)
                                 && value.is_some()
                             {
@@ -200,12 +305,12 @@ impl PostgresRedactColumn {
                                 modified = true;
                             }
                         }
-                        Shape::Absent => {}
-                        Shape::Unknown => {
+                        Some(Shape::Absent) => {}
+                        None => {
                             if fail.is_none() {
                                 fail = Some(
-                                    "cannot redact a result whose row shape was not described \
-                                     (a cached prepared statement skipped Describe)"
+                                    "cannot redact a result whose row shape is unknown \
+                                     (a statement executed without ever being described)"
                                         .to_owned(),
                                 );
                             }
@@ -218,16 +323,14 @@ impl PostgresRedactColumn {
                             fail = Some("cannot redact COPY output".to_owned());
                         }
                     }
-                    // A result boundary: the next result must establish its own shape. NOTE:
-                    // PortalSuspended is deliberately NOT here — it means the portal was suspended
-                    // MID-result (Execute hit its row limit), and the next Execute continues the
-                    // SAME result with the same shape and no new RowDescription. Treating it as a
-                    // boundary would fail-close every paginated fetch (JDBC setFetchSize, psycopg
-                    // named cursors).
+                    // A result boundary within THIS response: a following result set (simple query
+                    // with several statements) must present its own RowDescription. PortalSuspended
+                    // is deliberately absent — it continues the same result. The per-statement shape
+                    // in `statement_shapes` is untouched, so a later Execute still redacts.
                     BackendMessage::CommandComplete { .. }
                     | BackendMessage::EmptyQueryResponse
                     | BackendMessage::ReadyForQuery { .. } => {
-                        self.shape = Shape::Unknown;
+                        shape = None;
                     }
                     _ => {}
                 }
@@ -253,7 +356,9 @@ mod tests {
         PostgresRedactColumn {
             column: "ssn".to_owned(),
             replacement: "[REDACTED]".to_owned(),
-            shape: Shape::Unknown,
+            statement_shapes: HashMap::new(),
+            portal_statements: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 
@@ -271,6 +376,21 @@ mod tests {
 
     fn response(messages: Vec<BackendMessage>) -> Message {
         Message::from_frame(Frame::Postgres(PostgresFrame::Response(messages)))
+    }
+
+    /// Notes a request travelling down the chain and returns its id, so a response can be built that
+    /// pairs to it (as the codec would via the request id).
+    fn note(r: &mut PostgresRedactColumn, message: FrontendMessage) -> MessageId {
+        let mut request = Message::from_frame(Frame::Postgres(PostgresFrame::Request(message)));
+        let id = request.id();
+        r.note_request(&mut request);
+        id
+    }
+
+    fn response_for(id: MessageId, messages: Vec<BackendMessage>) -> Message {
+        let mut m = response(messages);
+        m.set_request_id(id);
+        m
     }
 
     fn data_row_value(message: &mut Message, row: usize, col: usize) -> Vec<u8> {
@@ -307,23 +427,82 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_statement_without_describe_fails_closed() {
+    fn test_execute_of_undescribed_statement_fails_closed() {
         let mut r = redactor();
-        // An Execute train with DataRows but no RowDescription (the driver cached the statement and
-        // skipped Describe) MUST fail closed rather than leak the real value.
-        let mut m = response(vec![
-            BackendMessage::DataRow {
-                values: vec![
-                    Some(Bytes::from_static(b"1")),
-                    Some(Bytes::from_static(b"111-22-3333")),
-                ],
+        // An Execute of a statement that was never described -> shape genuinely unknown -> fail
+        // closed rather than leak.
+        note(&mut r, bind("p", "s"));
+        let e = note(
+            &mut r,
+            FrontendMessage::Execute {
+                portal_name: "p".to_owned(),
+                max_rows: 0,
             },
-            BackendMessage::CommandComplete {
-                tag: "SELECT 1".to_owned(),
-            },
-            BackendMessage::ReadyForQuery { status: b'I' },
-        ]);
+        );
+        let mut m = response_for(
+            e,
+            vec![
+                BackendMessage::DataRow {
+                    values: vec![Some(Bytes::from_static(b"111-22-3333"))],
+                },
+                BackendMessage::CommandComplete {
+                    tag: "SELECT 1".to_owned(),
+                },
+            ],
+        );
         assert!(r.redact_response(&mut m).is_err());
+    }
+
+    #[test]
+    fn test_cached_statement_redacts_from_remembered_shape() {
+        // The C2/R7 fix: once a statement has been described, later Executes with NO Describe
+        // (cached prepared statements) redact from the remembered shape instead of failing closed.
+        let mut r = redactor();
+        note(
+            &mut r,
+            FrontendMessage::Parse {
+                statement_name: "s".to_owned(),
+                query: "SELECT ssn FROM t".to_owned(),
+                parameter_data_types: vec![],
+            },
+        );
+        let d = note(
+            &mut r,
+            FrontendMessage::Describe {
+                kind: b'S',
+                name: "s".to_owned(),
+            },
+        );
+        let mut describe = response_for(
+            d,
+            vec![BackendMessage::RowDescription {
+                fields: vec![field("ssn")],
+            }],
+        );
+        assert!(r.redact_response(&mut describe).is_ok());
+
+        // Now a cached re-execution: Bind + Execute, no Describe.
+        note(&mut r, bind("p", "s"));
+        let e = note(
+            &mut r,
+            FrontendMessage::Execute {
+                portal_name: "p".to_owned(),
+                max_rows: 0,
+            },
+        );
+        let mut execute = response_for(
+            e,
+            vec![
+                BackendMessage::DataRow {
+                    values: vec![Some(Bytes::from_static(b"111-22-3333"))],
+                },
+                BackendMessage::CommandComplete {
+                    tag: "SELECT 1".to_owned(),
+                },
+            ],
+        );
+        assert!(r.redact_response(&mut execute).is_ok());
+        assert_eq!(data_row_value(&mut execute, 0, 0), b"[REDACTED]");
     }
 
     #[test]
@@ -349,28 +528,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extended_describe_then_execute_carries_shape() {
-        let mut r = redactor();
-        // Describe train establishes the shape (no result boundary, so it persists).
-        let mut describe = response(vec![BackendMessage::RowDescription {
-            fields: vec![field("ssn")],
-        }]);
-        assert!(r.redact_response(&mut describe).is_ok());
-        // Execute train (a separate message) redacts using the carried shape.
-        let mut execute = response(vec![
-            BackendMessage::DataRow {
-                values: vec![Some(Bytes::from_static(b"111-22-3333"))],
-            },
-            BackendMessage::CommandComplete {
-                tag: "SELECT 1".to_owned(),
-            },
-            BackendMessage::ReadyForQuery { status: b'I' },
-        ]);
-        assert!(r.redact_response(&mut execute).is_ok());
-        assert_eq!(data_row_value(&mut execute, 0, 0), b"[REDACTED]");
-    }
-
-    #[test]
     fn test_copy_output_fails_closed() {
         let mut r = redactor();
         let mut m = response(vec![BackendMessage::CopyOutResponse {
@@ -381,33 +538,89 @@ mod tests {
     }
 
     #[test]
-    fn test_portal_suspended_continues_the_same_result() {
-        // A paginated fetch: Execute(max_rows) returns rows then PortalSuspended; the next Execute
-        // continues the SAME result with no new RowDescription. Redaction must persist, not fail.
+    fn test_portal_resumed_after_sync_still_redacts() {
+        // JDBC setFetchSize inside a transaction: Describe/Execute(max_rows)+Sync, then
+        // Execute(max_rows)+Sync on the SAME portal. The portal survives the Sync, the second
+        // Execute has no Describe, and the ReadyForQuery of the first Sync must not lose the shape.
         let mut r = redactor();
-        let mut first = response(vec![
-            BackendMessage::RowDescription {
-                fields: vec![field("ssn")],
+        note(
+            &mut r,
+            FrontendMessage::Parse {
+                statement_name: "s".to_owned(),
+                query: "SELECT ssn FROM t".to_owned(),
+                parameter_data_types: vec![],
             },
-            BackendMessage::DataRow {
-                values: vec![Some(Bytes::from_static(b"111-22-3333"))],
-            },
-            BackendMessage::PortalSuspended,
-        ]);
-        assert!(r.redact_response(&mut first).is_ok());
-        assert_eq!(data_row_value(&mut first, 1, 0), b"[REDACTED]");
-        // The resumed batch carries only DataRows and PortalSuspended, no RowDescription.
-        let mut resumed = response(vec![
-            BackendMessage::DataRow {
-                values: vec![Some(Bytes::from_static(b"444-55-6666"))],
-            },
-            BackendMessage::PortalSuspended,
-        ]);
-        assert!(
-            r.redact_response(&mut resumed).is_ok(),
-            "a suspended-portal continuation must not fail closed"
         );
-        assert_eq!(data_row_value(&mut resumed, 0, 0), b"[REDACTED]");
+        note(&mut r, bind("p", "s"));
+        let d = note(
+            &mut r,
+            FrontendMessage::Describe {
+                kind: b'P',
+                name: "p".to_owned(),
+            },
+        );
+        let e1 = note(
+            &mut r,
+            FrontendMessage::Execute {
+                portal_name: "p".to_owned(),
+                max_rows: 1,
+            },
+        );
+        // Responses: Describe -> RowDescription; Execute -> DataRow + PortalSuspended; Sync -> RFQ.
+        let mut describe = response_for(
+            d,
+            vec![BackendMessage::RowDescription {
+                fields: vec![field("ssn")],
+            }],
+        );
+        assert!(r.redact_response(&mut describe).is_ok());
+        let mut exec1 = response_for(
+            e1,
+            vec![
+                BackendMessage::DataRow {
+                    values: vec![Some(Bytes::from_static(b"111-22-3333"))],
+                },
+                BackendMessage::PortalSuspended,
+            ],
+        );
+        assert!(r.redact_response(&mut exec1).is_ok());
+        assert_eq!(data_row_value(&mut exec1, 0, 0), b"[REDACTED]");
+        // The Sync's ReadyForQuery arrives (its own response), resetting only the local shape.
+        let mut ready = response(vec![BackendMessage::ReadyForQuery { status: b'T' }]);
+        assert!(r.redact_response(&mut ready).is_ok());
+
+        // Second Execute on the same portal, no Describe: must still redact from the statement shape.
+        let e2 = note(
+            &mut r,
+            FrontendMessage::Execute {
+                portal_name: "p".to_owned(),
+                max_rows: 1,
+            },
+        );
+        let mut exec2 = response_for(
+            e2,
+            vec![
+                BackendMessage::DataRow {
+                    values: vec![Some(Bytes::from_static(b"444-55-6666"))],
+                },
+                BackendMessage::PortalSuspended,
+            ],
+        );
+        assert!(
+            r.redact_response(&mut exec2).is_ok(),
+            "a portal resumed after a Sync must not fail closed"
+        );
+        assert_eq!(data_row_value(&mut exec2, 0, 0), b"[REDACTED]");
+    }
+
+    fn bind(portal: &str, statement: &str) -> FrontendMessage {
+        FrontendMessage::Bind {
+            portal_name: portal.to_owned(),
+            statement_name: statement.to_owned(),
+            parameter_format_codes: vec![],
+            parameter_values: vec![],
+            result_format_codes: vec![],
+        }
     }
 
     #[test]

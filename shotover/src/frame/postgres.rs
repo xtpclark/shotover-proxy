@@ -1167,13 +1167,35 @@ fn into_clause_is_temp(into: Option<&pg_query::protobuf::IntoClause>) -> bool {
     range_var_is_temp(into.and_then(|i| i.rel.as_ref()))
 }
 
-/// Functions that write despite appearing inside an otherwise read-only statement.
-/// A `SELECT nextval('s')` must go to the primary or it errors on a read-only replica.
+/// Functions that write, take a lock, or change session state despite appearing inside an
+/// otherwise read-only statement, so a statement calling one must go to the primary. Some of these
+/// error on a read-only replica (`nextval`), but the dangerous ones SUCCEED on a replica with the
+/// wrong effect: an advisory lock taken on a replica does not exclude anything on the primary, and
+/// `set_config` mutates the replica session.
+///
+/// This list is best-effort and cannot be complete — any volatile or user-defined function may
+/// write, and a `SELECT` that calls one is not detected here. It covers the common built-ins whose
+/// silent misbehaviour on a replica is worst.
 fn is_writing_function(name: &str) -> bool {
     let bare = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+    // Advisory locks in all forms (pg_advisory_lock, pg_try_advisory_xact_lock_shared, …): taking
+    // one on a replica silently breaks the mutual exclusion the caller intended.
+    if bare.starts_with("pg_advisory_") || bare.starts_with("pg_try_advisory_") {
+        return true;
+    }
     matches!(
         bare.as_str(),
-        "nextval" | "setval" | "pg_logical_emit_message" | "pg_create_restore_point"
+        // Sequence access and mutation.
+        "nextval" | "setval" | "currval" | "lastval"
+        // set_config() is the function form of SET: it mutates session state.
+        | "set_config"
+        // Transaction id assignment.
+        | "txid_current" | "pg_current_xact_id"
+        // Replication / recovery side effects.
+        | "pg_logical_emit_message"
+        | "pg_create_restore_point"
+        | "pg_replication_origin_session_setup"
+        | "pg_replication_origin_xact_setup"
     )
 }
 
@@ -1427,6 +1449,28 @@ mod tests {
         }
         // A plain read with the string "for update" in a literal is still replica-safe.
         assert!(analyze_sql("SELECT 'for update' AS note").replica_safe);
+    }
+
+    #[test]
+    fn test_analyze_writing_functions_go_to_primary() {
+        // A SELECT that calls a lock/session/sequence function must not be replica-safe: on a
+        // replica it either errors or (worse) silently takes effect on the wrong node.
+        for sql in [
+            "SELECT pg_advisory_lock(42)",
+            "SELECT pg_try_advisory_xact_lock(1, 2)",
+            "SELECT pg_advisory_unlock_all()",
+            "SELECT set_config('search_path', 'x', false)",
+            "SELECT nextval('s')",
+            "SELECT currval('s')",
+            "SELECT txid_current()",
+        ] {
+            assert!(
+                !analyze_sql(sql).replica_safe,
+                "writing function must route to primary: {sql}"
+            );
+        }
+        // An ordinary read-only function is still replica-safe.
+        assert!(analyze_sql("SELECT count(*), now(), upper(name) FROM t").replica_safe);
     }
 
     #[test]
