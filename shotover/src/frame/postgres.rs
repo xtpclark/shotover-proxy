@@ -327,12 +327,13 @@ fn parse_startup_family(mut bytes: Bytes) -> Result<FrontendMessage> {
                 secret_key: bytes,
             })
         }
-        // SSLRequest/GSSENCRequest are answered inside the connection prologue and never
-        // reach frame parsing, but a valid parse is kept for completeness.
-        SSL_REQUEST_CODE | GSSENC_REQUEST_CODE => Ok(FrontendMessage::Raw {
-            tag: 0,
-            body: Bytes::new(),
-        }),
+        // SSLRequest/GSSENCRequest are answered inside the connection prologue and never reach
+        // frame parsing. If a packet carrying one of these codes (but not the exact 8-byte form)
+        // does reach here it is malformed; reject it rather than rewrite it into a lossy Raw frame
+        // that would not round-trip byte-identically.
+        SSL_REQUEST_CODE | GSSENC_REQUEST_CODE => Err(anyhow!(
+            "Unexpected SSL/GSS request code in a framed startup message (handled by the prologue)"
+        )),
         protocol_version => {
             let mut parameters = vec![];
             loop {
@@ -1156,6 +1157,16 @@ pub struct SqlAnalysis {
     pub pins_session: bool,
 }
 
+/// True if a RangeVar names a temporary relation (relpersistence 't').
+fn range_var_is_temp(rel: Option<&pg_query::protobuf::RangeVar>) -> bool {
+    rel.map(|r| r.relpersistence == "t").unwrap_or(false)
+}
+
+/// True if an IntoClause targets a temporary relation (SELECT INTO TEMP / CREATE TEMP TABLE AS).
+fn into_clause_is_temp(into: Option<&pg_query::protobuf::IntoClause>) -> bool {
+    range_var_is_temp(into.and_then(|i| i.rel.as_ref()))
+}
+
 /// Functions that write despite appearing inside an otherwise read-only statement.
 /// A `SELECT nextval('s')` must go to the primary or it errors on a read-only replica.
 fn is_writing_function(name: &str) -> bool {
@@ -1191,10 +1202,20 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
     let ddl_tables = !parsed.ddl_tables().is_empty();
     let writing_function = parsed.functions().iter().any(|f| is_writing_function(f));
 
-    let mut replica_safe = !writes_tables && !ddl_tables && !writing_function;
+    // Row-level lock clauses (FOR UPDATE/SHARE/NO KEY UPDATE/KEY SHARE) can sit in a subquery or
+    // CTE where the top-level SelectStmt.locking_clause check below does not see them, e.g.
+    // `WITH x AS (SELECT * FROM t FOR UPDATE) SELECT * FROM x`. Such a statement takes locks and
+    // errors on a read-only replica, so it must not be replica-safe. pg_query exposes no locking
+    // helper, so detect a LockingClause node anywhere in the tree via the debug representation of
+    // the parse tree (which reflects the AST, not the SQL text, so string literals cannot trip it).
+    // `test_analyze_row_locks_anywhere` pins this so a pg_query format change fails loudly rather
+    // than silently routing a lock to a replica.
+    let has_row_lock = format!("{:?}", parsed.protobuf).contains("LockingClause");
+
+    let mut replica_safe = !writes_tables && !ddl_tables && !writing_function && !has_row_lock;
     let mut pins_session = false;
     let mut saw_read = false;
-    let mut saw_write = writes_tables;
+    let mut saw_write = writes_tables || has_row_lock;
     let mut saw_ddl = ddl_tables;
 
     for stmt in &parsed.protobuf.stmts {
@@ -1207,8 +1228,35 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
                 if !select.locking_clause.is_empty() || select.into_clause.is_some() {
                     replica_safe = false;
                     saw_write = true;
+                    // SELECT ... INTO TEMP creates a temp table -> the session must pin so a later
+                    // read that references it does not go to a replica where it does not exist.
+                    if into_clause_is_temp(select.into_clause.as_deref()) {
+                        pins_session = true;
+                    }
                 } else {
                     saw_read = true;
+                }
+            }
+            NodeEnum::CreateTableAsStmt(create) => {
+                // CREATE [TEMP] TABLE AS / CREATE [TEMP] MATERIALIZED VIEW AS.
+                saw_ddl = true;
+                replica_safe = false;
+                if into_clause_is_temp(create.into.as_deref()) {
+                    pins_session = true;
+                }
+            }
+            NodeEnum::ViewStmt(view) => {
+                saw_ddl = true;
+                replica_safe = false;
+                if range_var_is_temp(view.view.as_ref()) {
+                    pins_session = true;
+                }
+            }
+            NodeEnum::CreateSeqStmt(seq) => {
+                saw_ddl = true;
+                replica_safe = false;
+                if range_var_is_temp(seq.sequence.as_ref()) {
+                    pins_session = true;
                 }
             }
             NodeEnum::VariableShowStmt(_) => saw_read = true,
@@ -1360,6 +1408,43 @@ mod tests {
                 "hidden write must not be replica-safe: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn test_analyze_row_locks_anywhere() {
+        // Row locks nested in a subquery or CTE are not replica-safe (they error on a replica).
+        // This test also pins the LockingClause debug-detection against pg_query format drift.
+        for sql in [
+            "SELECT * FROM t FOR UPDATE",
+            "WITH x AS (SELECT * FROM t FOR UPDATE) SELECT * FROM x",
+            "SELECT * FROM (SELECT id FROM t FOR UPDATE) s",
+            "SELECT * FROM t WHERE id IN (SELECT id FROM u FOR SHARE)",
+        ] {
+            assert!(
+                !analyze_sql(sql).replica_safe,
+                "row lock must not be replica-safe: {sql}"
+            );
+        }
+        // A plain read with the string "for update" in a literal is still replica-safe.
+        assert!(analyze_sql("SELECT 'for update' AS note").replica_safe);
+    }
+
+    #[test]
+    fn test_analyze_temp_object_creation_pins() {
+        for sql in [
+            "CREATE TEMP TABLE t AS SELECT 1",
+            "SELECT 1 INTO TEMP t",
+            "CREATE TEMP VIEW v AS SELECT 1",
+            "CREATE TEMP SEQUENCE s",
+        ] {
+            let a = analyze_sql(sql);
+            assert!(a.pins_session, "temp object creation must pin: {sql}");
+            assert!(!a.replica_safe, "{sql}");
+        }
+        // A permanent CREATE TABLE AS is a write/DDL but does not pin the session.
+        let permanent = analyze_sql("CREATE TABLE t AS SELECT 1");
+        assert!(!permanent.replica_safe);
+        assert!(!permanent.pins_session);
     }
 
     #[test]

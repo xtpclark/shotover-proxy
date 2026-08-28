@@ -1,6 +1,8 @@
 use super::{CodecWriteError, Direction, message_latency};
 use crate::codec::{CodecBuilder, CodecReadError, CodecState};
-use crate::frame::postgres::{GSSENC_REQUEST_CODE, SSL_REQUEST_CODE, message_wire_length};
+use crate::frame::postgres::{
+    CANCEL_REQUEST_CODE, GSSENC_REQUEST_CODE, SSL_REQUEST_CODE, message_wire_length,
+};
 use crate::frame::{Frame, MessageType};
 use crate::message::{Encodable, Message, MessageId, Messages};
 use anyhow::{Result, anyhow};
@@ -8,10 +10,14 @@ use bytes::BytesMut;
 use metrics::Histogram;
 use std::collections::VecDeque;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder};
+
+/// A client that connects must send its SSL negotiation or startup message within this window.
+/// Without it, a client that connects and sends nothing would hold a connection permit forever.
+const CLIENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The result of answering a client's pre-startup negotiation requests.
 pub enum SourcePrologue {
@@ -41,9 +47,9 @@ pub async fn source_prologue(
 ) -> Result<SourcePrologue> {
     let mut header = [0u8; 8];
     loop {
-        match stream.read_exact(&mut header).await {
-            Ok(_) => {}
-            Err(err)
+        match tokio::time::timeout(CLIENT_STARTUP_TIMEOUT, stream.read_exact(&mut header)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err))
                 if matches!(
                     err.kind(),
                     std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
@@ -51,7 +57,13 @@ pub async fn source_prologue(
             {
                 return Ok(SourcePrologue::Disconnected);
             }
-            Err(err) => return Err(err.into()),
+            Ok(Err(err)) => return Err(err.into()),
+            // The client connected but sent no startup within the window: drop it rather than
+            // hold the connection permit indefinitely.
+            Err(_elapsed) => {
+                tracing::debug!("postgres client sent no startup within the timeout, closing");
+                return Ok(SourcePrologue::Disconnected);
+            }
         }
         let length = i32::from_be_bytes(header[0..4].try_into().unwrap());
         let code = i32::from_be_bytes(header[4..8].try_into().unwrap());
@@ -64,12 +76,19 @@ pub async fn source_prologue(
             }
         } else if length == 8 && code == GSSENC_REQUEST_CODE {
             stream.write_all(b"N").await?;
+        } else if code == CANCEL_REQUEST_CODE {
+            // A CancelRequest is sent on its own plaintext connection even to a TLS server (libpq's
+            // PQcancel opens a raw socket with no SSL negotiation). Accept it regardless of whether
+            // this source terminates TLS, and let the codec decode it as a startup-framed message.
+            return Ok(SourcePrologue::Plaintext {
+                prefix: BytesMut::from(&header[..]),
+            });
         } else if tls_configured {
-            // This source terminates TLS: a plaintext startup message is refused,
-            // matching a postgres server whose pg_hba requires hostssl.
-            return Err(anyhow!(
-                "Client attempted a plaintext startup but this source requires TLS"
-            ));
+            // This source terminates TLS: a plaintext startup is refused, matching a postgres
+            // server whose pg_hba requires hostssl. Close quietly (a debug line, not an error per
+            // connection) so a port scanner cannot flood the log.
+            tracing::debug!("postgres source requires TLS; closing a plaintext startup attempt");
+            return Ok(SourcePrologue::Disconnected);
         } else {
             return Ok(SourcePrologue::Plaintext {
                 prefix: BytesMut::from(&header[..]),

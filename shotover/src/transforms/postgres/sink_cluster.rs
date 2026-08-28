@@ -40,8 +40,14 @@ use bytes::{BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
+
+/// Upper bound on how long the proxy waits for a backend to answer during topology probing and
+/// replica authentication. Without it, a backend that accepts the TCP connection but never replies
+/// would block a client connection (and, during probing, every client connection) indefinitely.
+const BACKEND_OP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The protocol version literal for protocol 3.0 (major 3 in the high 16 bits).
 const PROTOCOL_VERSION_3_0: i32 = 196608;
@@ -93,6 +99,7 @@ impl TransformConfig for PostgresSinkClusterConfig {
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
             tls,
             topology: Arc::new(Mutex::new(None)),
+            round_robin: Arc::new(AtomicUsize::new(0)),
         }))
     }
 
@@ -109,8 +116,9 @@ impl TransformConfig for PostgresSinkClusterConfig {
     }
 }
 
-/// The discovered roles of the backend hosts. Shared across all client connections and refreshed
-/// when a connection to the recorded primary fails (basic failover).
+/// The discovered roles of the backend hosts. Probed once and shared across all client
+/// connections. NOTE: it is NOT currently refreshed after a failover — the recorded primary is
+/// used until the process restarts. Dynamic re-probing on primary failure is a follow-up.
 #[derive(Clone, Debug)]
 struct Topology {
     primary: String,
@@ -126,6 +134,9 @@ pub struct PostgresSinkClusterBuilder {
     connect_timeout: Duration,
     tls: Option<TlsConnector>,
     topology: Arc<Mutex<Option<Topology>>>,
+    /// Rotates replica selection across client connections. Shared so it actually advances between
+    /// connections (each connection builds its own Transform).
+    round_robin: Arc<AtomicUsize>,
 }
 
 impl TransformBuilder for PostgresSinkClusterBuilder {
@@ -138,6 +149,7 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             connect_timeout: self.connect_timeout,
             tls: self.tls.clone(),
             topology: self.topology.clone(),
+            round_robin: self.round_robin.clone(),
             force_run_chain: transform_context.force_run_chain,
             primary: None,
             replica: None,
@@ -148,7 +160,6 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             in_transaction: false,
             session_pinned: false,
             unit_target: None,
-            round_robin: 0,
         })
     }
 
@@ -180,6 +191,7 @@ pub struct PostgresSinkCluster {
     connect_timeout: Duration,
     tls: Option<TlsConnector>,
     topology: Arc<Mutex<Option<Topology>>>,
+    round_robin: Arc<AtomicUsize>,
     force_run_chain: Arc<Notify>,
 
     /// Client-auth passthrough connection to the primary.
@@ -202,8 +214,6 @@ pub struct PostgresSinkCluster {
     /// The backend the current request unit is pinned to until a ReadyForQuery 'I' ends the unit.
     /// Keeps a split extended-query pipeline (Parse in one batch, Execute in the next) on one node.
     unit_target: Option<Target>,
-    /// Rotates replica selection across new client connections.
-    round_robin: usize,
 }
 
 #[async_trait]
@@ -242,32 +252,41 @@ impl Transform for PostgresSinkCluster {
 }
 
 impl PostgresSinkCluster {
-    /// Chooses where an incoming request batch goes. Preserves an in-progress unit's node; only
-    /// re-decides at a unit boundary (session idle, no open transaction).
+    /// Chooses where an incoming request batch goes.
+    ///
+    /// Session-state classification runs on EVERY batch, before the unit/transaction short-circuit,
+    /// so a `SET` (or temp table, cursor, named prepare) issued inside a transaction still pins the
+    /// session once the transaction ends. Routing itself preserves an in-progress unit's node and
+    /// only re-decides at a unit boundary (session idle, no open transaction).
     fn decide_target(&mut self, requests: &mut [Message]) -> Target {
+        let mut has_deciding_read = false;
+        let mut has_primary_only = false;
+        for request in requests.iter_mut() {
+            match classify_request(request) {
+                RequestRoute::ReplicaRead => has_deciding_read = true,
+                RequestRoute::Neutral => {}
+                RequestRoute::PinPrimary => {
+                    // A lasting session-state change: pin the whole session to the primary. This
+                    // must happen even mid-transaction, hence it runs before the returns below.
+                    if !self.session_pinned {
+                        tracing::debug!(
+                            "postgres cluster: session pinned to primary by session-state statement"
+                        );
+                    }
+                    self.session_pinned = true;
+                    has_primary_only = true;
+                }
+                RequestRoute::Primary => has_primary_only = true,
+            }
+        }
+
         if let Some(target) = self.unit_target {
             return target;
         }
         if self.session_pinned || self.in_transaction {
             return Target::Primary;
         }
-
-        let mut all_replica_safe = self.replica_available();
-        let mut saw_deciding_read = false;
-        for request in requests.iter_mut() {
-            match classify_request(request) {
-                RequestRoute::ReplicaRead => saw_deciding_read = true,
-                RequestRoute::Neutral => {}
-                RequestRoute::PinPrimary => {
-                    // A lasting session-state change: pin the whole session to the primary.
-                    self.session_pinned = true;
-                    all_replica_safe = false;
-                }
-                RequestRoute::Primary => all_replica_safe = false,
-            }
-        }
-
-        if all_replica_safe && saw_deciding_read {
+        if has_deciding_read && !has_primary_only && self.replica_available() {
             Target::Replica
         } else {
             Target::Primary
@@ -277,9 +296,19 @@ impl PostgresSinkCluster {
     /// Sends a batch to the chosen backend, collects its responses, and updates unit/transaction
     /// state from the trailing ReadyForQuery.
     async fn route(&mut self, target: Target, requests: Messages) -> Result<Messages> {
-        let target = if target == Target::Replica && self.ensure_replica().await.is_err() {
-            // No replica reachable: reads fall back to the primary.
-            Target::Primary
+        let target = if target == Target::Replica {
+            match self.ensure_replica().await {
+                Ok(()) => Target::Replica,
+                Err(err) => {
+                    // No replica reachable: reads fall back to the primary, but say so — a silent
+                    // fallback that also costs a full connect timeout per read is exactly the
+                    // "splitting quietly stopped and everything is slow" failure to avoid.
+                    tracing::warn!(
+                        "postgres cluster: replica unavailable, routing read to primary: {err}"
+                    );
+                    Target::Primary
+                }
+            }
         } else {
             target
         };
@@ -362,10 +391,20 @@ impl PostgresSinkCluster {
 
     /// Probes topology once (shared across all client connections) if it is not already known.
     async fn ensure_topology(&mut self) -> Result<()> {
+        // Fast path: topology already known. Bind the clone in its own statement so the mutex
+        // guard is dropped before select_replica_addr borrows self mutably.
+        let cached = self.topology.lock().await.clone();
+        if let Some(topology) = cached {
+            self.select_replica_addr(&topology);
+            return Ok(());
+        }
+        // Probe WITHOUT holding the shared lock — probing does network I/O to every contact point,
+        // and holding the lock across it would block every other client connection behind one slow
+        // or stalled host.
+        let probed = self.probe_topology().await?;
         let topology = {
             let mut guard = self.topology.lock().await;
             if guard.is_none() {
-                let probed = self.probe_topology().await?;
                 tracing::info!(
                     "postgres cluster topology: primary={} replicas={:?}",
                     probed.primary,
@@ -373,6 +412,7 @@ impl PostgresSinkCluster {
                 );
                 *guard = Some(probed);
             }
+            // Another connection may have probed concurrently; keep whichever landed first.
             guard.as_ref().unwrap().clone()
         };
         self.select_replica_addr(&topology);
@@ -381,8 +421,8 @@ impl PostgresSinkCluster {
 
     fn select_replica_addr(&mut self, topology: &Topology) {
         if self.replica_addr.is_none() && !topology.replicas.is_empty() {
-            let index = self.round_robin % topology.replicas.len();
-            self.round_robin = self.round_robin.wrapping_add(1);
+            // Shared counter so replica choice actually advances across client connections.
+            let index = self.round_robin.fetch_add(1, Ordering::Relaxed) % topology.replicas.len();
             self.replica_addr = Some(topology.replicas[index].clone());
         }
     }
@@ -418,8 +458,15 @@ impl PostgresSinkCluster {
     async fn probe_host(&self, host: &str) -> Result<bool> {
         let mut connection = self.new_backend_connection(host).await?;
         let database = self.probe_database.clone();
-        authenticate_backend(&mut connection, &self.username, &database, &self.password).await?;
-        query_scalar_bool(&mut connection, "SELECT pg_is_in_recovery()").await
+        // Bound the whole authenticate + probe exchange: a host that accepts the connection but
+        // never replies must not hang topology discovery.
+        tokio::time::timeout(BACKEND_OP_TIMEOUT, async {
+            authenticate_backend(&mut connection, &self.username, &database, &self.password)
+                .await?;
+            query_scalar_bool(&mut connection, "SELECT pg_is_in_recovery()").await
+        })
+        .await
+        .map_err(|_| anyhow!("timed out probing {host}"))?
     }
 
     async fn ensure_primary(&mut self) -> Result<()> {
@@ -453,7 +500,12 @@ impl PostgresSinkCluster {
             .ok_or_else(|| anyhow!("client user unknown"))?;
         let database = self.client_database.clone().unwrap_or_else(|| user.clone());
         let mut connection = self.new_backend_connection(&addr).await?;
-        authenticate_backend(&mut connection, &user, &database, &self.password).await?;
+        tokio::time::timeout(
+            BACKEND_OP_TIMEOUT,
+            authenticate_backend(&mut connection, &user, &database, &self.password),
+        )
+        .await
+        .map_err(|_| anyhow!("timed out authenticating to replica {addr}"))??;
         self.replica = Some(connection);
         Ok(())
     }
@@ -613,8 +665,8 @@ async fn query_scalar_bool(connection: &mut SinkConnection, sql: &str) -> Result
     )));
     connection.send(vec![query])?;
 
-    let mut responses = vec![];
     loop {
+        let mut responses = vec![];
         connection.recv_into(&mut responses).await?;
         for response in &mut responses {
             let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() else {
