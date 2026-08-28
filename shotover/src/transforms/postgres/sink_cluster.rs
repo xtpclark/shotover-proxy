@@ -160,6 +160,8 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             in_transaction: false,
             session_pinned: false,
             unit_target: None,
+            outstanding_primary: 0,
+            outstanding_replica: 0,
         })
     }
 
@@ -214,6 +216,10 @@ pub struct PostgresSinkCluster {
     /// The backend the current request unit is pinned to until a ReadyForQuery 'I' ends the unit.
     /// Keeps a split extended-query pipeline (Parse in one batch, Execute in the next) on one node.
     unit_target: Option<Target>,
+    /// Per-node counts of requests still awaiting a response (see [`super::exchange`]). Tracked
+    /// separately because each backend has its own independent pipeline.
+    outstanding_primary: usize,
+    outstanding_replica: usize,
 }
 
 #[async_trait]
@@ -280,10 +286,19 @@ impl PostgresSinkCluster {
             }
         }
 
+        // A pinned session must run on the primary even if a replica-routed unit is still open:
+        // the session-state statement itself has to execute on the primary, not just be recorded as
+        // a future pin (otherwise a named prepare runs on the replica and its later Execute, now
+        // routed to the primary, fails with "prepared statement does not exist"). Overriding the
+        // open unit here abandons at most an un-Synced replica read pipeline, which is safe.
+        if self.session_pinned {
+            self.unit_target = Some(Target::Primary);
+            return Target::Primary;
+        }
         if let Some(target) = self.unit_target {
             return target;
         }
-        if self.session_pinned || self.in_transaction {
+        if self.in_transaction {
             return Target::Primary;
         }
         if has_deciding_read && !has_primary_only && self.replica_available() {
@@ -314,32 +329,42 @@ impl PostgresSinkCluster {
         };
         self.unit_target = Some(target);
 
-        let requests_count = requests.len();
-        let connection = match target {
-            Target::Primary => self.primary.as_mut().unwrap(),
-            Target::Replica => self.replica.as_mut().unwrap(),
+        // Send to the chosen node, tracking that node's outstanding responses. Extended-query
+        // batches that carry no Flush/Sync produce no responses yet; super::exchange handles that
+        // without blocking, so a split pipeline cannot deadlock the connection.
+        let mut responses = match target {
+            Target::Primary => {
+                super::exchange(
+                    self.primary.as_mut().unwrap(),
+                    requests,
+                    &mut self.outstanding_primary,
+                )
+                .await?
+            }
+            Target::Replica => {
+                super::exchange(
+                    self.replica.as_mut().unwrap(),
+                    requests,
+                    &mut self.outstanding_replica,
+                )
+                .await?
+            }
         };
-        connection.send(requests)?;
+        self.note_unit_boundary(&mut responses);
+        Ok(responses)
+    }
 
-        let mut responses = vec![];
-        let mut responses_count = 0;
-        while responses_count < requests_count {
-            let old = responses.len();
-            connection.recv_into(&mut responses).await?;
-            for response in &mut responses[old..] {
-                if response.request_id().is_some() {
-                    responses_count += 1;
-                }
-                if let Some(status) = trailing_ready_status(response) {
-                    // A ReadyForQuery ends the current unit and reports transaction state.
-                    self.in_transaction = status != b'I';
-                    if status == b'I' {
-                        self.unit_target = None;
-                    }
+    /// Updates transaction/unit state from the trailing ReadyForQuery of a response batch.
+    fn note_unit_boundary(&mut self, responses: &mut [Message]) {
+        for response in responses.iter_mut() {
+            if let Some(status) = trailing_ready_status(response) {
+                // A ReadyForQuery ends the current unit and reports transaction state.
+                self.in_transaction = status != b'I';
+                if status == b'I' {
+                    self.unit_target = None;
                 }
             }
         }
-        Ok(responses)
     }
 
     /// Routes the client's startup and authentication exchange to the primary by passthrough,
@@ -362,24 +387,17 @@ impl PostgresSinkCluster {
         }
 
         let requests = std::mem::take(&mut chain_state.requests);
-        let requests_count = requests.len();
-        let primary = self.primary.as_mut().unwrap();
-        primary.send(requests)?;
-
-        let mut responses = vec![];
-        let mut responses_count = 0;
-        while responses_count < requests_count {
-            let old = responses.len();
-            primary.recv_into(&mut responses).await?;
-            for response in &mut responses[old..] {
-                if response.request_id().is_some() {
-                    responses_count += 1;
-                }
-                if let Some(status) = trailing_ready_status(response) {
-                    // The first ReadyForQuery means authentication succeeded and the session is live.
-                    self.startup_complete = true;
-                    self.in_transaction = status != b'I';
-                }
+        let mut responses = super::exchange(
+            self.primary.as_mut().unwrap(),
+            requests,
+            &mut self.outstanding_primary,
+        )
+        .await?;
+        for response in responses.iter_mut() {
+            if let Some(status) = trailing_ready_status(response) {
+                // The first ReadyForQuery means authentication succeeded and the session is live.
+                self.startup_complete = true;
+                self.in_transaction = status != b'I';
             }
         }
         Ok(responses)
@@ -391,20 +409,14 @@ impl PostgresSinkCluster {
 
     /// Probes topology once (shared across all client connections) if it is not already known.
     async fn ensure_topology(&mut self) -> Result<()> {
-        // Fast path: topology already known. Bind the clone in its own statement so the mutex
-        // guard is dropped before select_replica_addr borrows self mutably.
-        let cached = self.topology.lock().await.clone();
-        if let Some(topology) = cached {
-            self.select_replica_addr(&topology);
-            return Ok(());
-        }
-        // Probe WITHOUT holding the shared lock — probing does network I/O to every contact point,
-        // and holding the lock across it would block every other client connection behind one slow
-        // or stalled host.
-        let probed = self.probe_topology().await?;
+        // The probe runs while holding the shared lock so that a burst of connections at cold start
+        // does not each run a full probe of every host (a thundering herd against a backend that is
+        // least able to absorb it). Holding the lock is only safe because every probe is bounded by
+        // BACKEND_OP_TIMEOUT, so one stalled host delays the lock by at most that, once.
         let topology = {
             let mut guard = self.topology.lock().await;
             if guard.is_none() {
+                let probed = self.probe_topology().await?;
                 tracing::info!(
                     "postgres cluster topology: primary={} replicas={:?}",
                     probed.primary,
@@ -412,7 +424,6 @@ impl PostgresSinkCluster {
                 );
                 *guard = Some(probed);
             }
-            // Another connection may have probed concurrently; keep whichever landed first.
             guard.as_ref().unwrap().clone()
         };
         self.select_replica_addr(&topology);

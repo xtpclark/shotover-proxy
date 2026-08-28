@@ -95,6 +95,7 @@ impl TransformBuilder for PostgresSinkSingleBuilder {
             connection: None,
             connect_timeout: self.connect_timeout,
             force_run_chain: transform_context.force_run_chain,
+            outstanding: 0,
         })
     }
 
@@ -117,6 +118,10 @@ pub struct PostgresSinkSingle {
     connection: Option<SinkConnection>,
     connect_timeout: Duration,
     force_run_chain: Arc<Notify>,
+    /// Requests sent to the server that have not yet been answered — see [`super::exchange`].
+    /// Carried across batches because an extended-query pipeline's responses arrive on the batch
+    /// that carries the Flush/Sync, which may be a later one than the batch that sent the requests.
+    outstanding: usize,
 }
 
 // A note on SCRAM channel binding (SCRAM-SHA-256-PLUS) through a TLS terminating proxy.
@@ -204,27 +209,12 @@ impl Transform for PostgresSinkSingle {
                 .unwrap()
                 .try_recv_into(&mut responses);
         } else {
-            let requests_count = chain_state.requests.len();
-            self.connection
-                .as_mut()
-                .unwrap()
-                .send(std::mem::take(&mut chain_state.requests))?;
-
-            let mut responses_count = 0;
-            while responses_count < requests_count {
-                let responses_len_old = responses.len();
-                self.connection
-                    .as_mut()
-                    .unwrap()
-                    .recv_into(&mut responses)
-                    .await?;
-
-                for response in &responses[responses_len_old..] {
-                    if response.request_id().is_some() {
-                        responses_count += 1;
-                    }
-                }
-            }
+            responses = super::exchange(
+                self.connection.as_mut().unwrap(),
+                std::mem::take(&mut chain_state.requests),
+                &mut self.outstanding,
+            )
+            .await?;
         }
         responses.append(&mut cancel_responses);
         Ok(responses)

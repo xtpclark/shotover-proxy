@@ -487,11 +487,24 @@ mapping are follow-ups.
 This transform will replace the value of a named result column with a fixed
 replacement string in every row returned to the client. NULL values stay NULL.
 
-The column is matched by name against the row shape in the most recent
-`RowDescription` seen on the connection, which covers both the simple and the
-extended query protocol. The replacement is written as a text format value, so
+The column is matched by name against the row shape from the result's
+`RowDescription`. The replacement is written as a text format value, so
 redacting a column fetched in binary format hands the client bytes it may fail
 to decode - still redacted, just less politely.
+
+This is a security control, so it fails **closed**: if it cannot determine the
+row shape for a set of rows it is about to pass on, it replaces the whole
+response with an error rather than risk leaking an unredacted value. Two
+consequences worth knowing before you deploy it:
+
+- A driver that caches a prepared statement and skips `Describe` on
+  re-execution produces rows with no `RowDescription` in that exchange; those
+  queries error instead of returning data. Correctly redacting cached
+  statements needs per-portal shape tracking, which is a planned follow-up.
+- `COPY ... TO STDOUT` carries rows outside `DataRow` messages and cannot be
+  redacted here, so **any** COPY-based read through a chain containing this
+  transform fails closed regardless of which columns the table has. `pg_dump`
+  and other COPY consumers will not work through such a chain.
 
 ```yaml
 - PostgresRedactColumn:

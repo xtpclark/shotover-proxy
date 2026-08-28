@@ -1,6 +1,6 @@
 use crate::frame::postgres::{BackendMessage, PostgresFrame};
 use crate::frame::{Frame, MessageType};
-use crate::message::{Message, MessageErrorType, Messages};
+use crate::message::{Message, Messages};
 use crate::transforms::{
     ChainState, DownChainProtocol, Transform, TransformBuilder, TransformConfig,
     TransformContextBuilder, TransformContextConfig, UpChainProtocol,
@@ -136,18 +136,41 @@ impl Transform for PostgresRedactColumn {
             if let Err(reason) = self.redact_response(response) {
                 // Fail closed: never let an unredactable result reach the client. Replace it with
                 // an error carrying the same request id so the client sees a failure, not data.
-                match response.from_response_to_error_response(
-                    format!("PostgresRedactColumn: {reason}"),
-                    MessageErrorType::Internal,
-                ) {
-                    Ok(error) => *response = error,
-                    // If we cannot even build an error response, drop the message rather than leak.
-                    Err(_) => response.replace_with_dummy(),
-                }
+                *response = fail_closed_response(response, &reason);
             }
         }
         Ok(responses)
     }
+}
+
+/// Builds the error that replaces an unredactable response.
+///
+/// It appends a ReadyForQuery ONLY when the response being replaced carried one (a simple-query
+/// train), so the client's transaction-state machine stays in sync. An extended-protocol Execute
+/// train carries no ReadyForQuery — that comes with the client's Sync — so replacing it with an
+/// error+ReadyForQuery would deliver two ReadyForQuery for one Sync and desync the client.
+fn fail_closed_response(original: &mut Message, reason: &str) -> Message {
+    let had_ready_for_query = matches!(
+        original.frame(),
+        Some(Frame::Postgres(PostgresFrame::Response(messages)))
+            if messages.iter().any(|m| matches!(m, BackendMessage::ReadyForQuery { .. }))
+    );
+    let mut messages = vec![BackendMessage::ErrorResponse {
+        fields: vec![
+            (b'S', "ERROR".to_owned()),
+            (b'V', "ERROR".to_owned()),
+            (b'C', "XX000".to_owned()),
+            (b'M', format!("PostgresRedactColumn: {reason}")),
+        ],
+    }];
+    if had_ready_for_query {
+        messages.push(BackendMessage::ReadyForQuery { status: b'I' });
+    }
+    let mut response = Message::from_frame(Frame::Postgres(PostgresFrame::Response(messages)));
+    if let Some(id) = original.request_id() {
+        response.set_request_id(id);
+    }
+    response
 }
 
 impl PostgresRedactColumn {
@@ -195,10 +218,14 @@ impl PostgresRedactColumn {
                             fail = Some("cannot redact COPY output".to_owned());
                         }
                     }
-                    // A result boundary: the next result must establish its own shape.
+                    // A result boundary: the next result must establish its own shape. NOTE:
+                    // PortalSuspended is deliberately NOT here — it means the portal was suspended
+                    // MID-result (Execute hit its row limit), and the next Execute continues the
+                    // SAME result with the same shape and no new RowDescription. Treating it as a
+                    // boundary would fail-close every paginated fetch (JDBC setFetchSize, psycopg
+                    // named cursors).
                     BackendMessage::CommandComplete { .. }
                     | BackendMessage::EmptyQueryResponse
-                    | BackendMessage::PortalSuspended
                     | BackendMessage::ReadyForQuery { .. } => {
                         self.shape = Shape::Unknown;
                     }
@@ -351,5 +378,67 @@ mod tests {
             column_formats: vec![0],
         }]);
         assert!(r.redact_response(&mut m).is_err());
+    }
+
+    #[test]
+    fn test_portal_suspended_continues_the_same_result() {
+        // A paginated fetch: Execute(max_rows) returns rows then PortalSuspended; the next Execute
+        // continues the SAME result with no new RowDescription. Redaction must persist, not fail.
+        let mut r = redactor();
+        let mut first = response(vec![
+            BackendMessage::RowDescription {
+                fields: vec![field("ssn")],
+            },
+            BackendMessage::DataRow {
+                values: vec![Some(Bytes::from_static(b"111-22-3333"))],
+            },
+            BackendMessage::PortalSuspended,
+        ]);
+        assert!(r.redact_response(&mut first).is_ok());
+        assert_eq!(data_row_value(&mut first, 1, 0), b"[REDACTED]");
+        // The resumed batch carries only DataRows and PortalSuspended, no RowDescription.
+        let mut resumed = response(vec![
+            BackendMessage::DataRow {
+                values: vec![Some(Bytes::from_static(b"444-55-6666"))],
+            },
+            BackendMessage::PortalSuspended,
+        ]);
+        assert!(
+            r.redact_response(&mut resumed).is_ok(),
+            "a suspended-portal continuation must not fail closed"
+        );
+        assert_eq!(data_row_value(&mut resumed, 0, 0), b"[REDACTED]");
+    }
+
+    #[test]
+    fn test_fail_closed_response_matches_ready_for_query_of_original() {
+        // Replacing a simple-query train (which carries ReadyForQuery) keeps a ReadyForQuery.
+        let mut simple = response(vec![
+            BackendMessage::DataRow { values: vec![] },
+            BackendMessage::CommandComplete {
+                tag: "SELECT 1".to_owned(),
+            },
+            BackendMessage::ReadyForQuery { status: b'I' },
+        ]);
+        let mut replaced = fail_closed_response(&mut simple, "x");
+        assert!(matches!(
+            replaced.frame(),
+            Some(Frame::Postgres(PostgresFrame::Response(m)))
+                if m.iter().any(|x| matches!(x, BackendMessage::ReadyForQuery { .. }))
+        ));
+        // Replacing an extended Execute train (no ReadyForQuery) must NOT add one, or the client
+        // would see two ReadyForQuery for one Sync.
+        let mut extended = response(vec![
+            BackendMessage::DataRow { values: vec![] },
+            BackendMessage::CommandComplete {
+                tag: "SELECT 1".to_owned(),
+            },
+        ]);
+        let mut replaced = fail_closed_response(&mut extended, "x");
+        assert!(matches!(
+            replaced.frame(),
+            Some(Frame::Postgres(PostgresFrame::Response(m)))
+                if !m.iter().any(|x| matches!(x, BackendMessage::ReadyForQuery { .. }))
+        ));
     }
 }
