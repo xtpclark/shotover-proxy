@@ -114,12 +114,14 @@ enum Shape {
 }
 
 /// What a request in flight will produce, so its response can be interpreted when it comes back.
+/// The statement name is `None` when a portal could not be resolved to a statement — the shape is
+/// then unknown, and an Execute of it fails closed rather than defaulting to the unnamed statement.
 #[derive(Debug, Clone)]
 enum Awaiting {
     /// A Describe: its RowDescription (or NoData) establishes the shape of this statement.
-    Describe(String),
+    Describe(Option<String>),
     /// An Execute: its DataRows are redacted using this statement's remembered shape.
-    Execute(String),
+    Execute(Option<String>),
     /// A simple Query: its response train carries its own RowDescription.
     SimpleQuery,
 }
@@ -153,11 +155,17 @@ impl Transform for PostgresRedactColumn {
 
         let mut responses = chain_state.call_next_transform().await?;
         for response in &mut responses {
-            // Only postgres server responses are candidates; skip Dummy and anything else.
+            // Remove the pending entry for this response whatever its kind, so entries for requests
+            // answered by a synthesised Dummy (e.g. requests discarded after an extended-protocol
+            // error) do not accumulate on a long-lived connection.
+            let awaiting = response
+                .request_id()
+                .and_then(|id| self.pending.remove(&id));
+            // Only postgres server responses carry rows to redact; Dummy and anything else pass on.
             if response.message_type() != MessageType::Postgres {
                 continue;
             }
-            if let Err(reason) = self.redact_response(response) {
+            if let Err(reason) = self.redact_response(response, awaiting) {
                 // Fail closed: never let an unredactable result reach the client. Replace it with
                 // an error carrying the same request id so the client sees a failure, not data.
                 *response = fail_closed_response(response, &reason);
@@ -219,23 +227,19 @@ impl PostgresRedactColumn {
             }
             FrontendMessage::Describe { kind, name } => {
                 // 'S' describes a statement directly; 'P' describes a portal — resolve to its
-                // statement so all portals of a statement share the one remembered shape.
+                // statement so all portals of a statement share the one remembered shape. An
+                // unresolvable portal stays None (unknown) rather than defaulting to "".
                 let statement = if *kind == b'S' {
-                    name.clone()
+                    Some(name.clone())
                 } else {
-                    self.portal_statements
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_default()
+                    self.portal_statements.get(name).cloned()
                 };
                 self.pending.insert(id, Awaiting::Describe(statement));
             }
             FrontendMessage::Execute { portal_name, .. } => {
-                let statement = self
-                    .portal_statements
-                    .get(portal_name)
-                    .cloned()
-                    .unwrap_or_default();
+                // An unresolvable portal stays None (unknown), so redaction fails closed rather than
+                // defaulting to the unnamed statement's shape.
+                let statement = self.portal_statements.get(portal_name).cloned();
                 self.pending.insert(id, Awaiting::Execute(statement));
             }
             FrontendMessage::Query { .. } => {
@@ -253,20 +257,21 @@ impl PostgresRedactColumn {
     }
 
     /// Redacts a single server response in place, or returns Err with a reason if the result cannot
-    /// be redacted safely (the caller then fails the response closed).
-    fn redact_response(&mut self, response: &mut Message) -> Result<(), String> {
-        // What request produced this response tells us which statement's shape applies.
-        let awaiting = response
-            .request_id()
-            .and_then(|id| self.pending.remove(&id));
+    /// be redacted safely (the caller then fails the response closed). `awaiting` says what request
+    /// produced this response, and therefore which statement's shape applies.
+    fn redact_response(
+        &mut self,
+        response: &mut Message,
+        awaiting: Option<Awaiting>,
+    ) -> Result<(), String> {
         let statement = match &awaiting {
-            Some(Awaiting::Describe(s)) | Some(Awaiting::Execute(s)) => Some(s.clone()),
+            Some(Awaiting::Describe(s)) | Some(Awaiting::Execute(s)) => s.clone(),
             _ => None,
         };
         // An Execute starts from its statement's remembered shape; everything else starts unknown
         // and relies on a RowDescription within the response itself.
         let mut shape: Option<Shape> = match &awaiting {
-            Some(Awaiting::Execute(s)) => self.statement_shapes.get(s).copied(),
+            Some(Awaiting::Execute(Some(s))) => self.statement_shapes.get(s).copied(),
             _ => None,
         };
 
@@ -393,6 +398,12 @@ mod tests {
         m
     }
 
+    /// Mirrors the transform's response handling: pop the pending entry for this response and redact.
+    fn redact(r: &mut PostgresRedactColumn, response: &mut Message) -> Result<(), String> {
+        let awaiting = response.request_id().and_then(|id| r.pending.remove(&id));
+        r.redact_response(response, awaiting)
+    }
+
     fn data_row_value(message: &mut Message, row: usize, col: usize) -> Vec<u8> {
         match message.frame() {
             Some(Frame::Postgres(PostgresFrame::Response(messages))) => match &messages[row] {
@@ -421,7 +432,7 @@ mod tests {
             },
             BackendMessage::ReadyForQuery { status: b'I' },
         ]);
-        assert!(r.redact_response(&mut m).is_ok());
+        assert!(redact(&mut r, &mut m).is_ok());
         assert_eq!(data_row_value(&mut m, 1, 1), b"[REDACTED]");
         assert_eq!(data_row_value(&mut m, 1, 0), b"1"); // other columns untouched
     }
@@ -450,7 +461,7 @@ mod tests {
                 },
             ],
         );
-        assert!(r.redact_response(&mut m).is_err());
+        assert!(redact(&mut r, &mut m).is_err());
     }
 
     #[test]
@@ -479,7 +490,7 @@ mod tests {
                 fields: vec![field("ssn")],
             }],
         );
-        assert!(r.redact_response(&mut describe).is_ok());
+        assert!(redact(&mut r, &mut describe).is_ok());
 
         // Now a cached re-execution: Bind + Execute, no Describe.
         note(&mut r, bind("p", "s"));
@@ -501,8 +512,31 @@ mod tests {
                 },
             ],
         );
-        assert!(r.redact_response(&mut execute).is_ok());
+        assert!(redact(&mut r, &mut execute).is_ok());
         assert_eq!(data_row_value(&mut execute, 0, 0), b"[REDACTED]");
+    }
+
+    #[test]
+    fn test_execute_of_unbound_portal_fails_closed() {
+        // An Execute of a portal that was never Bound cannot be resolved to a statement. It must
+        // fail closed, NOT default to the unnamed statement's shape (which every driver reuses).
+        let mut r = redactor();
+        // Give the unnamed statement a real shape, to prove an unresolvable portal does not borrow it.
+        r.statement_shapes.insert(String::new(), Shape::At(0));
+        let e = note(
+            &mut r,
+            FrontendMessage::Execute {
+                portal_name: "never_bound".to_owned(),
+                max_rows: 0,
+            },
+        );
+        let mut m = response_for(
+            e,
+            vec![BackendMessage::DataRow {
+                values: vec![Some(Bytes::from_static(b"111-22-3333"))],
+            }],
+        );
+        assert!(redact(&mut r, &mut m).is_err());
     }
 
     #[test]
@@ -523,7 +557,7 @@ mod tests {
             },
             BackendMessage::ReadyForQuery { status: b'I' },
         ]);
-        assert!(r.redact_response(&mut m).is_ok());
+        assert!(redact(&mut r, &mut m).is_ok());
         assert_eq!(data_row_value(&mut m, 1, 1), b"alice");
     }
 
@@ -534,7 +568,7 @@ mod tests {
             overall_format: 0,
             column_formats: vec![0],
         }]);
-        assert!(r.redact_response(&mut m).is_err());
+        assert!(redact(&mut r, &mut m).is_err());
     }
 
     #[test]
@@ -573,7 +607,7 @@ mod tests {
                 fields: vec![field("ssn")],
             }],
         );
-        assert!(r.redact_response(&mut describe).is_ok());
+        assert!(redact(&mut r, &mut describe).is_ok());
         let mut exec1 = response_for(
             e1,
             vec![
@@ -583,11 +617,11 @@ mod tests {
                 BackendMessage::PortalSuspended,
             ],
         );
-        assert!(r.redact_response(&mut exec1).is_ok());
+        assert!(redact(&mut r, &mut exec1).is_ok());
         assert_eq!(data_row_value(&mut exec1, 0, 0), b"[REDACTED]");
         // The Sync's ReadyForQuery arrives (its own response), resetting only the local shape.
         let mut ready = response(vec![BackendMessage::ReadyForQuery { status: b'T' }]);
-        assert!(r.redact_response(&mut ready).is_ok());
+        assert!(redact(&mut r, &mut ready).is_ok());
 
         // Second Execute on the same portal, no Describe: must still redact from the statement shape.
         let e2 = note(
@@ -607,7 +641,7 @@ mod tests {
             ],
         );
         assert!(
-            r.redact_response(&mut exec2).is_ok(),
+            redact(&mut r, &mut exec2).is_ok(),
             "a portal resumed after a Sync must not fail closed"
         );
         assert_eq!(data_row_value(&mut exec2, 0, 0), b"[REDACTED]");
