@@ -12,9 +12,11 @@ set -e
 
 cd "$(dirname "$0")"
 
-# Install dependencies of the cpp-driver even if they are already on CI so that we can run this locally
+# Install dependencies of the cpp-driver even if they are already on CI so that we can run this locally.
+# libclang-dev is required by the postgres feature: pg_query's build script runs bindgen over
+# libpg_query, which needs libclang.
 sudo apt-get update
-sudo apt-get install -y libuv1 libuv1-dev cmake g++ libssl-dev zlib1g-dev libcurl4-openssl-dev
+sudo apt-get install -y libuv1 libuv1-dev cmake g++ libssl-dev zlib1g-dev libcurl4-openssl-dev libclang-dev
 # libcurl4-openssl-dev can probalbly be removed once this PR reaches an rdkafka release https://github.com/confluentinc/librdkafka/pull/5230
 
 # set VERSION to one of the tags here: https://github.com/datastax/cpp-driver/tags
