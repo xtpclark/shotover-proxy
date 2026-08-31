@@ -25,7 +25,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio::time::Duration;
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::codec::{Decoder, FramedRead, FramedWrite};
 use tracing::{Instrument, info, trace};
 use tracing::{debug, error, warn};
 
@@ -550,8 +550,11 @@ pub fn spawn_read_write_tasks<
     let mut reader = FramedRead::new(rx, decoder);
     let mut writer = FramedWrite::new(tx, encoder);
     if let Some(seed) = read_buffer_seed {
-        // Bytes already consumed from the socket before the codec took over
-        // (e.g. by a protocol negotiation prologue) are decoded first.
+        // Bytes already consumed from the socket before the codec took over (e.g. a postgres startup
+        // read in full by the negotiation prologue). The reader task decodes these up front BEFORE its
+        // first socket read — FramedRead reads before it decodes, so a fully-seeded message with no
+        // trailing wire bytes would otherwise never decode (the client has sent its startup and is
+        // awaiting our reply). See the drain block at the top of the reader task.
         reader.read_buffer_mut().extend_from_slice(&seed);
     }
 
@@ -572,6 +575,36 @@ pub fn spawn_read_write_tasks<
     // reader task
     tokio::spawn(
         async move {
+            // A protocol prologue (postgres startup) may have seeded a COMPLETE message into the read
+            // buffer above. FramedRead performs a socket read BEFORE decoding on its first poll, so a
+            // fully-buffered message with no trailing bytes on the wire would never decode — the client
+            // has sent its startup and is waiting for our response, so no more bytes arrive. Decode
+            // everything already buffered up front; the socket-read loop below then handles the rest (a
+            // partially-seeded buffer is simply completed by the loop's first read).
+            {
+                let mut buffered = std::mem::take(reader.read_buffer_mut());
+                loop {
+                    match reader.decoder_mut().decode(&mut buffered) {
+                        Ok(Some(messages)) => {
+                            if in_tx.send(messages).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(CodecReadError::RespondAndThenCloseConnection(messages)) => {
+                            if let Err(err) = out_tx.send(messages) {
+                                error!("Failed to send RespondAndThenCloseConnection message: {err}");
+                            }
+                            return;
+                        }
+                        Err(err) => {
+                            warn!("failed to decode seeded startup message: {err:?}");
+                            return;
+                        }
+                    }
+                }
+                *reader.read_buffer_mut() = buffered;
+            }
             loop {
                 tokio::select! {
                     result = reader.next() => {
