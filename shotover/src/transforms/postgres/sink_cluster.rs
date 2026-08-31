@@ -285,16 +285,17 @@ impl PostgresSinkCluster {
                 RequestRoute::Primary => has_primary_only = true,
             }
         }
-        // A batch may open a replica unit ONLY if it ends AT its flush point with nothing trailing —
-        // trailing_unanswerable(..) == Some(0). "Contains a Sync/Query" is NOT enough: a batch like
-        // [Parse, Bind, Describe, Execute, Sync, Parse] contains a Sync yet leaves the trailing Parse
-        // buffered past the last flush point (exchange() leaves it outstanding). Opening a replica
-        // unit for it strands that Parse on the replica while its continuation ([Bind, Execute, Sync])
-        // routes to the primary and errors "unnamed prepared statement does not exist". Requiring
-        // Some(0) keeps a replica unit fully drained within one exchange() call so it never spans
-        // batches; [Query] and [Parse, Bind, Describe, Execute, Sync] still qualify (both Some(0)) —
-        // only a batch with something trailing its flush point loses offload to the primary.
-        let self_terminating = matches!(super::trailing_unanswerable(requests), Some(0));
+        // A batch may open a replica unit ONLY if its LAST request is a Sync or a simple Query — a
+        // flush point that yields a ReadyForQuery, which closes the unit within this exchange() call so
+        // it never spans batches. Two shapes must NOT open one; both leave the unit open and strand the
+        // next batch on the replica (the finding-2 hazard):
+        //   * a trailing partial pipeline, e.g. [Parse, Bind, Describe, Execute, Sync, Parse] — the
+        //     Parse after the Sync is buffered, so the last request is not a terminator;
+        //   * a Flush (or CopyDone/CopyFail) terminator, e.g. [Parse, Bind, Describe, Execute, Flush] —
+        //     a flush point, but it yields NO ReadyForQuery, so note_unit_boundary never closes the
+        //     unit. (trailing_unanswerable == Some(0) alone admitted this, because request_triggers_flush
+        //     counts Flush — a regression that spanned a replica unit into the next write.)
+        let self_terminating = ends_with_ready_for_query(requests);
 
         // A pinned session runs on the primary. Because a replica unit never spans batches (only
         // self-terminating batches go to the replica), there is never an outstanding replica unit to
@@ -554,6 +555,20 @@ enum RequestRoute {
     Neutral,
 }
 
+/// True if the batch's LAST request is a Sync or a simple Query — a flush point that yields a
+/// ReadyForQuery, closing its response unit within one exchange() call. Only such a batch may open a
+/// replica unit (see decide_target): a Flush/CopyDone/CopyFail terminator is a flush point too but
+/// yields no ReadyForQuery, so its unit would never close and would strand the next batch on the
+/// replica; a trailing partial pipeline likewise does not end in a terminator.
+fn ends_with_ready_for_query(requests: &mut [Message]) -> bool {
+    matches!(
+        requests.last_mut().and_then(|r| r.frame()),
+        Some(Frame::Postgres(PostgresFrame::Request(
+            FrontendMessage::Sync | FrontendMessage::Query { .. }
+        )))
+    )
+}
+
 fn classify_request(request: &mut Message) -> RequestRoute {
     match request.frame() {
         Some(Frame::Postgres(PostgresFrame::Request(message))) => match message {
@@ -779,12 +794,12 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_self_terminating() {
-        // decide_target opens a replica unit only for a batch that ENDS AT its flush point with
-        // nothing trailing (trailing_unanswerable == Some(0)). A simple Query and a complete extended
-        // pipeline qualify; a pipeline with a trailing Parse after the Sync does NOT — that is the
-        // finding-2 shape that stranded a statement's Parse on the replica while its continuation hit
-        // the primary and errored "unnamed prepared statement does not exist".
+    fn test_batch_opens_replica_unit_only_when_ending_in_ready_for_query() {
+        // decide_target opens a replica unit only for a batch whose LAST request is a Sync or a simple
+        // Query — a flush point that yields a ReadyForQuery and closes the unit within one exchange().
+        // A trailing partial pipeline does NOT (finding-2 original); a Flush/CopyDone terminator does
+        // NOT either (finding-2 REGRESSION — a flush point that yields no ReadyForQuery, so its unit
+        // never closes and spans into the next batch).
         fn req(message: FrontendMessage) -> Message {
             Message::from_frame(Frame::Postgres(PostgresFrame::Request(message)))
         }
@@ -809,22 +824,20 @@ mod tests {
                 max_rows: 0,
             }
         }
-        let terminating = |mut batch: Vec<Message>| {
-            matches!(super::super::trailing_unanswerable(&mut batch), Some(0))
-        };
+        let opens_replica = |mut batch: Vec<Message>| ends_with_ready_for_query(&mut batch);
 
-        // Ends at its flush point → qualifies (still offloads to a replica).
-        assert!(terminating(vec![query("SELECT 1")]));
-        assert!(terminating(vec![parse("", "SELECT 1"), req(FrontendMessage::Sync)]));
-        assert!(terminating(vec![
+        // Ends in a Sync or simple Query → qualifies (offloads to a replica).
+        assert!(opens_replica(vec![query("SELECT 1")]));
+        assert!(opens_replica(vec![parse("", "SELECT 1"), req(FrontendMessage::Sync)]));
+        assert!(opens_replica(vec![
             parse("", "SELECT 1"),
             req(bind()),
             req(describe()),
             req(execute()),
             req(FrontendMessage::Sync),
         ]));
-        // A trailing Parse after the Sync → NOT self-terminating (the finding-2 shape).
-        assert!(!terminating(vec![
+        // A trailing Parse after the Sync → does NOT qualify (finding-2 original).
+        assert!(!opens_replica(vec![
             parse("", "SELECT 1"),
             req(bind()),
             req(describe()),
@@ -832,8 +845,18 @@ mod tests {
             req(FrontendMessage::Sync),
             parse("", "SELECT 1"),
         ]));
-        // No flush point at all → not self-terminating.
-        assert!(!terminating(vec![parse("", "SELECT 1")]));
+        // A Flush terminator → does NOT qualify (finding-2 REGRESSION: a flush point with no RFQ).
+        assert!(!opens_replica(vec![
+            parse("", "SELECT 1"),
+            req(bind()),
+            req(describe()),
+            req(execute()),
+            req(FrontendMessage::Flush),
+        ]));
+        // A CopyDone terminator → does NOT qualify either.
+        assert!(!opens_replica(vec![req(FrontendMessage::CopyDone)]));
+        // No terminator at all → does not qualify.
+        assert!(!opens_replica(vec![parse("", "SELECT 1")]));
     }
 
     #[test]
