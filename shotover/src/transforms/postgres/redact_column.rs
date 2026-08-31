@@ -51,15 +51,14 @@ use std::collections::HashMap;
 /// keeps the redaction it CAN do honest; it is not a substitute for the guarantee that label-matching
 /// cannot provide (see above).
 ///
-/// A fail-close inside a transaction reports the aborted status ('E') so a client that rolls back on
-/// error — as most drivers do — undoes the statement's real effect and the two ends reconverge. Its
-/// limits, by construction: (1) the statement ALREADY executed on the server (a fail-close hides the
-/// result, it does not prevent the statement), so a client that instead COMMITs an apparently-aborted
-/// transaction commits it on the server — the status agrees, the outcome may not; and (2) the abort
-/// marker is applied to the next ReadyForQuery, so a fail-close on a Flush-terminated Execute followed
-/// by an explicit simple-query ROLLBACK briefly reports that ROLLBACK as 'E' (it self-corrects on the
-/// next statement). Both are the residue of a response-side transform being unable to abort a server
-/// transaction — not fixable at this layer.
+/// A fail-close INSIDE a transaction closes the client connection (after delivering the error, so the
+/// client learns why). A response-side transform cannot roll back a statement that already executed on
+/// the server, but dropping the connection makes the server do it: the sink connection closes with the
+/// client's, the server rolls the transaction back, and every driver reads a dropped connection as
+/// "transaction lost, nothing committed" — which is then exactly true. This is the honest resolution of
+/// a limitation a status-byte rewrite could only paper over (a client that COMMITs an apparently-
+/// aborted transaction would otherwise commit it on the server). Outside a transaction there is nothing
+/// to abort: the error is self-coherent (idle 'I' for a simple query) and the connection stays open.
 ///
 /// NULL values stay NULL. The replacement is written as a text-format value: redacting a column
 /// fetched in binary format hands the client bytes it may fail to decode — still redacted.
@@ -121,7 +120,6 @@ impl TransformBuilder for PostgresRedactColumnBuilder {
             portal_statements: HashMap::new(),
             pending: HashMap::new(),
             in_transaction: false,
-            pending_abort: false,
         })
     }
 
@@ -170,12 +168,9 @@ pub struct PostgresRedactColumn {
     /// Requests in flight that produce a shape-relevant response, keyed by request id.
     pending: HashMap<MessageId, Awaiting>,
     /// Whether the session is currently inside a transaction, tracked from the ReadyForQuery status
-    /// the redactor ultimately emits (any status other than 'I' means in a transaction).
+    /// the server emits (any status other than 'I' means in a transaction). A fail-close inside a
+    /// transaction closes the connection so the server rolls back — see the transform loop.
     in_transaction: bool,
-    /// Set when an extended-protocol Execute failed closed inside a transaction: the next
-    /// ReadyForQuery (arriving with the client's Sync) is rewritten to the aborted state 'E' so the
-    /// client and server agree the transaction failed.
-    pending_abort: bool,
 }
 
 #[async_trait]
@@ -210,9 +205,18 @@ impl Transform for PostgresRedactColumn {
                 // Fail closed: never let an unredactable result reach the client. Replace it with
                 // an error carrying the same request id so the client sees a failure, not data.
                 *response = self.fail_closed_response(response, &reason);
+                // Inside a transaction, make the abort REAL: the statement already executed on the
+                // server and a response-side transform cannot roll it back, so close the client
+                // connection. The chain sends this error to the client FIRST, then closes (see
+                // send_receive_chain), and closing drops the sink connection with it — the server rolls
+                // the transaction back, so "transaction lost, nothing committed" is true, not merely
+                // reported. Outside a transaction there is nothing to abort and the error alone is
+                // coherent, so the connection stays open.
+                if self.in_transaction {
+                    chain_state.close_client_connection = true;
+                }
             }
-            // Track transaction state from this response's ReadyForQuery, drive the client to the
-            // aborted state after an extended-protocol fail-close, and reclaim portal state at
+            // Track transaction state from this response's ReadyForQuery and reclaim portal state at
             // transaction end. Runs for every postgres response, redacted or not.
             self.observe_transaction_state(response);
         }
@@ -226,16 +230,16 @@ impl Transform for PostgresRedactColumn {
 const MAX_STATEMENT_SHAPES: usize = 1024;
 
 impl PostgresRedactColumn {
-    /// Builds the error that replaces an unredactable response, keeping the client's transaction
-    /// state coherent.
+    /// Builds the error that replaces an unredactable response.
     ///
-    /// A simple-query train carries its own ReadyForQuery, so the replacement carries one too, with
-    /// the status Postgres would send after a statement error: 'E' (aborted) when inside a
-    /// transaction, else 'I'. An extended-protocol Execute train carries NO ReadyForQuery — it comes
-    /// with the client's Sync — so none is appended (appending one would deliver two ReadyForQuery for
-    /// one Sync and desync the client); instead, when inside a transaction, `pending_abort` is set so
-    /// the Sync's ReadyForQuery is reported aborted when it passes through.
-    fn fail_closed_response(&mut self, original: &mut Message, reason: &str) -> Message {
+    /// Outside a transaction the error is self-coherent and the connection stays open: a simple-query
+    /// train carries its own ReadyForQuery so the replacement carries one too (idle 'I'); an
+    /// extended-protocol Execute train carries none (its ReadyForQuery comes with the client's Sync),
+    /// so none is appended — appending one would deliver two ReadyForQuery for one Sync and desync the
+    /// client. Inside a transaction NO ReadyForQuery is appended in either case: the caller closes the
+    /// connection (see the transform loop), so the client should receive the error and then the close —
+    /// a ReadyForQuery would falsely say "ready for the next query" as we are about to disconnect.
+    fn fail_closed_response(&self, original: &mut Message, reason: &str) -> Message {
         let had_ready_for_query = matches!(
             original.frame(),
             Some(Frame::Postgres(PostgresFrame::Response(messages)))
@@ -249,12 +253,8 @@ impl PostgresRedactColumn {
                 (b'M', format!("PostgresRedactColumn: {reason}")),
             ],
         }];
-        if had_ready_for_query {
-            messages.push(BackendMessage::ReadyForQuery {
-                status: if self.in_transaction { b'E' } else { b'I' },
-            });
-        } else if self.in_transaction {
-            self.pending_abort = true;
+        if had_ready_for_query && !self.in_transaction {
+            messages.push(BackendMessage::ReadyForQuery { status: b'I' });
         }
         let mut response = Message::from_frame(Frame::Postgres(PostgresFrame::Response(messages)));
         if let Some(id) = original.request_id() {
@@ -275,35 +275,18 @@ impl PostgresRedactColumn {
         self.statement_shapes.insert(statement.to_owned(), shape);
     }
 
-    /// Keeps transaction state coherent with a fail-close and reclaims per-statement state.
-    ///
-    /// A `pending_abort` (set when an extended-protocol Execute failed closed inside a transaction)
-    /// rewrites the next ReadyForQuery to the aborted state 'E', so the client rolls back exactly what
-    /// the server will. `in_transaction` is then read from the status ULTIMATELY EMITTED, so a
-    /// self-synthesised 'E'/'I' never drives tracking to a state the server does not share. At
-    /// transaction end ('I') the non-holdable portals Postgres itself drops are reclaimed, bounding
-    /// per-connection state (a WITH HOLD cursor then fails closed on its next fetch — safe).
+    /// Tracks transaction state from a response's trailing ReadyForQuery and reclaims per-statement
+    /// state. `in_transaction` decides whether a later fail-close closes the connection. At transaction
+    /// end ('I') the non-holdable portals Postgres itself drops are reclaimed, bounding per-connection
+    /// state (a WITH HOLD cursor then fails closed on its next fetch — safe).
     fn observe_transaction_state(&mut self, response: &mut Message) {
-        let mut latest_status = None;
-        let mut changed = false;
-        {
-            let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() else {
-                return;
-            };
-            for message in messages.iter_mut() {
-                if let BackendMessage::ReadyForQuery { status } = message {
-                    if self.pending_abort {
-                        *status = b'E';
-                        self.pending_abort = false;
-                        changed = true;
-                    }
-                    latest_status = Some(*status);
-                }
-            }
-        }
-        if changed {
-            response.invalidate_cache();
-        }
+        let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() else {
+            return;
+        };
+        let latest_status = messages.iter().rev().find_map(|m| match m {
+            BackendMessage::ReadyForQuery { status } => Some(*status),
+            _ => None,
+        });
         if let Some(status) = latest_status {
             self.in_transaction = status != b'I';
             if status == b'I' {
@@ -472,7 +455,6 @@ mod tests {
             portal_statements: HashMap::new(),
             pending: HashMap::new(),
             in_transaction: false,
-            pending_abort: false,
         }
     }
 
@@ -780,7 +762,7 @@ mod tests {
 
     #[test]
     fn test_fail_closed_response_matches_ready_for_query_of_original() {
-        let mut r = redactor();
+        let r = redactor();
         // Replacing a simple-query train (which carries ReadyForQuery) keeps a ReadyForQuery.
         let mut simple = response(vec![
             BackendMessage::DataRow { values: vec![] },
@@ -812,12 +794,14 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_query_fail_close_reports_abort_inside_transaction() {
-        // Finding 4: a fail-close inside a transaction must report the aborted state 'E', not the
-        // server's 'T'/'I', or the client and server disagree about the transaction. Outside a
-        // transaction the status is 'I'.
+    fn test_in_transaction_fail_close_omits_ready_for_query() {
+        // A fail-close INSIDE a transaction closes the connection (the transform loop sets
+        // close_client_connection so the server rolls back). Its replacement must NOT carry a
+        // ReadyForQuery — the client receives the error and then the close, not "ready for the next
+        // query". Outside a transaction the connection stays open and a simple-query fail-close keeps
+        // its ReadyForQuery (idle 'I'); an extended Execute train never carries one.
         let mut r = redactor();
-        let train = || {
+        let simple = || {
             response(vec![
                 BackendMessage::DataRow { values: vec![] },
                 BackendMessage::CommandComplete {
@@ -826,45 +810,46 @@ mod tests {
                 BackendMessage::ReadyForQuery { status: b'T' },
             ])
         };
+        let extended = || {
+            response(vec![BackendMessage::DataRow {
+                values: vec![Some(Bytes::from_static(b"111-22-3333"))],
+            }])
+        };
+
         r.in_transaction = true;
-        let mut in_txn = r.fail_closed_response(&mut train(), "x");
-        assert_eq!(trailing_rfq(&mut in_txn), Some(b'E'));
+        assert_eq!(trailing_rfq(&mut r.fail_closed_response(&mut simple(), "x")), None);
+        assert_eq!(
+            trailing_rfq(&mut r.fail_closed_response(&mut extended(), "x")),
+            None
+        );
+
         r.in_transaction = false;
-        let mut no_txn = r.fail_closed_response(&mut train(), "x");
-        assert_eq!(trailing_rfq(&mut no_txn), Some(b'I'));
+        assert_eq!(
+            trailing_rfq(&mut r.fail_closed_response(&mut simple(), "x")),
+            Some(b'I')
+        );
+        assert_eq!(
+            trailing_rfq(&mut r.fail_closed_response(&mut extended(), "x")),
+            None
+        );
     }
 
     #[test]
-    fn test_extended_fail_close_drives_client_to_abort_and_reconverges() {
-        // Finding 4 + the Finding-1/Finding-4 feedback loop: an extended Execute failing closed inside
-        // a transaction carries no ReadyForQuery (that comes with Sync). It sets pending_abort and adds
-        // no RFQ; the Sync's ReadyForQuery('T') is then rewritten to 'E' so the client rolls back what
-        // the server will. in_transaction is read from the EMITTED status, so the synthesised 'E' keeps
-        // tracking correct; the client's ROLLBACK ('I') clears it and reclaims portals (Finding 5).
+    fn test_observe_tracks_transaction_and_reclaims_portals() {
+        // in_transaction (what decides whether a later fail-close closes the connection) follows the
+        // server's ReadyForQuery; at transaction end ('I') the non-holdable portals are reclaimed.
         let mut r = redactor();
-        r.in_transaction = true;
-
-        let mut execute = response(vec![BackendMessage::DataRow {
-            values: vec![Some(Bytes::from_static(b"111-22-3333"))],
-        }]);
-        let mut failed = r.fail_closed_response(&mut execute, "x");
-        assert!(r.pending_abort);
-        assert_eq!(trailing_rfq(&mut failed), None);
-        // The fail-closed Execute response carries no RFQ, so pending_abort survives to the Sync.
-        r.observe_transaction_state(&mut failed);
-        assert!(r.pending_abort);
-
-        let mut sync = response(vec![BackendMessage::ReadyForQuery { status: b'T' }]);
-        r.observe_transaction_state(&mut sync);
-        assert_eq!(trailing_rfq(&mut sync), Some(b'E'));
-        assert!(!r.pending_abort);
-        assert!(r.in_transaction); // 'E' != 'I' -> still inside a (failed) transaction
-
         r.portal_statements.insert("p".to_owned(), "s".to_owned());
-        let mut rollback = response(vec![BackendMessage::ReadyForQuery { status: b'I' }]);
-        r.observe_transaction_state(&mut rollback);
+
+        let mut in_txn = response(vec![BackendMessage::ReadyForQuery { status: b'T' }]);
+        r.observe_transaction_state(&mut in_txn);
+        assert!(r.in_transaction);
+        assert!(!r.portal_statements.is_empty()); // portals survive inside a transaction
+
+        let mut idle = response(vec![BackendMessage::ReadyForQuery { status: b'I' }]);
+        r.observe_transaction_state(&mut idle);
         assert!(!r.in_transaction);
-        assert!(r.portal_statements.is_empty());
+        assert!(r.portal_statements.is_empty()); // reclaimed at transaction end
     }
 
     #[test]

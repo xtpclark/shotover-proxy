@@ -545,11 +545,12 @@ with an error. Two cases fail closed:
 
 - An `Execute` of a statement that was never `Describe`d in this connection —
   the shape is genuinely unknown, so the query errors rather than pass rows
-  through unchecked. A fail-close inside a transaction reports the aborted
-  status so a client that rolls back on error undoes the statement's real
-  effect. Note the transform cannot actually abort the server's transaction (the
-  statement already executed): a client that instead COMMITs an apparently-
-  aborted transaction will commit it on the server.
+  through unchecked. A fail-close **inside a transaction closes the connection**
+  (after sending the error): the transform cannot itself roll back a statement
+  that already executed on the server, but dropping the connection makes the
+  server roll the transaction back, so nothing the transaction did is committed.
+  Outside a transaction the error alone is coherent and the connection stays
+  open.
 - `COPY ... TO STDOUT` carries rows outside `DataRow` messages and cannot be
   redacted here, so **any** COPY-based read through a chain containing this
   transform fails closed regardless of which columns the table has. `pg_dump`
