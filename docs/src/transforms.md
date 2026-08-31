@@ -506,22 +506,48 @@ Known limitations of this release:
 This transform will replace the value of a named result column with a fixed
 replacement string in every row returned to the client. NULL values stay NULL.
 
-The column is matched by name against the row shape from the result's
-`RowDescription`. The replacement is written as a text format value, so
-redacting a column fetched in binary format hands the client bytes it may fail
-to decode - still redacted, just less politely.
+> **This is NOT a security control.** The column is matched by the result column
+> **label** in the result's `RowDescription`, and that label is entirely
+> client-controlled. It therefore cannot protect a value against the user
+> writing the query — anyone who writes their own SQL defeats it in one
+> keystroke. Its only honest use is preventing **accidental** exposure by
+> queries that happen to select the column by its plain name.
+
+With the configured column `ssn`:
+
+| Query | Result |
+|---|---|
+| `SELECT ssn FROM patients` | redacted |
+| `SELECT ssn AS x FROM patients` | **leaks** — the label is now `x` |
+| `SELECT ssn\|\|'' FROM patients` | **leaks** — a computed column has no label match |
+| `SELECT * FROM v_patients` (a view that renames the column) | **leaks** |
+| two output columns both labelled `ssn` | only the first is redacted; the second leaks |
+
+The failure differs by construction: an alias preserves the source column's
+`(table_oid, attribute_number)` (so a match on those would catch it), but a
+renaming view reports the *view's* oid and a computed column carries no
+provenance at all — so there is no complete fix at the proxy layer without
+catalog resolution. Matching by source identity is a possible partial
+improvement, deferred.
+
+The replacement is written as a text format value, so redacting a column fetched
+in binary format hands the client bytes it may fail to decode - still redacted,
+just less politely.
 
 The shape is tracked per prepared statement (established by a `Describe`), so
 cached prepared statements and paginated portals (JDBC `setFetchSize`) redact
 correctly even though they re-execute without a `Describe`.
 
-This is a security control, so it fails **closed**: if it cannot determine the
-row shape for a set of rows it is about to pass on, it replaces the whole
-response with an error rather than risk leaking an unredacted value. Two
-cases fail closed:
+It fails **closed** on an unknown row shape — not as a security guarantee (the
+label matching above already isn't one) but to keep the redaction it *can* do
+honest: rather than pass on rows it could not inspect, it replaces the response
+with an error. Two cases fail closed:
 
 - An `Execute` of a statement that was never `Describe`d in this connection —
-  the shape is genuinely unknown, so the query errors rather than risk a leak.
+  the shape is genuinely unknown, so the query errors rather than pass rows
+  through unchecked. A fail-close inside a transaction reports the aborted
+  state so the client and server agree on the transaction; the statement itself
+  still executed on the server.
 - `COPY ... TO STDOUT` carries rows outside `DataRow` messages and cannot be
   redacted here, so **any** COPY-based read through a chain containing this
   transform fails closed regardless of which columns the table has. `pg_dump`
@@ -530,7 +556,8 @@ cases fail closed:
 ```yaml
 - PostgresRedactColumn:
     name: "redact-salary"
-    # The result column name to redact, matched exactly.
+    # The result column LABEL to redact, matched exactly. Client-controllable
+    # (an AS alias / expression / renaming view changes it) — see the warning above.
     column: "salary"
     replacement: "[REDACTED]"
 ```

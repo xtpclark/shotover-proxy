@@ -14,6 +14,25 @@ use std::collections::HashMap;
 /// Replaces the value of a named result column with a fixed replacement string in every DataRow
 /// flowing back to the client.
 ///
+/// # NOT a security control — read this before relying on it
+/// Redaction is keyed on the result column LABEL carried in `RowDescription`, and that label is
+/// entirely client-controlled. It therefore CANNOT protect a value against the user writing the query
+/// — anyone who writes their own SQL defeats it in one keystroke. Its only honest value is preventing
+/// ACCIDENTAL exposure by queries that happen to select the column by its plain name.
+///
+/// Concretely (live `RowDescription` provenance, configured column "ssn"):
+/// * `SELECT ssn FROM patients`      → label `ssn`,      table_oid 16384, attnum 2 — REDACTED
+/// * `SELECT ssn AS x FROM patients` → label `x`,        table_oid 16384, attnum 2 — LEAKS (label differs)
+/// * `SELECT * FROM v_patients`      → label `social`,   table_oid 16389 (the VIEW's oid) — LEAKS
+/// * `SELECT ssn||'' FROM patients`  → label `?column?`, table_oid 0 (no provenance) — LEAKS
+/// * two output columns both labelled `ssn` → only the first is redacted; the second LEAKS
+///
+/// The failure differs by construction: an alias PRESERVES (table_oid, attnum), so matching on those
+/// WOULD catch it; but a renaming view reports the VIEW's oid (a base-table match still misses it
+/// without catalog resolution), and a computed column carries no provenance at all. So there is no
+/// complete fix at the proxy layer — an (table_oid, attnum) match would be a partial improvement only,
+/// and is deferred.
+///
 /// # Row-shape tracking
 /// To redact by column name the transform needs the row shape (which column index carries the
 /// name). In the simple query protocol the RowDescription and its DataRows share one response, so
@@ -25,11 +44,14 @@ use std::collections::HashMap;
 /// redacted using its statement's remembered shape (matched to the request by id). This keeps cached
 /// statements and paginated portals (JDBC setFetchSize) working.
 ///
-/// # Fail-closed
-/// It is a security control, so when it genuinely cannot determine the shape for a set of DataRows —
-/// an Execute of a statement it never saw Described — it replaces the whole response with an error
-/// rather than risk leaking an unredacted value. COPY output (rows outside DataRow messages) and any
-/// unparseable response also fail closed.
+/// # Fail-closed on unknown shape
+/// When it cannot determine the shape for a set of DataRows — an Execute of a statement it never saw
+/// Described — it replaces the whole response with an error rather than emit rows it could not inspect.
+/// COPY output (rows outside DataRow messages) and any unparseable response also fail closed. This
+/// keeps the redaction it CAN do honest; it is not a substitute for the guarantee that label-matching
+/// cannot provide (see above). A fail-close inside a transaction reports the aborted state ('E') so
+/// the client and server agree — but note the underlying statement already executed on the server: a
+/// fail-close hides the result, it does not prevent the statement.
 ///
 /// NULL values stay NULL. The replacement is written as a text-format value: redacting a column
 /// fetched in binary format hands the client bytes it may fail to decode — still redacted.
@@ -37,7 +59,9 @@ use std::collections::HashMap;
 #[serde(deny_unknown_fields)]
 pub struct PostgresRedactColumnConfig {
     pub name: String,
-    /// The result column name to redact, matched exactly.
+    /// The result column LABEL to redact, matched exactly against `RowDescription`. This label is
+    /// client-controlled — an `AS` alias, an expression, or a renaming view changes it and the value
+    /// is NOT redacted. See the type doc: this is accidental-exposure hygiene, not a security control.
     pub column: String,
     pub replacement: String,
 }
@@ -88,6 +112,8 @@ impl TransformBuilder for PostgresRedactColumnBuilder {
             statement_shapes: HashMap::new(),
             portal_statements: HashMap::new(),
             pending: HashMap::new(),
+            in_transaction: false,
+            pending_abort: false,
         })
     }
 
@@ -135,6 +161,13 @@ pub struct PostgresRedactColumn {
     portal_statements: HashMap<String, String>,
     /// Requests in flight that produce a shape-relevant response, keyed by request id.
     pending: HashMap<MessageId, Awaiting>,
+    /// Whether the session is currently inside a transaction, tracked from the ReadyForQuery status
+    /// the redactor ultimately emits (any status other than 'I' means in a transaction).
+    in_transaction: bool,
+    /// Set when an extended-protocol Execute failed closed inside a transaction: the next
+    /// ReadyForQuery (arriving with the client's Sync) is rewritten to the aborted state 'E' so the
+    /// client and server agree the transaction failed.
+    pending_abort: bool,
 }
 
 #[async_trait]
@@ -168,41 +201,108 @@ impl Transform for PostgresRedactColumn {
             if let Err(reason) = self.redact_response(response, awaiting) {
                 // Fail closed: never let an unredactable result reach the client. Replace it with
                 // an error carrying the same request id so the client sees a failure, not data.
-                *response = fail_closed_response(response, &reason);
+                *response = self.fail_closed_response(response, &reason);
             }
+            // Track transaction state from this response's ReadyForQuery, drive the client to the
+            // aborted state after an extended-protocol fail-close, and reclaim portal state at
+            // transaction end. Runs for every postgres response, redacted or not.
+            self.observe_transaction_state(response);
         }
         Ok(responses)
     }
 }
 
-/// Builds the error that replaces an unredactable response.
-///
-/// It appends a ReadyForQuery ONLY when the response being replaced carried one (a simple-query
-/// train), so the client's transaction-state machine stays in sync. An extended-protocol Execute
-/// train carries no ReadyForQuery — that comes with the client's Sync — so replacing it with an
-/// error+ReadyForQuery would deliver two ReadyForQuery for one Sync and desync the client.
-fn fail_closed_response(original: &mut Message, reason: &str) -> Message {
-    let had_ready_for_query = matches!(
-        original.frame(),
-        Some(Frame::Postgres(PostgresFrame::Response(messages)))
-            if messages.iter().any(|m| matches!(m, BackendMessage::ReadyForQuery { .. }))
-    );
-    let mut messages = vec![BackendMessage::ErrorResponse {
-        fields: vec![
-            (b'S', "ERROR".to_owned()),
-            (b'V', "ERROR".to_owned()),
-            (b'C', "XX000".to_owned()),
-            (b'M', format!("PostgresRedactColumn: {reason}")),
-        ],
-    }];
-    if had_ready_for_query {
-        messages.push(BackendMessage::ReadyForQuery { status: b'I' });
+/// The most result shapes the redactor remembers per connection. Named prepared statements live until
+/// session end, so their shapes cannot be dropped at transaction end like portals; this bounds the map
+/// instead. An evicted shape simply fails closed and is re-learned on the next Describe.
+const MAX_STATEMENT_SHAPES: usize = 1024;
+
+impl PostgresRedactColumn {
+    /// Builds the error that replaces an unredactable response, keeping the client's transaction
+    /// state coherent.
+    ///
+    /// A simple-query train carries its own ReadyForQuery, so the replacement carries one too, with
+    /// the status Postgres would send after a statement error: 'E' (aborted) when inside a
+    /// transaction, else 'I'. An extended-protocol Execute train carries NO ReadyForQuery — it comes
+    /// with the client's Sync — so none is appended (appending one would deliver two ReadyForQuery for
+    /// one Sync and desync the client); instead, when inside a transaction, `pending_abort` is set so
+    /// the Sync's ReadyForQuery is reported aborted when it passes through.
+    fn fail_closed_response(&mut self, original: &mut Message, reason: &str) -> Message {
+        let had_ready_for_query = matches!(
+            original.frame(),
+            Some(Frame::Postgres(PostgresFrame::Response(messages)))
+                if messages.iter().any(|m| matches!(m, BackendMessage::ReadyForQuery { .. }))
+        );
+        let mut messages = vec![BackendMessage::ErrorResponse {
+            fields: vec![
+                (b'S', "ERROR".to_owned()),
+                (b'V', "ERROR".to_owned()),
+                (b'C', "XX000".to_owned()),
+                (b'M', format!("PostgresRedactColumn: {reason}")),
+            ],
+        }];
+        if had_ready_for_query {
+            messages.push(BackendMessage::ReadyForQuery {
+                status: if self.in_transaction { b'E' } else { b'I' },
+            });
+        } else if self.in_transaction {
+            self.pending_abort = true;
+        }
+        let mut response = Message::from_frame(Frame::Postgres(PostgresFrame::Response(messages)));
+        if let Some(id) = original.request_id() {
+            response.set_request_id(id);
+        }
+        response
     }
-    let mut response = Message::from_frame(Frame::Postgres(PostgresFrame::Response(messages)));
-    if let Some(id) = original.request_id() {
-        response.set_request_id(id);
+
+    /// Records a statement's shape, evicting an arbitrary entry first when the map is at its cap, so a
+    /// client that Parses unbounded distinct named statements cannot grow it without limit.
+    fn remember_shape(&mut self, statement: &str, shape: Shape) {
+        if self.statement_shapes.len() >= MAX_STATEMENT_SHAPES
+            && !self.statement_shapes.contains_key(statement)
+            && let Some(evict) = self.statement_shapes.keys().next().cloned()
+        {
+            self.statement_shapes.remove(&evict);
+        }
+        self.statement_shapes.insert(statement.to_owned(), shape);
     }
-    response
+
+    /// Keeps transaction state coherent with a fail-close and reclaims per-statement state.
+    ///
+    /// A `pending_abort` (set when an extended-protocol Execute failed closed inside a transaction)
+    /// rewrites the next ReadyForQuery to the aborted state 'E', so the client rolls back exactly what
+    /// the server will. `in_transaction` is then read from the status ULTIMATELY EMITTED, so a
+    /// self-synthesised 'E'/'I' never drives tracking to a state the server does not share. At
+    /// transaction end ('I') the non-holdable portals Postgres itself drops are reclaimed, bounding
+    /// per-connection state (a WITH HOLD cursor then fails closed on its next fetch — safe).
+    fn observe_transaction_state(&mut self, response: &mut Message) {
+        let mut latest_status = None;
+        let mut changed = false;
+        {
+            let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() else {
+                return;
+            };
+            for message in messages.iter_mut() {
+                if let BackendMessage::ReadyForQuery { status } = message {
+                    if self.pending_abort {
+                        *status = b'E';
+                        self.pending_abort = false;
+                        changed = true;
+                    }
+                    latest_status = Some(*status);
+                }
+            }
+        }
+        if changed {
+            response.invalidate_cache();
+        }
+        if let Some(status) = latest_status {
+            self.in_transaction = status != b'I';
+            if status == b'I' {
+                self.portal_statements.clear();
+            }
+        }
+    }
 }
 
 impl PostgresRedactColumn {
@@ -290,15 +390,14 @@ impl PostgresRedactColumn {
                         };
                         shape = Some(resolved);
                         if let Some(statement) = &statement {
-                            self.statement_shapes.insert(statement.clone(), resolved);
+                            self.remember_shape(statement, resolved);
                         }
                     }
                     // A described statement that returns no rows: remember it as having no columns.
                     BackendMessage::NoData => {
                         shape = Some(Shape::Absent);
                         if let Some(statement) = &statement {
-                            self.statement_shapes
-                                .insert(statement.clone(), Shape::Absent);
+                            self.remember_shape(statement, Shape::Absent);
                         }
                     }
                     BackendMessage::DataRow { values } => match shape {
@@ -364,6 +463,20 @@ mod tests {
             statement_shapes: HashMap::new(),
             portal_statements: HashMap::new(),
             pending: HashMap::new(),
+            in_transaction: false,
+            pending_abort: false,
+        }
+    }
+
+    fn trailing_rfq(message: &mut Message) -> Option<u8> {
+        match message.frame() {
+            Some(Frame::Postgres(PostgresFrame::Response(messages))) => {
+                messages.iter().rev().find_map(|m| match m {
+                    BackendMessage::ReadyForQuery { status } => Some(*status),
+                    _ => None,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -659,6 +772,7 @@ mod tests {
 
     #[test]
     fn test_fail_closed_response_matches_ready_for_query_of_original() {
+        let mut r = redactor();
         // Replacing a simple-query train (which carries ReadyForQuery) keeps a ReadyForQuery.
         let mut simple = response(vec![
             BackendMessage::DataRow { values: vec![] },
@@ -667,7 +781,7 @@ mod tests {
             },
             BackendMessage::ReadyForQuery { status: b'I' },
         ]);
-        let mut replaced = fail_closed_response(&mut simple, "x");
+        let mut replaced = r.fail_closed_response(&mut simple, "x");
         assert!(matches!(
             replaced.frame(),
             Some(Frame::Postgres(PostgresFrame::Response(m)))
@@ -681,11 +795,77 @@ mod tests {
                 tag: "SELECT 1".to_owned(),
             },
         ]);
-        let mut replaced = fail_closed_response(&mut extended, "x");
+        let mut replaced = r.fail_closed_response(&mut extended, "x");
         assert!(matches!(
             replaced.frame(),
             Some(Frame::Postgres(PostgresFrame::Response(m)))
                 if !m.iter().any(|x| matches!(x, BackendMessage::ReadyForQuery { .. }))
         ));
+    }
+
+    #[test]
+    fn test_simple_query_fail_close_reports_abort_inside_transaction() {
+        // Finding 4: a fail-close inside a transaction must report the aborted state 'E', not the
+        // server's 'T'/'I', or the client and server disagree about the transaction. Outside a
+        // transaction the status is 'I'.
+        let mut r = redactor();
+        let train = || {
+            response(vec![
+                BackendMessage::DataRow { values: vec![] },
+                BackendMessage::CommandComplete {
+                    tag: "SELECT 1".to_owned(),
+                },
+                BackendMessage::ReadyForQuery { status: b'T' },
+            ])
+        };
+        r.in_transaction = true;
+        let mut in_txn = r.fail_closed_response(&mut train(), "x");
+        assert_eq!(trailing_rfq(&mut in_txn), Some(b'E'));
+        r.in_transaction = false;
+        let mut no_txn = r.fail_closed_response(&mut train(), "x");
+        assert_eq!(trailing_rfq(&mut no_txn), Some(b'I'));
+    }
+
+    #[test]
+    fn test_extended_fail_close_drives_client_to_abort_and_reconverges() {
+        // Finding 4 + the Finding-1/Finding-4 feedback loop: an extended Execute failing closed inside
+        // a transaction carries no ReadyForQuery (that comes with Sync). It sets pending_abort and adds
+        // no RFQ; the Sync's ReadyForQuery('T') is then rewritten to 'E' so the client rolls back what
+        // the server will. in_transaction is read from the EMITTED status, so the synthesised 'E' keeps
+        // tracking correct; the client's ROLLBACK ('I') clears it and reclaims portals (Finding 5).
+        let mut r = redactor();
+        r.in_transaction = true;
+
+        let mut execute = response(vec![BackendMessage::DataRow {
+            values: vec![Some(Bytes::from_static(b"111-22-3333"))],
+        }]);
+        let mut failed = r.fail_closed_response(&mut execute, "x");
+        assert!(r.pending_abort);
+        assert_eq!(trailing_rfq(&mut failed), None);
+        // The fail-closed Execute response carries no RFQ, so pending_abort survives to the Sync.
+        r.observe_transaction_state(&mut failed);
+        assert!(r.pending_abort);
+
+        let mut sync = response(vec![BackendMessage::ReadyForQuery { status: b'T' }]);
+        r.observe_transaction_state(&mut sync);
+        assert_eq!(trailing_rfq(&mut sync), Some(b'E'));
+        assert!(!r.pending_abort);
+        assert!(r.in_transaction); // 'E' != 'I' -> still inside a (failed) transaction
+
+        r.portal_statements.insert("p".to_owned(), "s".to_owned());
+        let mut rollback = response(vec![BackendMessage::ReadyForQuery { status: b'I' }]);
+        r.observe_transaction_state(&mut rollback);
+        assert!(!r.in_transaction);
+        assert!(r.portal_statements.is_empty());
+    }
+
+    #[test]
+    fn test_statement_shapes_are_bounded() {
+        // Finding 5: named prepared statements Parsed without Close cannot grow the shape map forever.
+        let mut r = redactor();
+        for i in 0..(MAX_STATEMENT_SHAPES + 100) {
+            r.remember_shape(&format!("stmt{i}"), Shape::Absent);
+        }
+        assert!(r.statement_shapes.len() <= MAX_STATEMENT_SHAPES);
     }
 }
