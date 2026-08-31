@@ -295,7 +295,7 @@ impl PostgresSinkCluster {
         //     a flush point, but it yields NO ReadyForQuery, so note_unit_boundary never closes the
         //     unit. (trailing_unanswerable == Some(0) alone admitted this, because request_triggers_flush
         //     counts Flush — a regression that spanned a replica unit into the next write.)
-        let self_terminating = ends_with_ready_for_query(requests);
+        let self_terminating = ends_with_sync_or_query(requests);
 
         // A pinned session runs on the primary. Because a replica unit never spans batches (only
         // self-terminating batches go to the replica), there is never an outstanding replica unit to
@@ -555,12 +555,21 @@ enum RequestRoute {
     Neutral,
 }
 
-/// True if the batch's LAST request is a Sync or a simple Query — a flush point that yields a
-/// ReadyForQuery, closing its response unit within one exchange() call. Only such a batch may open a
-/// replica unit (see decide_target): a Flush/CopyDone/CopyFail terminator is a flush point too but
-/// yields no ReadyForQuery, so its unit would never close and would strand the next batch on the
-/// replica; a trailing partial pipeline likewise does not end in a terminator.
-fn ends_with_ready_for_query(requests: &mut [Message]) -> bool {
+/// True if the batch's LAST request is a Sync or a simple Query. This is the gate for opening a
+/// replica unit (see decide_target): such a batch normally closes its own response unit with a
+/// ReadyForQuery within one exchange() call, so the unit never spans batches. A Flush/CopyDone/CopyFail
+/// terminator is a flush point too but yields NO ReadyForQuery, so it must not open a unit; a trailing
+/// partial pipeline does not end in a terminator either.
+///
+/// The name is LITERAL — "sync or query", not "yields a ReadyForQuery" — on purpose: a simple Query
+/// does not universally yield a ReadyForQuery. `COPY ... FROM STDIN` is a simple Query whose train ends
+/// at CopyInResponse with NO ReadyForQuery (that comes with a later CopyDone) — exactly the
+/// never-closing-unit shape. It is safe here ONLY because it is a write: analyze_sql classifies every
+/// CopyStmt as a write, so classify_request returns Primary and has_primary_only blocks the replica
+/// unit in decide_target BEFORE this predicate is consulted, so a replica-safe COPY-in Query never
+/// reaches it. The ReadyForQuery guarantee lives in the classifier, not in this predicate — do not
+/// rename this to imply otherwise.
+fn ends_with_sync_or_query(requests: &mut [Message]) -> bool {
     matches!(
         requests.last_mut().and_then(|r| r.frame()),
         Some(Frame::Postgres(PostgresFrame::Request(
@@ -824,7 +833,7 @@ mod tests {
                 max_rows: 0,
             }
         }
-        let opens_replica = |mut batch: Vec<Message>| ends_with_ready_for_query(&mut batch);
+        let opens_replica = |mut batch: Vec<Message>| ends_with_sync_or_query(&mut batch);
 
         // Ends in a Sync or simple Query → qualifies (offloads to a replica).
         assert!(opens_replica(vec![query("SELECT 1")]));
