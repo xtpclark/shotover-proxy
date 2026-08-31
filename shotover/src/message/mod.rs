@@ -263,7 +263,10 @@ impl Message {
         self.inner = Some(inner);
         if let Err(err) = result {
             // TODO: If we could include a stacktrace in this error it would be really helpful
-            tracing::error!("{:?}", err.context("Failed to parse frame"));
+            // Debug, not error: an unparseable frame is expected untrusted-wire input that degrades to
+            // raw and still round-trips. This lazy parse is retried on every frame()/into_frame() call,
+            // so at error level one bad frame flooded the logs several times per connection.
+            tracing::debug!("{:?}", err.context("Failed to parse frame"));
             return None;
         }
 
@@ -282,7 +285,10 @@ impl Message {
         let (inner, result) = self.inner.take().unwrap().ensure_parsed(self.codec_state);
         if let Err(err) = result {
             // TODO: If we could include a stacktrace in this error it would be really helpful
-            tracing::error!("{:?}", err.context("Failed to parse frame"));
+            // Debug, not error: an unparseable frame is expected untrusted-wire input that degrades to
+            // raw and still round-trips. This lazy parse is retried on every frame()/into_frame() call,
+            // so at error level one bad frame flooded the logs several times per connection.
+            tracing::debug!("{:?}", err.context("Failed to parse frame"));
             return None;
         }
 
