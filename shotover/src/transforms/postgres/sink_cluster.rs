@@ -267,13 +267,6 @@ impl PostgresSinkCluster {
     fn decide_target(&mut self, requests: &mut [Message]) -> Target {
         let mut has_deciding_read = false;
         let mut has_primary_only = false;
-        // A batch is self-terminating if it ends its own response cycle with a ReadyForQuery — it
-        // contains a Sync or a simple Query. Only such a batch may open a replica unit: it drains
-        // fully within one exchange() call (see route + note_unit_boundary), so a replica unit never
-        // spans batches. A partial extended-query pipeline (Parse/Bind/Execute with no Sync) would
-        // otherwise leave responses outstanding on the replica that a later pin would strand,
-        // violating the one-response-per-request invariant. Partial pipelines go to the primary.
-        let mut self_terminating = false;
         for request in requests.iter_mut() {
             match classify_request(request) {
                 RequestRoute::ReplicaRead => has_deciding_read = true,
@@ -291,10 +284,17 @@ impl PostgresSinkCluster {
                 }
                 RequestRoute::Primary => has_primary_only = true,
             }
-            if is_self_terminating(request) {
-                self_terminating = true;
-            }
         }
+        // A batch may open a replica unit ONLY if it ends AT its flush point with nothing trailing —
+        // trailing_unanswerable(..) == Some(0). "Contains a Sync/Query" is NOT enough: a batch like
+        // [Parse, Bind, Describe, Execute, Sync, Parse] contains a Sync yet leaves the trailing Parse
+        // buffered past the last flush point (exchange() leaves it outstanding). Opening a replica
+        // unit for it strands that Parse on the replica while its continuation ([Bind, Execute, Sync])
+        // routes to the primary and errors "unnamed prepared statement does not exist". Requiring
+        // Some(0) keeps a replica unit fully drained within one exchange() call so it never spans
+        // batches; [Query] and [Parse, Bind, Describe, Execute, Sync] still qualify (both Some(0)) —
+        // only a batch with something trailing its flush point loses offload to the primary.
+        let self_terminating = matches!(super::trailing_unanswerable(requests), Some(0));
 
         // A pinned session runs on the primary. Because a replica unit never spans batches (only
         // self-terminating batches go to the replica), there is never an outstanding replica unit to
@@ -554,17 +554,6 @@ enum RequestRoute {
     Neutral,
 }
 
-/// True if the request ends its own response cycle with a ReadyForQuery: a Sync (extended protocol)
-/// or a simple Query. A batch containing one drains fully within a single exchange() call.
-fn is_self_terminating(request: &mut Message) -> bool {
-    matches!(
-        request.frame(),
-        Some(Frame::Postgres(PostgresFrame::Request(
-            FrontendMessage::Sync | FrontendMessage::Query { .. }
-        )))
-    )
-}
-
 fn classify_request(request: &mut Message) -> RequestRoute {
     match request.frame() {
         Some(Frame::Postgres(PostgresFrame::Request(message))) => match message {
@@ -790,26 +779,61 @@ mod tests {
     }
 
     #[test]
-    fn test_is_self_terminating() {
-        // Only a Sync or a simple Query ends its own response cycle; a partial extended pipeline
-        // does not and therefore must not open a replica unit.
-        assert!(is_self_terminating(&mut query("SELECT 1")));
-        let mut sync = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
-            FrontendMessage::Sync,
-        )));
-        assert!(is_self_terminating(&mut sync));
-        assert!(!is_self_terminating(&mut parse("", "SELECT 1")));
-        let mut execute = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
+    fn test_batch_self_terminating() {
+        // decide_target opens a replica unit only for a batch that ENDS AT its flush point with
+        // nothing trailing (trailing_unanswerable == Some(0)). A simple Query and a complete extended
+        // pipeline qualify; a pipeline with a trailing Parse after the Sync does NOT — that is the
+        // finding-2 shape that stranded a statement's Parse on the replica while its continuation hit
+        // the primary and errored "unnamed prepared statement does not exist".
+        fn req(message: FrontendMessage) -> Message {
+            Message::from_frame(Frame::Postgres(PostgresFrame::Request(message)))
+        }
+        fn bind() -> FrontendMessage {
+            FrontendMessage::Bind {
+                portal_name: "".to_owned(),
+                statement_name: "".to_owned(),
+                parameter_format_codes: vec![],
+                parameter_values: vec![],
+                result_format_codes: vec![],
+            }
+        }
+        fn describe() -> FrontendMessage {
+            FrontendMessage::Describe {
+                kind: b'P',
+                name: "".to_owned(),
+            }
+        }
+        fn execute() -> FrontendMessage {
             FrontendMessage::Execute {
                 portal_name: "".to_owned(),
                 max_rows: 0,
-            },
-        )));
-        assert!(!is_self_terminating(&mut execute));
-        let mut flush = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
-            FrontendMessage::Flush,
-        )));
-        assert!(!is_self_terminating(&mut flush));
+            }
+        }
+        let terminating = |mut batch: Vec<Message>| {
+            matches!(super::super::trailing_unanswerable(&mut batch), Some(0))
+        };
+
+        // Ends at its flush point → qualifies (still offloads to a replica).
+        assert!(terminating(vec![query("SELECT 1")]));
+        assert!(terminating(vec![parse("", "SELECT 1"), req(FrontendMessage::Sync)]));
+        assert!(terminating(vec![
+            parse("", "SELECT 1"),
+            req(bind()),
+            req(describe()),
+            req(execute()),
+            req(FrontendMessage::Sync),
+        ]));
+        // A trailing Parse after the Sync → NOT self-terminating (the finding-2 shape).
+        assert!(!terminating(vec![
+            parse("", "SELECT 1"),
+            req(bind()),
+            req(describe()),
+            req(execute()),
+            req(FrontendMessage::Sync),
+            parse("", "SELECT 1"),
+        ]));
+        // No flush point at all → not self-terminating.
+        assert!(!terminating(vec![parse("", "SELECT 1")]));
     }
 
     #[test]
