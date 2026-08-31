@@ -15,8 +15,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder};
 
-/// A client that connects must send its SSL negotiation or startup message within this window.
-/// Without it, a client that connects and sends nothing would hold a connection permit forever.
+/// A client that connects must complete its SSL negotiation and startup message within this window.
+/// It bounds the WHOLE startup handshake — the 8-byte header AND the message body (see
+/// `read_startup_body`) — so a client that connects and sends nothing, or sends a partial header/body
+/// and stalls, cannot hold a connection permit forever. The body read is not otherwise deadlined: the
+/// source `timeout` config bounds only established connections and is unset by default.
 const CLIENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The result of answering a client's pre-startup negotiation requests.
@@ -79,10 +82,9 @@ pub async fn source_prologue(
         } else if code == CANCEL_REQUEST_CODE {
             // A CancelRequest is sent on its own plaintext connection even to a TLS server (libpq's
             // PQcancel opens a raw socket with no SSL negotiation). Accept it regardless of whether
-            // this source terminates TLS, and let the codec decode it as a startup-framed message.
-            return Ok(SourcePrologue::Plaintext {
-                prefix: BytesMut::from(&header[..]),
-            });
+            // this source terminates TLS, reading its whole body under the handshake deadline before
+            // handing it to the codec as a startup-framed message.
+            return read_startup_body(stream, header).await;
         } else if tls_configured {
             // This source terminates TLS: a plaintext startup is refused, matching a postgres
             // server whose pg_hba requires hostssl. Close quietly (a debug line, not an error per
@@ -90,11 +92,57 @@ pub async fn source_prologue(
             tracing::debug!("postgres source requires TLS; closing a plaintext startup attempt");
             return Ok(SourcePrologue::Disconnected);
         } else {
-            return Ok(SourcePrologue::Plaintext {
-                prefix: BytesMut::from(&header[..]),
-            });
+            return read_startup_body(stream, header).await;
         }
     }
+}
+
+/// Reads the remainder of a startup-framed message (StartupMessage or CancelRequest) whose 8-byte
+/// header has already been read, under the same [`CLIENT_STARTUP_TIMEOUT`] that bounds the header.
+///
+/// This closes the half-startup hold: once the header arrived, the body was previously read by the
+/// codec with no deadline (the source `timeout` config is unset by default), so a client that sent 8
+/// bytes then stalled held a connection permit forever. The declared length is validated against the
+/// startup-packet cap FIRST (via [`message_wire_length`]), so an over-cap length is rejected
+/// immediately instead of being read or waited on.
+async fn read_startup_body(stream: &mut TcpStream, header: [u8; 8]) -> Result<SourcePrologue> {
+    let total = match message_wire_length(&header, true) {
+        Ok(Some(total)) => total,
+        // 8 header bytes are always enough to read the startup length prefix.
+        Ok(None) => return Ok(SourcePrologue::Disconnected),
+        Err(err) => {
+            tracing::debug!("postgres client sent an invalid startup packet length: {err}");
+            return Ok(SourcePrologue::Disconnected);
+        }
+    };
+
+    let mut message = BytesMut::from(&header[..]);
+    let body_len = total - header.len();
+    if body_len > 0 {
+        let mut body = vec![0u8; body_len];
+        match tokio::time::timeout(CLIENT_STARTUP_TIMEOUT, stream.read_exact(&mut body)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(SourcePrologue::Disconnected);
+            }
+            Ok(Err(err)) => return Err(err.into()),
+            // The header arrived but the body did not complete within the window: drop it rather than
+            // hold the connection permit indefinitely.
+            Err(_elapsed) => {
+                tracing::debug!(
+                    "postgres client sent an incomplete startup body within the timeout, closing"
+                );
+                return Ok(SourcePrologue::Disconnected);
+            }
+        }
+        message.extend_from_slice(&body);
+    }
+    Ok(SourcePrologue::Plaintext { prefix: message })
 }
 
 /// Sends an SSLRequest on a fresh connection to a postgres server and reads the
