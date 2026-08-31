@@ -49,9 +49,17 @@ use std::collections::HashMap;
 /// Described — it replaces the whole response with an error rather than emit rows it could not inspect.
 /// COPY output (rows outside DataRow messages) and any unparseable response also fail closed. This
 /// keeps the redaction it CAN do honest; it is not a substitute for the guarantee that label-matching
-/// cannot provide (see above). A fail-close inside a transaction reports the aborted state ('E') so
-/// the client and server agree — but note the underlying statement already executed on the server: a
-/// fail-close hides the result, it does not prevent the statement.
+/// cannot provide (see above).
+///
+/// A fail-close inside a transaction reports the aborted status ('E') so a client that rolls back on
+/// error — as most drivers do — undoes the statement's real effect and the two ends reconverge. Its
+/// limits, by construction: (1) the statement ALREADY executed on the server (a fail-close hides the
+/// result, it does not prevent the statement), so a client that instead COMMITs an apparently-aborted
+/// transaction commits it on the server — the status agrees, the outcome may not; and (2) the abort
+/// marker is applied to the next ReadyForQuery, so a fail-close on a Flush-terminated Execute followed
+/// by an explicit simple-query ROLLBACK briefly reports that ROLLBACK as 'E' (it self-corrects on the
+/// next statement). Both are the residue of a response-side transform being unable to abort a server
+/// transaction — not fixable at this layer.
 ///
 /// NULL values stay NULL. The replacement is written as a text-format value: redacting a column
 /// fetched in binary format hands the client bytes it may fail to decode — still redacted.

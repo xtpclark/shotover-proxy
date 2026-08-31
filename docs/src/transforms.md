@@ -546,8 +546,10 @@ with an error. Two cases fail closed:
 - An `Execute` of a statement that was never `Describe`d in this connection —
   the shape is genuinely unknown, so the query errors rather than pass rows
   through unchecked. A fail-close inside a transaction reports the aborted
-  state so the client and server agree on the transaction; the statement itself
-  still executed on the server.
+  status so a client that rolls back on error undoes the statement's real
+  effect. Note the transform cannot actually abort the server's transaction (the
+  statement already executed): a client that instead COMMITs an apparently-
+  aborted transaction will commit it on the server.
 - `COPY ... TO STDOUT` carries rows outside `DataRow` messages and cannot be
   redacted here, so **any** COPY-based read through a chain containing this
   transform fails closed regardless of which columns the table has. `pg_dump`
