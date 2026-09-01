@@ -39,10 +39,11 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 
 /// Upper bound on how long the proxy waits for a backend to answer during topology probing and
@@ -74,11 +75,27 @@ pub struct PostgresSinkClusterConfig {
     /// producing anything trips it. Unset (the default) waits forever, preserving prior behaviour.
     #[serde(default)]
     pub read_timeout_ms: Option<u64>,
+    /// Replica addresses to PREFER when routing reads (B2, locality). A read picks a healthy
+    /// preferred replica first, then any other healthy replica, then the primary. Entries should be a
+    /// subset of `first_contact_points`; an entry that is not currently a replica simply never
+    /// matches. Empty (the default) treats every replica equally.
+    #[serde(default)]
+    pub preferred_replicas: Vec<String>,
+    /// How long a replica that fails to connect or authenticate is skipped before being retried (B3,
+    /// health-aware selection). This is what stops a dead replica from costing a full connect_timeout
+    /// on every single read: once it fails, reads route to a healthy replica (or the primary) until
+    /// the cooldown elapses, then it gets one half-open retry. Default 5000ms.
+    #[serde(default = "default_replica_health_cooldown_ms")]
+    pub replica_health_cooldown_ms: u64,
     pub tls: Option<TlsConnectorConfig>,
 }
 
 fn default_probe_database() -> String {
     "postgres".to_owned()
+}
+
+fn default_replica_health_cooldown_ms() -> u64 {
+    5000
 }
 
 const NAME: &str = "PostgresSinkCluster";
@@ -103,7 +120,8 @@ impl TransformConfig for PostgresSinkClusterConfig {
         let reads_to_replica = counter!("shotover_postgres_reads_to_replica_count", "chain" => chain_name.clone(), "transform" => NAME);
         let replica_fallback = counter!("shotover_postgres_replica_fallback_count", "chain" => chain_name.clone(), "transform" => NAME);
         let backend_read_timeout = counter!("shotover_postgres_backend_read_timeout_count", "chain" => chain_name.clone(), "transform" => NAME);
-        let primary_reprobe = counter!("shotover_postgres_primary_reprobe_count", "chain" => chain_name, "transform" => NAME);
+        let primary_reprobe = counter!("shotover_postgres_primary_reprobe_count", "chain" => chain_name.clone(), "transform" => NAME);
+        let replica_unhealthy = counter!("shotover_postgres_replica_unhealthy_count", "chain" => chain_name, "transform" => NAME);
         Ok(Box::new(PostgresSinkClusterBuilder {
             name: self.name.clone(),
             contact_points: self.first_contact_points.clone(),
@@ -112,13 +130,17 @@ impl TransformConfig for PostgresSinkClusterConfig {
             probe_database: self.probe_database.clone(),
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
             read_timeout: self.read_timeout_ms.map(Duration::from_millis),
+            preferred_replicas: self.preferred_replicas.clone(),
+            replica_health_cooldown: Duration::from_millis(self.replica_health_cooldown_ms),
             reads_to_replica,
             replica_fallback,
             backend_read_timeout,
             primary_reprobe,
+            replica_unhealthy,
             tls,
             topology: Arc::new(Mutex::new(None)),
             round_robin: Arc::new(AtomicUsize::new(0)),
+            replica_health: Arc::new(Mutex::new(HashMap::new())),
         }))
     }
 
@@ -157,15 +179,21 @@ pub struct PostgresSinkClusterBuilder {
     probe_database: String,
     connect_timeout: Duration,
     read_timeout: Option<Duration>,
+    preferred_replicas: Vec<String>,
+    replica_health_cooldown: Duration,
     tls: Option<TlsConnector>,
     topology: Arc<Mutex<Option<Topology>>>,
     /// Rotates replica selection across client connections. Shared so it actually advances between
     /// connections (each connection builds its own Transform).
     round_robin: Arc<AtomicUsize>,
+    /// Shared replica-health map: address -> instant until which the replica is skipped after a
+    /// connect/auth failure. Shared so a dead replica found by one connection is skipped by all.
+    replica_health: Arc<Mutex<HashMap<String, Instant>>>,
     reads_to_replica: Counter,
     replica_fallback: Counter,
     backend_read_timeout: Counter,
     primary_reprobe: Counter,
+    replica_unhealthy: Counter,
 }
 
 impl TransformBuilder for PostgresSinkClusterBuilder {
@@ -177,13 +205,17 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             probe_database: self.probe_database.clone(),
             connect_timeout: self.connect_timeout,
             read_timeout: self.read_timeout,
+            preferred_replicas: self.preferred_replicas.clone(),
+            replica_health_cooldown: self.replica_health_cooldown,
             tls: self.tls.clone(),
             topology: self.topology.clone(),
             round_robin: self.round_robin.clone(),
+            replica_health: self.replica_health.clone(),
             reads_to_replica: self.reads_to_replica.clone(),
             replica_fallback: self.replica_fallback.clone(),
             backend_read_timeout: self.backend_read_timeout.clone(),
             primary_reprobe: self.primary_reprobe.clone(),
+            replica_unhealthy: self.replica_unhealthy.clone(),
             force_run_chain: transform_context.force_run_chain,
             primary: None,
             replica: None,
@@ -226,9 +258,14 @@ pub struct PostgresSinkCluster {
     probe_database: String,
     connect_timeout: Duration,
     read_timeout: Option<Duration>,
+    preferred_replicas: Vec<String>,
+    replica_health_cooldown: Duration,
     tls: Option<TlsConnector>,
     topology: Arc<Mutex<Option<Topology>>>,
     round_robin: Arc<AtomicUsize>,
+    /// Shared replica-health map: address -> instant until which the replica is skipped after a
+    /// connect/auth failure (see [`Self::select_replica_addr`]).
+    replica_health: Arc<Mutex<HashMap<String, Instant>>>,
     force_run_chain: Arc<Notify>,
 
     /// Client-auth passthrough connection to the primary.
@@ -261,6 +298,7 @@ pub struct PostgresSinkCluster {
     replica_fallback: Counter,
     backend_read_timeout: Counter,
     primary_reprobe: Counter,
+    replica_unhealthy: Counter,
 }
 
 #[async_trait]
@@ -441,10 +479,15 @@ impl PostgresSinkCluster {
                     Err(err) => {
                         if err.downcast_ref::<super::BackendReadTimeout>().is_some() {
                             self.backend_read_timeout.increment(1);
-                            self.replica = None;
-                            self.outstanding_replica = 0;
-                            self.unit_target = None;
                         }
+                        self.replica = None;
+                        self.outstanding_replica = 0;
+                        self.unit_target = None;
+                        // A broken replica link: cool it down so reads skip it, and reselect next time.
+                        if let Some(addr) = self.replica_addr.clone() {
+                            self.mark_replica_unhealthy(&addr).await;
+                        }
+                        self.replica_addr = None;
                         return Err(err);
                     }
                 }
@@ -539,16 +582,57 @@ impl PostgresSinkCluster {
             }
             guard.as_ref().unwrap().clone()
         };
-        self.select_replica_addr(&topology);
+        self.select_replica_addr(&topology).await;
         Ok(())
     }
 
-    fn select_replica_addr(&mut self, topology: &Topology) {
-        if self.replica_addr.is_none() && !topology.replicas.is_empty() {
-            // Shared counter so replica choice actually advances across client connections.
-            let index = self.round_robin.fetch_add(1, Ordering::Relaxed) % topology.replicas.len();
-            self.replica_addr = Some(topology.replicas[index].clone());
+    /// Chooses which replica this connection reads from, honouring health (B3) and locality (B2):
+    /// a replica in cooldown after a recent failure is skipped; among the healthy ones a preferred
+    /// replica wins, otherwise any healthy replica, round-robined. Leaves `replica_addr` None when
+    /// every replica is in cooldown so reads fall back to the primary rather than stalling.
+    async fn select_replica_addr(&mut self, topology: &Topology) {
+        if self.replica_addr.is_some() || topology.replicas.is_empty() {
+            return;
         }
+        let healthy: Vec<String> = {
+            let now = Instant::now();
+            let mut guard = self.replica_health.lock().await;
+            // Expired cooldowns make a replica eligible again (a half-open retry).
+            guard.retain(|_, until| *until > now);
+            topology
+                .replicas
+                .iter()
+                .filter(|r| !guard.contains_key(*r))
+                .cloned()
+                .collect()
+        };
+        if healthy.is_empty() {
+            return;
+        }
+        // Locality: prefer a healthy replica the operator declared preferred; else any healthy one.
+        let mut preferred: Vec<String> = Vec::new();
+        for r in &healthy {
+            if self.preferred_replicas.contains(r) {
+                preferred.push(r.clone());
+            }
+        }
+        let pool = if preferred.is_empty() { healthy } else { preferred };
+        // Shared counter so replica choice actually advances across client connections.
+        let index = self.round_robin.fetch_add(1, Ordering::Relaxed) % pool.len();
+        self.replica_addr = Some(pool[index].clone());
+    }
+
+    async fn mark_replica_unhealthy(&self, addr: &str) {
+        self.replica_unhealthy.increment(1);
+        let until = Instant::now() + self.replica_health_cooldown;
+        self.replica_health
+            .lock()
+            .await
+            .insert(addr.to_owned(), until);
+    }
+
+    async fn mark_replica_healthy(&self, addr: &str) {
+        self.replica_health.lock().await.remove(addr);
     }
 
     /// Connects to each contact point, runs `pg_is_in_recovery()`, and classifies primary vs replica.
@@ -670,15 +754,37 @@ impl PostgresSinkCluster {
             .clone()
             .ok_or_else(|| anyhow!("client user unknown"))?;
         let database = self.client_database.clone().unwrap_or_else(|| user.clone());
-        let mut connection = self.new_backend_connection(&addr).await?;
+        match self.try_connect_replica(&addr, &user, &database).await {
+            Ok(connection) => {
+                self.mark_replica_healthy(&addr).await;
+                self.replica = Some(connection);
+                Ok(())
+            }
+            Err(err) => {
+                // This replica is unreachable. Cool it down so subsequent reads skip it (no per-read
+                // connect penalty) and clear our choice so the next read reselects a healthy one; the
+                // error surfaces to route(), which falls back to the primary for this read.
+                self.mark_replica_unhealthy(&addr).await;
+                self.replica_addr = None;
+                Err(err)
+            }
+        }
+    }
+
+    async fn try_connect_replica(
+        &self,
+        addr: &str,
+        user: &str,
+        database: &str,
+    ) -> Result<SinkConnection> {
+        let mut connection = self.new_backend_connection(addr).await?;
         tokio::time::timeout(
             BACKEND_OP_TIMEOUT,
-            authenticate_backend(&mut connection, &user, &database, &self.password),
+            authenticate_backend(&mut connection, user, database, &self.password),
         )
         .await
         .map_err(|_| anyhow!("timed out authenticating to replica {addr}"))??;
-        self.replica = Some(connection);
-        Ok(())
+        Ok(connection)
     }
 
     async fn new_backend_connection(&self, host: &str) -> Result<SinkConnection> {
