@@ -10,12 +10,12 @@
 //! The client authenticates against the primary by passthrough (the same 1:1 flow
 //! `PostgresSinkSingle` uses), so no client-facing credential store is needed and client auth is
 //! real. Replica connections cannot reuse that exchange (SCRAM is per-connection challenge/
-//! response), so the proxy originates them itself using a configured backend password plus the
-//! `user`/`database` it captured from the client's startup message — the standard pooler model.
-//! Only `trust` and cleartext `password` backend auth are supported for originated connections in
-//! this milestone; md5 and SCRAM origination are a follow-up. Per-user credential mapping (a
-//! pgbouncer-style userlist) is also a follow-up: today every replica connection authenticates
-//! with the one configured password.
+//! response), so the proxy originates them itself using a backend password plus the `user`/`database`
+//! it captured from the client's startup message — the standard pooler model. A replica connection
+//! authenticates as the CLIENT's user; its password is looked up in `replica_users` (a pgbouncer-style
+//! userlist: username -> cleartext backend password), falling back to the single configured `password`
+//! for any user not in the list. Only `trust` and cleartext `password` backend auth are supported for
+//! originated connections in this milestone; md5 and SCRAM origination are a follow-up.
 //!
 //! ## Consistency
 //! A read routed to a replica may be stale by the replication lag. Reads issued after a write on
@@ -61,10 +61,18 @@ pub struct PostgresSinkClusterConfig {
     /// Candidate backend hosts (`host:port`). Each is probed with `pg_is_in_recovery()` to decide
     /// which is the primary and which are read replicas.
     pub first_contact_points: Vec<String>,
-    /// The user used to originate replica connections and to probe topology.
+    /// The user used to probe topology, and the default user/password for originating replica
+    /// connections for any client user not present in `replica_users`.
     pub username: String,
-    /// The backend password used to originate replica connections and to probe topology.
+    /// The backend password used to probe topology and as the fallback for replica origination.
     pub password: String,
+    /// Optional pgbouncer-style userlist: client username -> cleartext backend password used to
+    /// originate that user's replica connections (B1). The proxy never sees the client's own password
+    /// (the client authenticates to the primary by passthrough, often via SCRAM), so a replica
+    /// connection for user X authenticates with `replica_users[X]`; a user absent from the map falls
+    /// back to the single `password`. Empty (the default) means every user uses the shared password.
+    #[serde(default)]
+    pub replica_users: HashMap<String, String>,
     /// The database used only for topology probing (`pg_is_in_recovery()` works in any database).
     #[serde(default = "default_probe_database")]
     pub probe_database: String,
@@ -132,6 +140,7 @@ impl TransformConfig for PostgresSinkClusterConfig {
             read_timeout: self.read_timeout_ms.map(Duration::from_millis),
             preferred_replicas: self.preferred_replicas.clone(),
             replica_health_cooldown: Duration::from_millis(self.replica_health_cooldown_ms),
+            replica_users: Arc::new(self.replica_users.clone()),
             reads_to_replica,
             replica_fallback,
             backend_read_timeout,
@@ -183,6 +192,8 @@ pub struct PostgresSinkClusterBuilder {
     replica_health_cooldown: Duration,
     tls: Option<TlsConnector>,
     topology: Arc<Mutex<Option<Topology>>>,
+    /// pgbouncer-style userlist for replica origination (client username -> cleartext password).
+    replica_users: Arc<HashMap<String, String>>,
     /// Rotates replica selection across client connections. Shared so it actually advances between
     /// connections (each connection builds its own Transform).
     round_robin: Arc<AtomicUsize>,
@@ -207,6 +218,7 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             read_timeout: self.read_timeout,
             preferred_replicas: self.preferred_replicas.clone(),
             replica_health_cooldown: self.replica_health_cooldown,
+            replica_users: self.replica_users.clone(),
             tls: self.tls.clone(),
             topology: self.topology.clone(),
             round_robin: self.round_robin.clone(),
@@ -262,6 +274,8 @@ pub struct PostgresSinkCluster {
     replica_health_cooldown: Duration,
     tls: Option<TlsConnector>,
     topology: Arc<Mutex<Option<Topology>>>,
+    /// pgbouncer-style userlist for replica origination (client username -> cleartext password).
+    replica_users: Arc<HashMap<String, String>>,
     round_robin: Arc<AtomicUsize>,
     /// Shared replica-health map: address -> instant until which the replica is skipped after a
     /// connect/auth failure (see [`Self::select_replica_addr`]).
@@ -754,7 +768,17 @@ impl PostgresSinkCluster {
             .clone()
             .ok_or_else(|| anyhow!("client user unknown"))?;
         let database = self.client_database.clone().unwrap_or_else(|| user.clone());
-        match self.try_connect_replica(&addr, &user, &database).await {
+        // B1: originate the replica connection with the client user's own backend password from the
+        // userlist, falling back to the single configured password for any user not listed.
+        let password = self
+            .replica_users
+            .get(&user)
+            .cloned()
+            .unwrap_or_else(|| self.password.clone());
+        match self
+            .try_connect_replica(&addr, &user, &database, &password)
+            .await
+        {
             Ok(connection) => {
                 self.mark_replica_healthy(&addr).await;
                 self.replica = Some(connection);
@@ -776,11 +800,12 @@ impl PostgresSinkCluster {
         addr: &str,
         user: &str,
         database: &str,
+        password: &str,
     ) -> Result<SinkConnection> {
         let mut connection = self.new_backend_connection(addr).await?;
         tokio::time::timeout(
             BACKEND_OP_TIMEOUT,
-            authenticate_backend(&mut connection, user, database, &self.password),
+            authenticate_backend(&mut connection, user, database, password),
         )
         .await
         .map_err(|_| anyhow!("timed out authenticating to replica {addr}"))??;
