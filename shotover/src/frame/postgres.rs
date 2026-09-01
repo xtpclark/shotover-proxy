@@ -1199,6 +1199,16 @@ fn is_writing_function(name: &str) -> bool {
     )
 }
 
+/// True for `set_config`, the function form of SET — it mutates a session GUC, so like SET it must pin
+/// the session to the primary (see analyze_sql). Kept separate from is_writing_function because that
+/// set also includes functions that route to the primary but need no session pin.
+fn is_set_config(name: &str) -> bool {
+    name.rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .eq_ignore_ascii_case("set_config")
+}
+
 /// Analyses a SQL string using the postgres grammar (libpg_query via pg_query).
 /// Falls back to a keyword heuristic when the parser cannot parse the string.
 pub fn analyze_sql(sql: &str) -> SqlAnalysis {
@@ -1222,7 +1232,15 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
     // (WITH x AS (INSERT ...) SELECT ...) is caught here as a write.
     let writes_tables = !parsed.dml_tables().is_empty();
     let ddl_tables = !parsed.ddl_tables().is_empty();
-    let writing_function = parsed.functions().iter().any(|f| is_writing_function(f));
+    let functions = parsed.functions();
+    let writing_function = functions.iter().any(|f| is_writing_function(f));
+    // set_config() is the function form of SET: it mutates a session GUC (search_path, timezone, …)
+    // that EVERY subsequent query depends on. Like SET (VariableSetStmt below) it MUST pin the session
+    // to the primary, or a following replica-safe read hits a replica that never saw the change —
+    // silent wrong results (e.g. a multi-tenant search_path resolving to the wrong schema, a
+    // cross-tenant read). The sibling writing-functions do not share this: they either route to the
+    // primary themselves (currval/lastval/advisory locks) or change no state a plain read observes.
+    let sets_session_state = functions.iter().any(|f| is_set_config(f));
 
     // Row-level lock clauses (FOR UPDATE/SHARE/NO KEY UPDATE/KEY SHARE) can sit in a subquery or
     // CTE where the top-level SelectStmt.locking_clause check below does not see them, e.g.
@@ -1235,7 +1253,7 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
     let has_row_lock = format!("{:?}", parsed.protobuf).contains("LockingClause");
 
     let mut replica_safe = !writes_tables && !ddl_tables && !writing_function && !has_row_lock;
-    let mut pins_session = false;
+    let mut pins_session = sets_session_state;
     let mut saw_read = false;
     let mut saw_write = writes_tables || has_row_lock;
     let mut saw_ddl = ddl_tables;
@@ -1508,6 +1526,10 @@ mod tests {
     fn test_analyze_session_state_pins() {
         for sql in [
             "SET search_path = myschema",
+            // set_config() is the function form of SET and must pin identically, or a following
+            // replica-safe read diverges to a replica with the old GUC (cross-tenant read).
+            "SELECT set_config('search_path', 'tenant_a', false)",
+            "SELECT set_config('timezone', 'Asia/Tokyo', true)",
             "PREPARE p AS SELECT 1",
             "LISTEN channel",
             "DECLARE c CURSOR FOR SELECT * FROM t",
