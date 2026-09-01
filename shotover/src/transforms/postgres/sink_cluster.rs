@@ -102,7 +102,8 @@ impl TransformConfig for PostgresSinkClusterConfig {
         let chain_name = transform_context.chain_name;
         let reads_to_replica = counter!("shotover_postgres_reads_to_replica_count", "chain" => chain_name.clone(), "transform" => NAME);
         let replica_fallback = counter!("shotover_postgres_replica_fallback_count", "chain" => chain_name.clone(), "transform" => NAME);
-        let backend_read_timeout = counter!("shotover_postgres_backend_read_timeout_count", "chain" => chain_name, "transform" => NAME);
+        let backend_read_timeout = counter!("shotover_postgres_backend_read_timeout_count", "chain" => chain_name.clone(), "transform" => NAME);
+        let primary_reprobe = counter!("shotover_postgres_primary_reprobe_count", "chain" => chain_name, "transform" => NAME);
         Ok(Box::new(PostgresSinkClusterBuilder {
             name: self.name.clone(),
             contact_points: self.first_contact_points.clone(),
@@ -114,6 +115,7 @@ impl TransformConfig for PostgresSinkClusterConfig {
             reads_to_replica,
             replica_fallback,
             backend_read_timeout,
+            primary_reprobe,
             tls,
             topology: Arc::new(Mutex::new(None)),
             round_robin: Arc::new(AtomicUsize::new(0)),
@@ -133,9 +135,14 @@ impl TransformConfig for PostgresSinkClusterConfig {
     }
 }
 
-/// The discovered roles of the backend hosts. Probed once and shared across all client
-/// connections. NOTE: it is NOT currently refreshed after a failover — the recorded primary is
-/// used until the process restarts. Dynamic re-probing on primary failure is a follow-up.
+/// The discovered roles of the backend hosts. Probed once and shared across all client connections,
+/// then RE-PROBED whenever the recorded primary turns out to be unreachable — see
+/// `invalidate_topology`. That is the failover story: a broken primary link (crash or a failover that
+/// promoted a replica) discards this cache so the next connection re-discovers the current primary,
+/// instead of pinning a dead host until the process restarts. Mid-session failover is NOT transparent
+/// (a client's open transaction / prepared statements / SET state cannot be moved to a new primary —
+/// PostgreSQL itself does not do this): the affected connection is closed with an error and the client
+/// reconnects onto the freshly-probed primary.
 #[derive(Clone, Debug)]
 struct Topology {
     primary: String,
@@ -158,6 +165,7 @@ pub struct PostgresSinkClusterBuilder {
     reads_to_replica: Counter,
     replica_fallback: Counter,
     backend_read_timeout: Counter,
+    primary_reprobe: Counter,
 }
 
 impl TransformBuilder for PostgresSinkClusterBuilder {
@@ -175,6 +183,7 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             reads_to_replica: self.reads_to_replica.clone(),
             replica_fallback: self.replica_fallback.clone(),
             backend_read_timeout: self.backend_read_timeout.clone(),
+            primary_reprobe: self.primary_reprobe.clone(),
             force_run_chain: transform_context.force_run_chain,
             primary: None,
             replica: None,
@@ -247,10 +256,11 @@ pub struct PostgresSinkCluster {
     outstanding_primary: usize,
     outstanding_replica: usize,
 
-    /// Read/write-split counters (shared handles cloned from the builder).
+    /// Read/write-split + failover counters (shared handles cloned from the builder).
     reads_to_replica: Counter,
     replica_fallback: Counter,
     backend_read_timeout: Counter,
+    primary_reprobe: Counter,
 }
 
 #[async_trait]
@@ -403,14 +413,17 @@ impl PostgresSinkCluster {
                 {
                     Ok(responses) => responses,
                     Err(err) => {
-                        // A stalled backend leaves the connection desynced: drop it (and this unit)
-                        // so the next request reconnects, then let transform() tell the client.
+                        // The primary link is broken (a stall, a crash, or a failover). Drop it and
+                        // this unit so nothing reuses a desynced connection.
                         if err.downcast_ref::<super::BackendReadTimeout>().is_some() {
                             self.backend_read_timeout.increment(1);
-                            self.primary = None;
-                            self.outstanding_primary = 0;
-                            self.unit_target = None;
                         }
+                        self.primary = None;
+                        self.outstanding_primary = 0;
+                        self.unit_target = None;
+                        // Discard the cached topology so the NEXT connection re-probes and finds a
+                        // promoted replica, instead of pinning a dead primary until process restart.
+                        self.invalidate_topology().await;
                         return Err(err);
                     }
                 }
@@ -484,10 +497,12 @@ impl PostgresSinkCluster {
         {
             Ok(responses) => responses,
             Err(err) => {
-                // A backend that stalls during the client's own startup gets the same treatment as
-                // an unsupported-auth backend: drop it and surface a clean FATAL to the client.
+                // A backend that stalls or breaks during the client's own startup gets the same
+                // treatment as an unsupported-auth backend: drop it and surface a clean FATAL. Also
+                // discard the cached topology so the next connection re-probes for a new primary.
                 self.primary = None;
                 self.outstanding_primary = 0;
+                self.invalidate_topology().await;
                 return map_startup_error(err, chain_state);
             }
         };
@@ -595,6 +610,31 @@ impl PostgresSinkCluster {
         if self.primary.is_some() {
             return Ok(());
         }
+        // Try the recorded primary. If it is unreachable, a failover may have promoted a replica, so
+        // discard the cached topology, re-probe every contact point, and try the freshly-discovered
+        // primary once. This is what lets a NEW connection reach the new primary transparently instead
+        // of failing against a dead host until the process restarts.
+        match self.connect_primary().await {
+            Ok(()) => Ok(()),
+            Err(first_err) => {
+                tracing::warn!(
+                    "postgres cluster: recorded primary unreachable ({first_err}); re-probing topology"
+                );
+                self.invalidate_topology().await;
+                self.ensure_topology().await?;
+                self.connect_primary().await.map_err(|retry_err| {
+                    anyhow!(
+                        "postgres cluster: primary unreachable after re-probe: {retry_err} \
+                         (before re-probe: {first_err})"
+                    )
+                })
+            }
+        }
+    }
+
+    /// Connects to whatever host the cached topology currently names as primary. The connection
+    /// carries the client's own auth by passthrough.
+    async fn connect_primary(&mut self) -> Result<()> {
         let primary_addr = {
             let guard = self.topology.lock().await;
             guard
@@ -603,9 +643,18 @@ impl PostgresSinkCluster {
                 .primary
                 .clone()
         };
-        // The primary connection carries the client's own auth by passthrough.
         self.primary = Some(self.new_backend_connection(&primary_addr).await?);
         Ok(())
+    }
+
+    /// Discards the shared cached topology so the next `ensure_topology` re-probes every contact
+    /// point. Called when the recorded primary is unreachable — the trigger that lets the cluster
+    /// discover a promoted replica after a failover. Also clears THIS connection's replica choice,
+    /// whose host role may have just changed, so the refreshed topology reselects it.
+    async fn invalidate_topology(&mut self) {
+        self.primary_reprobe.increment(1);
+        *self.topology.lock().await = None;
+        self.replica_addr = None;
     }
 
     async fn ensure_replica(&mut self) -> Result<()> {
