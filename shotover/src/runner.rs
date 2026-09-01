@@ -143,7 +143,22 @@ impl Shotover {
                 .unwrap()
                 .build_recorder();
             let handle = recorder.handle();
+            // Upkeep drains the recorder's rolling histogram/summary buckets. `build_recorder()`
+            // (unlike `PrometheusBuilder::install()`) does NOT spawn the upkeep task, and `render()`
+            // on a scrape does not drain those buckets — so without running upkeep ourselves, every
+            // recorded sample (notably the per-message latency histograms recorded on every message
+            // by the codec) accumulates without bound and RSS grows unboundedly under sustained
+            // traffic. Run upkeep on the same 5s cadence `install()` uses.
+            let upkeep_handle = recorder.handle();
             metrics::set_global_recorder(recorder)?;
+
+            runtime.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    upkeep_handle.run_upkeep();
+                }
+            });
 
             let socket: SocketAddr = observability_interface.parse()?;
             let exporter = LogFilterHttpExporter::new(handle, socket, tracing.handle.clone());
