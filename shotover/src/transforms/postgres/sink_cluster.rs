@@ -232,8 +232,12 @@ impl Transform for PostgresSinkCluster {
         &mut self,
         chain_state: &'shorter mut ChainState<'longer>,
     ) -> Result<Messages> {
-        self.ensure_topology().await?;
-        self.ensure_primary().await?;
+        if let Err(err) = self.ensure_topology().await {
+            return map_startup_error(err, chain_state);
+        }
+        if let Err(err) = self.ensure_primary().await {
+            return map_startup_error(err, chain_state);
+        }
 
         if !self.startup_complete {
             return self.run_startup(chain_state).await;
@@ -451,6 +455,10 @@ impl PostgresSinkCluster {
     async fn probe_topology(&self) -> Result<Topology> {
         let mut primary = None;
         let mut replicas = vec![];
+        // If a contact point rejects the probe because it requires md5/SCRAM (which the cluster sink
+        // cannot originate), keep that specific error so a "no primary" outcome surfaces it to the
+        // client instead of a bare "no primary found" / generic internal error.
+        let mut auth_unsupported = None;
         for host in &self.contact_points {
             match self.probe_host(host).await {
                 Ok(true) => replicas.push(host.clone()),
@@ -463,15 +471,24 @@ impl PostgresSinkCluster {
                         primary = Some(host.clone());
                     }
                 }
-                Err(err) => tracing::warn!("postgres cluster: probe of {host} failed: {err}"),
+                Err(err) => {
+                    if err.downcast_ref::<BackendAuthUnsupported>().is_some() {
+                        auth_unsupported.get_or_insert(err);
+                    } else {
+                        tracing::warn!("postgres cluster: probe of {host} failed: {err}");
+                    }
+                }
             }
         }
         match primary {
             Some(primary) => Ok(Topology { primary, replicas }),
-            None => bail!(
-                "postgres cluster: no primary found among {:?}",
-                self.contact_points
-            ),
+            None => match auth_unsupported {
+                Some(err) => Err(err),
+                None => bail!(
+                    "postgres cluster: no primary found among {:?}",
+                    self.contact_points
+                ),
+            },
         }
     }
 
@@ -639,6 +656,53 @@ fn trailing_ready_status(response: &mut Message) -> Option<u8> {
 
 /// Originates authentication to a backend using a configured password. Supports trust and
 /// cleartext password only; md5 and SCRAM are a documented follow-up.
+/// The backend requested md5 or SCRAM authentication, which PostgresSinkCluster cannot originate (it
+/// originates probe and replica connections with trust or cleartext password only — SCRAM is
+/// per-connection and cannot be forwarded to N backends). Typed so `map_startup_error` can turn it
+/// into a clear client-facing ErrorResponse instead of a generic internal error. Its `Display` is the
+/// message shown to the client.
+#[derive(Debug)]
+struct BackendAuthUnsupported;
+
+impl std::fmt::Display for BackendAuthUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PostgresSinkCluster can only originate connections with trust or cleartext password \
+             auth, but this backend requires md5/SCRAM. Use PostgresSinkSingle for a md5/SCRAM backend."
+        )
+    }
+}
+
+impl std::error::Error for BackendAuthUnsupported {}
+
+/// Turns a startup-time backend failure into what the client should see. An unsupported-auth failure
+/// (a md5/SCRAM backend the cluster sink cannot originate against) becomes a clean FATAL ErrorResponse
+/// that names the fix, and closes the connection — instead of the generic "internal shotover bug"
+/// error a client gets when a transform returns Err. Any other failure propagates unchanged.
+fn map_startup_error(err: anyhow::Error, chain_state: &mut ChainState) -> Result<Messages> {
+    if err.downcast_ref::<BackendAuthUnsupported>().is_none() {
+        return Err(err);
+    }
+    chain_state.close_client_connection = true;
+    let request_id = chain_state.requests.first_mut().map(|r| r.id());
+    let mut response = Message::from_frame(Frame::Postgres(PostgresFrame::Response(vec![
+        BackendMessage::ErrorResponse {
+            fields: vec![
+                (b'S', "FATAL".to_owned()),
+                (b'V', "FATAL".to_owned()),
+                // 0A000 = feature_not_supported.
+                (b'C', "0A000".to_owned()),
+                (b'M', err.to_string()),
+            ],
+        },
+    ])));
+    if let Some(id) = request_id {
+        response.set_request_id(id);
+    }
+    Ok(vec![response])
+}
+
 async fn authenticate_backend(
     connection: &mut SinkConnection,
     user: &str,
@@ -680,10 +744,9 @@ async fn authenticate_backend(
                         ..
                     })
                     | BackendMessage::Authentication(AuthenticationMessage::Sasl { .. }) => {
-                        bail!(
-                            "PostgresSinkCluster can only originate replica connections with trust or cleartext password auth; \
-                             this backend requested md5/SCRAM (a follow-up). Configure the backend with password auth or use PostgresSinkSingle."
-                        );
+                        // Typed so the transform can surface a clear client-facing ErrorResponse
+                        // instead of the generic internal error a bare Err produces.
+                        return Err(BackendAuthUnsupported.into());
                     }
                     BackendMessage::ErrorResponse { .. } => {
                         bail!(
