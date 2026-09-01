@@ -118,6 +118,20 @@ impl Metadata {
     }
 }
 
+/// Postgres rate-limiting granularity: only self-contained simple queries (`Q`) are throttled.
+/// Extended-protocol messages (Parse/Bind/Describe/Execute/Sync/Close/…) cannot be rejected
+/// individually without desyncing the stateful session, and startup/auth (which is tag-less, so its
+/// first byte is never `Q`) must never be throttled — for all of those this returns Err, which
+/// `RequestThrottling` treats as "do not throttle, pass through". The tag byte is the first byte of a
+/// tagged frontend message on the wire.
+#[cfg(feature = "postgres")]
+fn postgres_query_cell_count(bytes: &[u8]) -> Result<NonZeroU32> {
+    match bytes.first() {
+        Some(b'Q') => Ok(nonzero!(1u32)),
+        _ => Err(anyhow!("postgres: only simple Query messages are rate-limited")),
+    }
+}
+
 pub type Messages = Vec<Message>;
 
 /// Unique identifier for the message assigned by shotover at creation time.
@@ -396,7 +410,7 @@ impl Message {
     pub fn cell_count(&self) -> Result<NonZeroU32> {
         Ok(match self.inner.as_ref().unwrap() {
             MessageInner::RawBytes {
-                #[cfg(feature = "cassandra")]
+                #[cfg(any(feature = "cassandra", feature = "postgres"))]
                 bytes,
                 message_type,
                 ..
@@ -411,7 +425,7 @@ impl Message {
                 #[cfg(feature = "opensearch")]
                 MessageType::OpenSearch => todo!(),
                 #[cfg(feature = "postgres")]
-                MessageType::Postgres => nonzero!(1u32),
+                MessageType::Postgres => postgres_query_cell_count(bytes)?,
             },
             MessageInner::Modified { frame } | MessageInner::Parsed { frame, .. } => {
                 match frame.as_ref() {
@@ -425,7 +439,18 @@ impl Message {
                     #[cfg(feature = "opensearch")]
                     Frame::OpenSearch(_) => todo!(),
                     #[cfg(feature = "postgres")]
-                    Frame::Postgres(_) => nonzero!(1u32),
+                    Frame::Postgres(frame) => {
+                        use crate::frame::postgres::{FrontendMessage, PostgresFrame};
+                        match frame {
+                            PostgresFrame::Request(FrontendMessage::Query { .. }) => nonzero!(1u32),
+                            // Only simple queries are rate-limited; see postgres_query_cell_count.
+                            _ => {
+                                return Err(anyhow!(
+                                    "postgres: only simple Query messages are rate-limited"
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         })
@@ -607,7 +632,29 @@ impl Message {
                 #[cfg(feature = "opensearch")]
                 Metadata::OpenSearch => unimplemented!(),
                 #[cfg(feature = "postgres")]
-                Metadata::Postgres => unimplemented!(),
+                Metadata::Postgres => {
+                    use crate::frame::postgres::{BackendMessage, PostgresFrame};
+                    // Only simple queries reach here (see postgres_query_cell_count), so the response
+                    // that ends a simple-query cycle — ErrorResponse then ReadyForQuery('I') — is a
+                    // valid, self-contained rejection the client can consume without desync.
+                    Frame::Postgres(PostgresFrame::Response(vec![
+                        BackendMessage::ErrorResponse {
+                            fields: vec![
+                                (b'S', "ERROR".to_owned()),
+                                (b'V', "ERROR".to_owned()),
+                                // 53400 configuration_limit_exceeded: the configured request rate
+                                // limit (RequestThrottling.max_requests_per_second) was exceeded.
+                                (b'C', "53400".to_owned()),
+                                (
+                                    b'M',
+                                    "request rate limit exceeded, try again later (RequestThrottling)"
+                                        .to_owned(),
+                                ),
+                            ],
+                        },
+                        BackendMessage::ReadyForQuery { status: b'I' },
+                    ]))
+                }
             },
             // reachable with feature = cassandra
             #[allow(unreachable_code)]
@@ -737,4 +784,25 @@ pub enum QueryType {
     ReadWrite,
     SchemaChange,
     PubSubMessage,
+}
+
+#[cfg(all(test, feature = "postgres"))]
+mod postgres_throttle_tests {
+    use super::postgres_query_cell_count;
+
+    #[test]
+    fn only_simple_query_is_rate_limited() {
+        // A simple Query ('Q') is throttleable and counts as one cell.
+        assert_eq!(postgres_query_cell_count(b"Q\0\0\0\x08").unwrap().get(), 1);
+        // Extended-protocol tags (Parse/Bind/Describe/Execute/Sync/Close) and Terminate must NOT be
+        // throttled — rejecting one mid-pipeline would desync the session — so they return Err, which
+        // RequestThrottling reads as "pass through".
+        for &tag in b"PBDESCX" {
+            assert!(postgres_query_cell_count(&[tag]).is_err());
+        }
+        // A tag-less startup message (first byte is part of its length) is never 'Q': not throttled.
+        assert!(postgres_query_cell_count(&[0, 0, 0, 8]).is_err());
+        // A truncated/empty buffer is skipped rather than throttled.
+        assert!(postgres_query_cell_count(&[]).is_err());
+    }
 }

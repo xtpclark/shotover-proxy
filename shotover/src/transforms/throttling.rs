@@ -45,7 +45,14 @@ impl TransformConfig for RequestThrottlingConfig {
     }
 
     fn up_chain_protocol(&self) -> UpChainProtocol {
-        UpChainProtocol::MustBeOneOf(vec![MessageType::Cassandra])
+        // Per enabled feature: the MessageType variants are themselves cfg-gated, so a build without
+        // one of these protocols must not name it.
+        UpChainProtocol::MustBeOneOf(vec![
+            #[cfg(feature = "cassandra")]
+            MessageType::Cassandra,
+            #[cfg(feature = "postgres")]
+            MessageType::Postgres,
+        ])
     }
 
     fn down_chain_protocol(&self) -> DownChainProtocol {
@@ -123,7 +130,7 @@ impl Transform for RequestThrottling {
             }
         }
 
-        // send allowed messages to Cassandra
+        // send allowed messages on to the sink (throttled ones were replaced with dummies)
         let mut responses = chain_state.call_next_transform().await?;
 
         // replace dummy responses with throttle messages
