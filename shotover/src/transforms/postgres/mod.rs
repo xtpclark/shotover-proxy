@@ -8,6 +8,21 @@ use crate::frame::Frame;
 use crate::frame::postgres::{FrontendMessage, PostgresFrame};
 use crate::message::{Message, Messages};
 use anyhow::Result;
+use std::time::Duration;
+
+/// A backend accepted the connection but did not produce the next response within `read_timeout`.
+/// Typed so a sink can turn it into a client ErrorResponse + connection close rather than letting the
+/// client hang forever on a backend that stalls mid-answer.
+#[derive(Debug)]
+pub(crate) struct BackendReadTimeout;
+
+impl std::fmt::Display for BackendReadTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "postgres backend did not respond within read_timeout")
+    }
+}
+
+impl std::error::Error for BackendReadTimeout {}
 
 /// Returns true if a request makes the server produce output now.
 ///
@@ -62,6 +77,7 @@ pub(crate) async fn exchange(
     connection: &mut SinkConnection,
     mut requests: Messages,
     outstanding: &mut usize,
+    read_timeout: Option<Duration>,
 ) -> Result<Messages> {
     let trailing = trailing_unanswerable(&mut requests);
     *outstanding += requests.len();
@@ -73,7 +89,17 @@ pub(crate) async fn exchange(
         Some(trailing) => {
             while *outstanding > trailing {
                 let before = responses.len();
-                connection.recv_into(&mut responses).await?;
+                // read_timeout is an IDLE timeout: it bounds the wait for the NEXT chunk of response
+                // data, resetting whenever data arrives, so a large legitimately-streaming result set
+                // is never cut off — only a backend that stalls without producing anything trips it.
+                match read_timeout {
+                    Some(timeout) => {
+                        tokio::time::timeout(timeout, connection.recv_into(&mut responses))
+                            .await
+                            .map_err(|_| BackendReadTimeout)??
+                    }
+                    None => connection.recv_into(&mut responses).await?,
+                }
                 *outstanding = outstanding.saturating_sub(count_answered(&responses[before..]));
             }
         }

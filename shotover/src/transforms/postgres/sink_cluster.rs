@@ -28,7 +28,8 @@ use crate::frame::postgres::{
     AuthenticationMessage, BackendMessage, FrontendMessage, PostgresFrame, analyze_sql,
 };
 use crate::frame::{Frame, MessageType};
-use crate::message::{Message, Messages};
+use crate::message::{Message, MessageId, Messages};
+use metrics::{Counter, counter};
 use crate::tls::{TlsConnector, TlsConnectorConfig};
 use crate::transforms::{
     ChainState, DownChainProtocol, Transform, TransformBuilder, TransformConfig,
@@ -67,6 +68,12 @@ pub struct PostgresSinkClusterConfig {
     #[serde(default = "default_probe_database")]
     pub probe_database: String,
     pub connect_timeout_ms: u64,
+    /// Optional per-node idle read timeout: the longest shotover waits for the NEXT chunk of a
+    /// backend's response before giving up on that connection. It resets whenever data arrives, so a
+    /// large legitimately-streaming result is never cut off — only a backend that stalls without
+    /// producing anything trips it. Unset (the default) waits forever, preserving prior behaviour.
+    #[serde(default)]
+    pub read_timeout_ms: Option<u64>,
     pub tls: Option<TlsConnectorConfig>,
 }
 
@@ -84,12 +91,18 @@ impl TransformConfig for PostgresSinkClusterConfig {
 
     async fn get_builder(
         &self,
-        _transform_context: TransformContextConfig,
+        transform_context: TransformContextConfig,
     ) -> Result<Box<dyn TransformBuilder>> {
         if self.first_contact_points.is_empty() {
             bail!("PostgresSinkCluster requires at least one first_contact_point");
         }
         let tls = self.tls.as_ref().map(TlsConnector::new).transpose()?;
+        // Read/write-split observability: one handle per event, cloned into every per-connection
+        // transform so a running split is measurable (offloaded reads, silent fallback, stalls).
+        let chain_name = transform_context.chain_name;
+        let reads_to_replica = counter!("shotover_postgres_reads_to_replica_count", "chain" => chain_name.clone(), "transform" => NAME);
+        let replica_fallback = counter!("shotover_postgres_replica_fallback_count", "chain" => chain_name.clone(), "transform" => NAME);
+        let backend_read_timeout = counter!("shotover_postgres_backend_read_timeout_count", "chain" => chain_name, "transform" => NAME);
         Ok(Box::new(PostgresSinkClusterBuilder {
             name: self.name.clone(),
             contact_points: self.first_contact_points.clone(),
@@ -97,6 +110,10 @@ impl TransformConfig for PostgresSinkClusterConfig {
             password: self.password.clone(),
             probe_database: self.probe_database.clone(),
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            read_timeout: self.read_timeout_ms.map(Duration::from_millis),
+            reads_to_replica,
+            replica_fallback,
+            backend_read_timeout,
             tls,
             topology: Arc::new(Mutex::new(None)),
             round_robin: Arc::new(AtomicUsize::new(0)),
@@ -132,11 +149,15 @@ pub struct PostgresSinkClusterBuilder {
     password: String,
     probe_database: String,
     connect_timeout: Duration,
+    read_timeout: Option<Duration>,
     tls: Option<TlsConnector>,
     topology: Arc<Mutex<Option<Topology>>>,
     /// Rotates replica selection across client connections. Shared so it actually advances between
     /// connections (each connection builds its own Transform).
     round_robin: Arc<AtomicUsize>,
+    reads_to_replica: Counter,
+    replica_fallback: Counter,
+    backend_read_timeout: Counter,
 }
 
 impl TransformBuilder for PostgresSinkClusterBuilder {
@@ -147,9 +168,13 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             password: self.password.clone(),
             probe_database: self.probe_database.clone(),
             connect_timeout: self.connect_timeout,
+            read_timeout: self.read_timeout,
             tls: self.tls.clone(),
             topology: self.topology.clone(),
             round_robin: self.round_robin.clone(),
+            reads_to_replica: self.reads_to_replica.clone(),
+            replica_fallback: self.replica_fallback.clone(),
+            backend_read_timeout: self.backend_read_timeout.clone(),
             force_run_chain: transform_context.force_run_chain,
             primary: None,
             replica: None,
@@ -191,6 +216,7 @@ pub struct PostgresSinkCluster {
     password: String,
     probe_database: String,
     connect_timeout: Duration,
+    read_timeout: Option<Duration>,
     tls: Option<TlsConnector>,
     topology: Arc<Mutex<Option<Topology>>>,
     round_robin: Arc<AtomicUsize>,
@@ -220,6 +246,11 @@ pub struct PostgresSinkCluster {
     /// separately because each backend has its own independent pipeline.
     outstanding_primary: usize,
     outstanding_replica: usize,
+
+    /// Read/write-split counters (shared handles cloned from the builder).
+    reads_to_replica: Counter,
+    replica_fallback: Counter,
+    backend_read_timeout: Counter,
 }
 
 #[async_trait]
@@ -256,8 +287,18 @@ impl Transform for PostgresSinkCluster {
         }
 
         let target = self.decide_target(&mut chain_state.requests);
-        self.route(target, std::mem::take(&mut chain_state.requests))
-            .await
+        let mut requests = std::mem::take(&mut chain_state.requests);
+        let first_id = requests.first_mut().map(|r| r.id());
+        match self.route(target, requests).await {
+            Ok(responses) => Ok(responses),
+            Err(err) if err.downcast_ref::<super::BackendReadTimeout>().is_some() => {
+                // route() already dropped the stalled backend connection. Tell the client and close
+                // so it never hangs on a response the backend will not produce.
+                chain_state.close_client_connection = true;
+                Ok(vec![backend_read_timeout_response(first_id)])
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -326,11 +367,16 @@ impl PostgresSinkCluster {
     async fn route(&mut self, target: Target, requests: Messages) -> Result<Messages> {
         let target = if target == Target::Replica {
             match self.ensure_replica().await {
-                Ok(()) => Target::Replica,
+                Ok(()) => {
+                    self.reads_to_replica.increment(1);
+                    Target::Replica
+                }
                 Err(err) => {
                     // No replica reachable: reads fall back to the primary, but say so — a silent
                     // fallback that also costs a full connect timeout per read is exactly the
-                    // "splitting quietly stopped and everything is slow" failure to avoid.
+                    // "splitting quietly stopped and everything is slow" failure to avoid. The
+                    // counter makes that fallback visible even when nobody is watching the log.
+                    self.replica_fallback.increment(1);
                     tracing::warn!(
                         "postgres cluster: replica unavailable, routing read to primary: {err}"
                     );
@@ -347,20 +393,48 @@ impl PostgresSinkCluster {
         // without blocking, so a split pipeline cannot deadlock the connection.
         let mut responses = match target {
             Target::Primary => {
-                super::exchange(
+                match super::exchange(
                     self.primary.as_mut().unwrap(),
                     requests,
                     &mut self.outstanding_primary,
+                    self.read_timeout,
                 )
-                .await?
+                .await
+                {
+                    Ok(responses) => responses,
+                    Err(err) => {
+                        // A stalled backend leaves the connection desynced: drop it (and this unit)
+                        // so the next request reconnects, then let transform() tell the client.
+                        if err.downcast_ref::<super::BackendReadTimeout>().is_some() {
+                            self.backend_read_timeout.increment(1);
+                            self.primary = None;
+                            self.outstanding_primary = 0;
+                            self.unit_target = None;
+                        }
+                        return Err(err);
+                    }
+                }
             }
             Target::Replica => {
-                super::exchange(
+                match super::exchange(
                     self.replica.as_mut().unwrap(),
                     requests,
                     &mut self.outstanding_replica,
+                    self.read_timeout,
                 )
-                .await?
+                .await
+                {
+                    Ok(responses) => responses,
+                    Err(err) => {
+                        if err.downcast_ref::<super::BackendReadTimeout>().is_some() {
+                            self.backend_read_timeout.increment(1);
+                            self.replica = None;
+                            self.outstanding_replica = 0;
+                            self.unit_target = None;
+                        }
+                        return Err(err);
+                    }
+                }
             }
         };
         self.note_unit_boundary(&mut responses);
@@ -400,12 +474,23 @@ impl PostgresSinkCluster {
         }
 
         let requests = std::mem::take(&mut chain_state.requests);
-        let mut responses = super::exchange(
+        let mut responses = match super::exchange(
             self.primary.as_mut().unwrap(),
             requests,
             &mut self.outstanding_primary,
+            self.read_timeout,
         )
-        .await?;
+        .await
+        {
+            Ok(responses) => responses,
+            Err(err) => {
+                // A backend that stalls during the client's own startup gets the same treatment as
+                // an unsupported-auth backend: drop it and surface a clean FATAL to the client.
+                self.primary = None;
+                self.outstanding_primary = 0;
+                return map_startup_error(err, chain_state);
+            }
+        };
         for response in responses.iter_mut() {
             if let Some(status) = trailing_ready_status(response) {
                 // The first ReadyForQuery means authentication succeeded and the session is live.
@@ -681,9 +766,14 @@ impl std::error::Error for BackendAuthUnsupported {}
 /// that names the fix, and closes the connection — instead of the generic "internal shotover bug"
 /// error a client gets when a transform returns Err. Any other failure propagates unchanged.
 fn map_startup_error(err: anyhow::Error, chain_state: &mut ChainState) -> Result<Messages> {
-    if err.downcast_ref::<BackendAuthUnsupported>().is_none() {
+    // 0A000 = feature_not_supported (md5/SCRAM backend); 08006 = connection_failure (backend stalled).
+    let sqlstate = if err.downcast_ref::<BackendAuthUnsupported>().is_some() {
+        "0A000"
+    } else if err.downcast_ref::<super::BackendReadTimeout>().is_some() {
+        "08006"
+    } else {
         return Err(err);
-    }
+    };
     chain_state.close_client_connection = true;
     let request_id = chain_state.requests.first_mut().map(|r| r.id());
     let mut response = Message::from_frame(Frame::Postgres(PostgresFrame::Response(vec![
@@ -691,8 +781,7 @@ fn map_startup_error(err: anyhow::Error, chain_state: &mut ChainState) -> Result
             fields: vec![
                 (b'S', "FATAL".to_owned()),
                 (b'V', "FATAL".to_owned()),
-                // 0A000 = feature_not_supported.
-                (b'C', "0A000".to_owned()),
+                (b'C', sqlstate.to_owned()),
                 (b'M', err.to_string()),
             ],
         },
@@ -701,6 +790,26 @@ fn map_startup_error(err: anyhow::Error, chain_state: &mut ChainState) -> Result
         response.set_request_id(id);
     }
     Ok(vec![response])
+}
+
+/// The ErrorResponse sent to the client when a backend read timed out mid-session (read_timeout).
+/// SQLSTATE 08006 (connection_failure): the stalled backend connection has already been dropped by
+/// `route`, and the caller pairs this to the batch's first request id and closes the connection.
+fn backend_read_timeout_response(request_id: Option<MessageId>) -> Message {
+    let mut response = Message::from_frame(Frame::Postgres(PostgresFrame::Response(vec![
+        BackendMessage::ErrorResponse {
+            fields: vec![
+                (b'S', "ERROR".to_owned()),
+                (b'V', "ERROR".to_owned()),
+                (b'C', "08006".to_owned()),
+                (b'M', "postgres backend did not respond within read_timeout".to_owned()),
+            ],
+        },
+    ])));
+    if let Some(id) = request_id {
+        response.set_request_id(id);
+    }
+    response
 }
 
 async fn authenticate_backend(
