@@ -306,6 +306,7 @@ mod test {
             .build(TransformContextBuilder {
                 force_run_chain: force_run_chain.clone(),
                 client_details: String::new(),
+                source_is_tls: false,
             });
         (transform, force_run_chain)
     }

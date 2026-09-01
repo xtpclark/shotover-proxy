@@ -1,6 +1,8 @@
 use crate::codec::{CodecBuilder, Direction, postgres::PostgresCodecBuilder};
 use crate::connection::SinkConnection;
-use crate::frame::postgres::{FrontendMessage, PostgresFrame};
+use crate::frame::postgres::{
+    AuthenticationMessage, BackendMessage, FrontendMessage, PostgresFrame,
+};
 use crate::frame::{Frame, MessageType};
 use crate::message::{Message, Messages};
 use crate::tls::{TlsConnector, TlsConnectorConfig};
@@ -96,6 +98,8 @@ impl TransformBuilder for PostgresSinkSingleBuilder {
             connect_timeout: self.connect_timeout,
             force_run_chain: transform_context.force_run_chain,
             outstanding: 0,
+            source_is_tls: transform_context.source_is_tls,
+            startup_complete: false,
         })
     }
 
@@ -122,6 +126,13 @@ pub struct PostgresSinkSingle {
     /// Carried across batches because an extended-query pipeline's responses arrive on the batch
     /// that carries the Flush/Sync, which may be a later one than the batch that sent the requests.
     outstanding: usize,
+    /// Whether this connection's source terminates TLS with the client. When false (a plaintext
+    /// client), SCRAM-SHA-256-PLUS is stripped from the backend's SASL offer during auth — see
+    /// `strip_scram_channel_binding` and the note above.
+    source_is_tls: bool,
+    /// True once the client has finished authenticating (AuthenticationOk / first ReadyForQuery);
+    /// after that no AuthenticationSASL can appear, so responses pass through unparsed (byte-faithful).
+    startup_complete: bool,
 }
 
 // A note on SCRAM channel binding (SCRAM-SHA-256-PLUS) through a TLS terminating proxy.
@@ -216,12 +227,56 @@ impl Transform for PostgresSinkSingle {
             )
             .await?;
         }
+        // A plaintext client cannot use SCRAM channel binding, so strip SCRAM-SHA-256-PLUS from the
+        // backend's SASL offer before it reaches the client. A TLS sink to a channel-binding-capable
+        // backend otherwise offers -PLUS to a plaintext client, which aborts the handshake
+        // ("server offered SCRAM-SHA-256-PLUS authentication over a non-SSL connection"). Only the
+        // auth phase can carry an AuthenticationSASL, so once startup completes responses pass through
+        // untouched (byte-faithful passthrough).
+        if !self.source_is_tls && !self.startup_complete {
+            for response in responses.iter_mut() {
+                self.strip_scram_channel_binding(response);
+            }
+        }
         responses.append(&mut cancel_responses);
         Ok(responses)
     }
 }
 
 impl PostgresSinkSingle {
+    /// Strips SCRAM-SHA-256-PLUS from a backend AuthenticationSASL offer when the client link is
+    /// plaintext (see the note above), and records when startup finishes so later responses are left
+    /// untouched. A plaintext client never attempts channel binding, so removing -PLUS leaves plain
+    /// SCRAM-SHA-256 and the handshake proceeds; a TLS client is unaffected because this runs only
+    /// when the source is not TLS.
+    fn strip_scram_channel_binding(&mut self, response: &mut Message) {
+        let mut modified = false;
+        {
+            let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() else {
+                return;
+            };
+            for message in messages.iter_mut() {
+                match message {
+                    BackendMessage::Authentication(AuthenticationMessage::Sasl { mechanisms }) => {
+                        let before = mechanisms.len();
+                        mechanisms.retain(|m| m != "SCRAM-SHA-256-PLUS");
+                        modified |= mechanisms.len() != before;
+                    }
+                    // Auth is over once the backend accepts or the session is ready; no
+                    // AuthenticationSASL can follow, so stop inspecting responses.
+                    BackendMessage::Authentication(AuthenticationMessage::Ok)
+                    | BackendMessage::ReadyForQuery { .. } => {
+                        self.startup_complete = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if modified {
+            response.invalidate_cache();
+        }
+    }
+
     /// Delivers a CancelRequest to the server on a throwaway connection.
     /// Failure is logged and swallowed: a cancel is advisory and the client's own
     /// connection is unaffected by whether the cancel reached the server.
@@ -257,5 +312,76 @@ impl PostgresSinkSingle {
         // The server closes the connection after processing the cancel.
         stream.shutdown().await.ok();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sink() -> PostgresSinkSingle {
+        PostgresSinkSingle {
+            address: "127.0.0.1:5432".to_owned(),
+            tls: None,
+            connection: None,
+            connect_timeout: Duration::from_secs(1),
+            force_run_chain: Arc::new(Notify::new()),
+            outstanding: 0,
+            source_is_tls: false,
+            startup_complete: false,
+        }
+    }
+
+    fn sasl_offer(mechanisms: &[&str]) -> Message {
+        Message::from_frame(Frame::Postgres(PostgresFrame::Response(vec![
+            BackendMessage::Authentication(AuthenticationMessage::Sasl {
+                mechanisms: mechanisms.iter().map(|m| m.to_string()).collect(),
+            }),
+        ])))
+    }
+
+    fn mechanisms_of(m: &mut Message) -> Vec<String> {
+        match m.frame() {
+            Some(Frame::Postgres(PostgresFrame::Response(msgs))) => msgs
+                .iter()
+                .find_map(|x| match x {
+                    BackendMessage::Authentication(AuthenticationMessage::Sasl { mechanisms }) => {
+                        Some(mechanisms.clone())
+                    }
+                    _ => None,
+                })
+                .expect("expected a SASL message"),
+            _ => panic!("expected a postgres response"),
+        }
+    }
+
+    #[test]
+    fn test_strip_scram_plus_for_plaintext_client() {
+        // A plaintext client cannot do channel binding, so SCRAM-SHA-256-PLUS is removed, leaving
+        // plain SCRAM-SHA-256 so the handshake can proceed.
+        let mut s = sink();
+        let mut offer = sasl_offer(&["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"]);
+        s.strip_scram_channel_binding(&mut offer);
+        assert_eq!(mechanisms_of(&mut offer), vec!["SCRAM-SHA-256".to_owned()]);
+    }
+
+    #[test]
+    fn test_strip_leaves_plain_scram_offer_untouched() {
+        let mut s = sink();
+        let mut offer = sasl_offer(&["SCRAM-SHA-256"]);
+        s.strip_scram_channel_binding(&mut offer);
+        assert_eq!(mechanisms_of(&mut offer), vec!["SCRAM-SHA-256".to_owned()]);
+    }
+
+    #[test]
+    fn test_startup_complete_stops_inspection() {
+        // AuthenticationOk (or a ReadyForQuery) ends the auth phase; the sink then leaves responses
+        // untouched, preserving byte-faithful passthrough.
+        let mut s = sink();
+        let mut ok = Message::from_frame(Frame::Postgres(PostgresFrame::Response(vec![
+            BackendMessage::Authentication(AuthenticationMessage::Ok),
+        ])));
+        s.strip_scram_channel_binding(&mut ok);
+        assert!(s.startup_complete);
     }
 }

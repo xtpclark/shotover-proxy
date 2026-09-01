@@ -288,6 +288,7 @@ impl<C: CodecBuilder + 'static> SourceTask<C> {
                         let context = TransformContextBuilder{
                             force_run_chain: force_run_chain.clone(),
                             client_details:client_details.clone(),
+                            source_is_tls: self.tls.is_some(),
                         };
 
                         // Create a unique shutdown channel for this connection

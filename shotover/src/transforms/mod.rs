@@ -52,6 +52,13 @@ pub struct TransformContextBuilder {
 
     /// IP address of the client
     pub client_details: String,
+
+    /// Whether the shotover source that accepted this client connection terminates TLS with the
+    /// client. The postgres sink uses this to decide whether it may strip SCRAM-SHA-256-PLUS from a
+    /// backend's SASL offer: safe only when the client link is plaintext (a plaintext client never
+    /// attempts channel binding), never when the client link is TLS (that path needs the client to
+    /// set channel_binding=disable — stripping there triggers SCRAM's own downgrade rejection).
+    pub source_is_tls: bool,
 }
 
 impl TransformContextBuilder {
@@ -59,6 +66,7 @@ impl TransformContextBuilder {
         TransformContextBuilder {
             force_run_chain: Arc::new(Notify::new()),
             client_details: String::new(),
+            source_is_tls: false,
         }
     }
 }
