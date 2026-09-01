@@ -37,14 +37,29 @@ use crate::transforms::{
 };
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
+
+/// The cancel key a client holds = the PRIMARY's BackendKeyData, passed through untouched at startup.
+type CancelKey = (i32, Bytes);
+
+/// Where to re-issue a cancel for a session that ran reads on a replica: the replica's own address
+/// and its own BackendKeyData (the client never saw the replica's key, so the proxy must supply it).
+#[derive(Clone)]
+struct ReplicaCancelTarget {
+    addr: String,
+    process_id: i32,
+    secret_key: Bytes,
+}
 
 /// Upper bound on how long the proxy waits for a backend to answer during topology probing and
 /// replica authentication. Without it, a backend that accepts the TCP connection but never replies
@@ -150,6 +165,7 @@ impl TransformConfig for PostgresSinkClusterConfig {
             topology: Arc::new(Mutex::new(None)),
             round_robin: Arc::new(AtomicUsize::new(0)),
             replica_health: Arc::new(Mutex::new(HashMap::new())),
+            cancel_registry: Arc::new(StdMutex::new(HashMap::new())),
         }))
     }
 
@@ -205,6 +221,8 @@ pub struct PostgresSinkClusterBuilder {
     backend_read_timeout: Counter,
     primary_reprobe: Counter,
     replica_unhealthy: Counter,
+    /// Shared cancel registry: a client's key (the primary's) -> the replica key to re-cancel with.
+    cancel_registry: Arc<StdMutex<HashMap<CancelKey, ReplicaCancelTarget>>>,
 }
 
 impl TransformBuilder for PostgresSinkClusterBuilder {
@@ -228,6 +246,8 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             backend_read_timeout: self.backend_read_timeout.clone(),
             primary_reprobe: self.primary_reprobe.clone(),
             replica_unhealthy: self.replica_unhealthy.clone(),
+            cancel_registry: self.cancel_registry.clone(),
+            client_cancel_key: None,
             force_run_chain: transform_context.force_run_chain,
             primary: None,
             replica: None,
@@ -313,6 +333,14 @@ pub struct PostgresSinkCluster {
     backend_read_timeout: Counter,
     primary_reprobe: Counter,
     replica_unhealthy: Counter,
+
+    /// Shared cancel registry (see [`ReplicaCancelTarget`]): the client's key (the primary's) -> the
+    /// replica's own key, so a CancelRequest arriving on its own connection can be re-issued to the
+    /// replica that is actually running the read.
+    cancel_registry: Arc<StdMutex<HashMap<CancelKey, ReplicaCancelTarget>>>,
+    /// This session's client-facing cancel key (the primary's BackendKeyData), captured at startup.
+    /// Used as the registry key and removed from the registry on drop.
+    client_cancel_key: Option<CancelKey>,
 }
 
 #[async_trait]
@@ -327,6 +355,11 @@ impl Transform for PostgresSinkCluster {
     ) -> Result<Messages> {
         if let Err(err) = self.ensure_topology().await {
             return map_startup_error(err, chain_state);
+        }
+        // A CancelRequest arrives on its own dedicated connection ahead of any startup, so it must be
+        // routed to the backend running the query rather than run through startup/auth.
+        if requests_contain_cancel(&mut chain_state.requests) {
+            return self.handle_cancel(chain_state).await;
         }
         if let Err(err) = self.ensure_primary().await {
             return map_startup_error(err, chain_state);
@@ -563,6 +596,22 @@ impl PostgresSinkCluster {
                 return map_startup_error(err, chain_state);
             }
         };
+        // Capture the primary's BackendKeyData as it passes through to the client: it IS the key the
+        // client will present in a CancelRequest, so it is this session's client-facing cancel key and
+        // the registry key used to route a cancel to the replica running the read.
+        for response in responses.iter_mut() {
+            if let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() {
+                for message in messages.iter() {
+                    if let BackendMessage::BackendKeyData {
+                        process_id,
+                        secret_key,
+                    } = message
+                    {
+                        self.client_cancel_key = Some((*process_id, secret_key.clone()));
+                    }
+                }
+            }
+        }
         for response in responses.iter_mut() {
             if let Some(status) = trailing_ready_status(response) {
                 // The first ReadyForQuery means authentication succeeded and the session is live.
@@ -779,8 +828,24 @@ impl PostgresSinkCluster {
             .try_connect_replica(&addr, &user, &database, &password)
             .await
         {
-            Ok(connection) => {
+            Ok((connection, replica_key)) => {
                 self.mark_replica_healthy(&addr).await;
+                // Register for cluster-side cancel routing: map the client-held key (the primary's) to
+                // this replica's own key, so a later CancelRequest can be re-issued to the replica that
+                // is actually running the read.
+                if let (Some(client_key), Some((rpid, rsecret))) =
+                    (self.client_cancel_key.clone(), replica_key)
+                    && let Ok(mut reg) = self.cancel_registry.lock()
+                {
+                    reg.insert(
+                        client_key,
+                        ReplicaCancelTarget {
+                            addr: addr.clone(),
+                            process_id: rpid,
+                            secret_key: rsecret,
+                        },
+                    );
+                }
                 self.replica = Some(connection);
                 Ok(())
             }
@@ -795,21 +860,23 @@ impl PostgresSinkCluster {
         }
     }
 
+    /// Connects and authenticates a replica connection, returning it along with the replica's own
+    /// BackendKeyData (process_id + secret) captured during authentication, for cancel routing.
     async fn try_connect_replica(
         &self,
         addr: &str,
         user: &str,
         database: &str,
         password: &str,
-    ) -> Result<SinkConnection> {
+    ) -> Result<(SinkConnection, Option<(i32, Bytes)>)> {
         let mut connection = self.new_backend_connection(addr).await?;
-        tokio::time::timeout(
+        let key = tokio::time::timeout(
             BACKEND_OP_TIMEOUT,
             authenticate_backend(&mut connection, user, database, password),
         )
         .await
         .map_err(|_| anyhow!("timed out authenticating to replica {addr}"))??;
-        Ok(connection)
+        Ok((connection, key))
     }
 
     async fn new_backend_connection(&self, host: &str) -> Result<SinkConnection> {
@@ -822,6 +889,95 @@ impl PostgresSinkCluster {
             None,
         )
         .await
+    }
+
+    /// Relays a client's CancelRequest to the backend(s) that could be running its query: verbatim to
+    /// the primary (the client holds the primary's key), and — if this session's key is in the shared
+    /// registry — a synthesized CancelRequest to the replica using the replica's OWN key. Both are
+    /// best-effort (a cancel is advisory); the client connection is then closed, matching a real
+    /// server's behaviour after acting on a cancel.
+    async fn handle_cancel(&mut self, chain_state: &mut ChainState<'_>) -> Result<Messages> {
+        let primary_addr = {
+            let guard = self.topology.lock().await;
+            guard.as_ref().map(|t| t.primary.clone())
+        };
+        let mut responses = vec![];
+        for request in chain_state.requests.iter_mut() {
+            let (process_id, secret_key) = match request.frame() {
+                Some(Frame::Postgres(PostgresFrame::Request(FrontendMessage::CancelRequest {
+                    process_id,
+                    secret_key,
+                }))) => (*process_id, secret_key.clone()),
+                _ => continue,
+            };
+            if let Some(addr) = &primary_addr {
+                self.send_cancel(addr, process_id, secret_key.clone()).await;
+            }
+            let target = self
+                .cancel_registry
+                .lock()
+                .ok()
+                .and_then(|reg| reg.get(&(process_id, secret_key.clone())).cloned());
+            if let Some(target) = target {
+                self.send_cancel(&target.addr, target.process_id, target.secret_key)
+                    .await;
+            }
+            // The server sends no response to a cancel; satisfy one-response-per-request with a dummy.
+            let mut dummy = Message::from_frame(Frame::Dummy);
+            dummy.set_request_id(request.id());
+            responses.push(dummy);
+        }
+        chain_state.requests.clear();
+        chain_state.close_client_connection = true;
+        Ok(responses)
+    }
+
+    async fn send_cancel(&self, addr: &str, process_id: i32, secret_key: Bytes) {
+        let mut bytes = BytesMut::new();
+        let message = FrontendMessage::CancelRequest {
+            process_id,
+            secret_key,
+        };
+        if message.encode(&mut bytes).is_err() {
+            return;
+        }
+        if let Err(err) = self.send_cancel_bytes(addr, &bytes).await {
+            tracing::warn!("postgres cluster: failed to relay CancelRequest to {addr}: {err}");
+        }
+    }
+
+    async fn send_cancel_bytes(&self, addr: &str, bytes: &[u8]) -> Result<()> {
+        // No TLS on the cancel connection: postgres accepts a cancel on a plaintext connection even to
+        // a TLS server, and it carries no secret beyond the already-issued cancel key.
+        let mut stream =
+            tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr)).await??;
+        stream.write_all(bytes).await?;
+        stream.flush().await?;
+        stream.shutdown().await.ok();
+        Ok(())
+    }
+}
+
+/// True if any request in the batch is a CancelRequest (which arrives alone on its own connection).
+fn requests_contain_cancel(requests: &mut [Message]) -> bool {
+    requests.iter_mut().any(|r| {
+        matches!(
+            r.frame(),
+            Some(Frame::Postgres(PostgresFrame::Request(
+                FrontendMessage::CancelRequest { .. }
+            )))
+        )
+    })
+}
+
+impl Drop for PostgresSinkCluster {
+    fn drop(&mut self) {
+        // Remove this session's cancel registry entry so keys do not leak as sessions come and go.
+        if let Some(key) = self.client_cancel_key.take()
+            && let Ok(mut reg) = self.cancel_registry.lock()
+        {
+            reg.remove(&key);
+        }
     }
 }
 
@@ -992,12 +1148,14 @@ fn backend_read_timeout_response(request_id: Option<MessageId>) -> Message {
     response
 }
 
+/// Originates a backend startup/auth and returns the backend's BackendKeyData (process_id + secret),
+/// if the backend sent one, so a later CancelRequest can be re-issued to this backend.
 async fn authenticate_backend(
     connection: &mut SinkConnection,
     user: &str,
     database: &str,
     password: &str,
-) -> Result<()> {
+) -> Result<Option<(i32, Bytes)>> {
     let startup = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
         FrontendMessage::Startup {
             protocol_version: PROTOCOL_VERSION_3_0,
@@ -1009,6 +1167,7 @@ async fn authenticate_backend(
     )));
     connection.send(vec![startup])?;
 
+    let mut key = None;
     loop {
         let mut responses = vec![];
         connection.recv_into(&mut responses).await?;
@@ -1018,6 +1177,12 @@ async fn authenticate_backend(
             };
             for message in messages.iter() {
                 match message {
+                    BackendMessage::BackendKeyData {
+                        process_id,
+                        secret_key,
+                    } => {
+                        key = Some((*process_id, secret_key.clone()));
+                    }
                     BackendMessage::Authentication(AuthenticationMessage::Ok) => {}
                     BackendMessage::Authentication(AuthenticationMessage::CleartextPassword) => {
                         let mut body = BytesMut::new();
@@ -1043,7 +1208,7 @@ async fn authenticate_backend(
                             message.error_message().unwrap_or("unknown error")
                         );
                     }
-                    BackendMessage::ReadyForQuery { .. } => return Ok(()),
+                    BackendMessage::ReadyForQuery { .. } => return Ok(key),
                     _ => {}
                 }
             }
