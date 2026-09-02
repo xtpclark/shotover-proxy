@@ -41,8 +41,12 @@ impl TransformConfig for DebugPrinterConfig {
         vec![]
     }
 
+    /// `false` deliberately: DebugPrinter renders every response with `to_high_level_string()`,
+    /// which parses it, and a parsed frame is then retained alongside the raw bytes. That is the
+    /// exact cost streaming exists to avoid, so printing a chunked chain is refused rather than
+    /// silently expensive — debug such a chain with `stream_threshold_bytes: 0`.
     fn accepts_partial_responses(&self) -> bool {
-        true
+        false
     }
 }
 

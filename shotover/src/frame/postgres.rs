@@ -1368,6 +1368,15 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
                 replica_safe = false;
                 pins_session = true;
             }
+            // DISCARD ALL/PLANS/TEMP resets search_path and the rendering GUCs, so a later read on
+            // this connection renders differently from one on a connection that never discarded.
+            // It reaches the cache only as ParameterStatus messages inside the response train, and
+            // a train large enough to be chunked can hide them in a partial the cache skips, so
+            // pinning the session here is what keeps the cache key honest either way.
+            NodeEnum::DiscardStmt(_) => {
+                replica_safe = false;
+                pins_session = true;
+            }
             NodeEnum::PrepareStmt(_)
             | NodeEnum::DeclareCursorStmt(_)
             | NodeEnum::ListenStmt(_)
@@ -1648,6 +1657,12 @@ mod tests {
             "LISTEN channel",
             "DECLARE c CURSOR FOR SELECT * FROM t",
             "CREATE TEMP TABLE tmp (a int)",
+            // DISCARD resets search_path and the rendering GUCs. The server announces that only as
+            // ParameterStatus inside the response train, which a chunked train can hide from the
+            // cache, so the pin is what keeps a later read from being keyed under the old GUCs.
+            "DISCARD ALL",
+            "DISCARD PLANS",
+            "DISCARD TEMP",
         ] {
             let a = analyze_sql(sql);
             assert!(a.pins_session, "expected session pin: {sql}");
