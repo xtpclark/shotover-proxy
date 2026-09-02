@@ -482,7 +482,9 @@ connections in this release; md5/SCRAM origination is a follow-up.
     connect_timeout_ms: 3000
     # Optional idle read timeout (ms): the longest to wait for the NEXT chunk of a backend
     # response before abandoning a stalled backend (returns a clean error + closes). It resets on
-    # every chunk, so a large legitimately-streaming result is never cut off. Unset = wait forever.
+    # every chunk, so a large streaming result is never cut off — but ANY statement silent for this
+    # long trips it (a long-running query still computing, or small rows still inside PostgreSQL's
+    # ~8KB send buffer), so set it above your longest SILENT execution time. Unset = wait forever.
     #read_timeout_ms: 30000
     # Optional: replica addresses to PREFER for reads (a subset of first_contact_points). A read
     # prefers a healthy preferred replica, then any healthy replica, then the primary.
@@ -512,10 +514,12 @@ Behaviour and limitations of this release:
   primary. A window with no reachable primary returns `FATAL 08006 no postgres primary is currently
   available … please retry`.
 - **Split-brain fencing is best-effort.** If more than one host reports itself writable (an un-fenced
-  old primary that came back), the currently-cached primary is kept if it is still writable, else the
-  host the replicas actually stream from (`pg_stat_wal_receiver`) is preferred; only if neither
-  resolves does contact-point ORDER decide, logged at ERROR. On a cold start into a split brain with
-  no streaming replicas, list order is all there is — **list the intended primary first**.
+  old primary that came back), the currently-cached primary is kept if it is still REACHABLE — even if
+  it only rejected the probe (an auth/hba/too-many-connections answer still proves it is up, which is
+  what protects a rotated-probe-password primary) — else the host the replicas actually stream from
+  (`pg_stat_wal_receiver`) is preferred; only if neither resolves does contact-point ORDER decide,
+  logged at ERROR. On a cold start into a split brain with no streaming replicas, list order is all
+  there is — **list the intended primary first**.
 - **Session pinning is permanent.** Once a session issues session state it pins to the primary and
   never returns to read-splitting, so a long-lived pooled connection that prepares a named
   statement early stops offloading reads for the rest of its life.
@@ -622,8 +626,10 @@ This transform will send/receive postgres messages to a single postgres instance
 
     # Optional idle read timeout (ms): the longest to wait for the NEXT chunk of a backend response
     # before abandoning a stalled backend (returns a clean error to the client and closes). It resets
-    # whenever data arrives, so a large legitimately-streaming result is never cut off — only a backend
-    # that produces nothing for the whole timeout trips it. Unset (the default) waits forever.
+    # whenever data arrives, so a large streaming result is never cut off. But ANY statement that sends
+    # no bytes for this long is cut off — including a long-running query still computing, and small
+    # rows still held inside PostgreSQL's ~8KB send buffer — so set it above your longest SILENT
+    # execution time, not just above your network stalls. Unset (the default) waits forever.
     #read_timeout_ms: 30000
 
     # When this field is provided TLS is used when connecting to the remote address.
@@ -674,10 +680,14 @@ Metrics: `shotover_postgres_read_cache_hits_count` and `shotover_postgres_read_c
     ttl_ms: 5000
     # Maximum number of cached entries (optional, default 1024).
     #max_entries: 1024
-    # Maximum total cached bytes, estimated from response payloads (optional, default 64 MiB). A
+    # Maximum total cached bytes, estimated from response payloads (optional, default 16 MiB). A
     # result larger than this, or one that would exceed the total, is not cached.
-    #max_bytes: 67108864
+    #max_bytes: 16777216
 ```
+
+When either bound is reached the cache does NOT evict LRU: it drops expired entries, and if it is still
+full it simply skips caching the new result (existing entries stay until their TTL). So a warm cache at
+its limit stops admitting new entries until TTLs expire — expected, not a bug.
 
 ### QueryCounter
 
@@ -893,6 +903,11 @@ mid-pipeline would desync the session, and startup/auth must never be throttled 
 through untouched, and only a simple `Query` can be throttled. A throttled request is answered with a
 `53400 configuration_limit_exceeded` error whose `ReadyForQuery` mirrors the session's real transaction
 state, so a rejection inside a transaction does not falsely report the session idle.
+
+One simple `Query` MESSAGE counts as one request regardless of how many statements it contains — unlike
+the Cassandra `BATCH` rule above, `"select 1; select 2; select 3"` in one message is one cell. A client
+can therefore pack many statements into one message and pay a single cell; per-statement counting for
+postgres is a follow-up.
 
 ```yaml
 - RequestThrottling

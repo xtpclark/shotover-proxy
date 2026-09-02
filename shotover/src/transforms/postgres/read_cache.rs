@@ -96,7 +96,9 @@ fn default_max_entries() -> usize {
 }
 
 fn default_max_bytes() -> usize {
-    64 * 1024 * 1024
+    // Deliberately modest: the proxy already buffers each whole response train in memory (~several
+    // times its wire size), so a large cache budget on top compounds that. 16 MiB is a sane start.
+    16 * 1024 * 1024
 }
 
 const NAME: &str = "PostgresReadCache";
