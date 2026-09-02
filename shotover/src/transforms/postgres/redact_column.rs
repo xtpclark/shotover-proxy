@@ -288,14 +288,7 @@ impl PostgresRedactColumn {
     /// end ('I') the non-holdable portals Postgres itself drops are reclaimed, bounding per-connection
     /// state (a WITH HOLD cursor then fails closed on its next fetch — safe).
     fn observe_transaction_state(&mut self, response: &mut Message) {
-        let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() else {
-            return;
-        };
-        let latest_status = messages.iter().rev().find_map(|m| match m {
-            BackendMessage::ReadyForQuery { status } => Some(*status),
-            _ => None,
-        });
-        if let Some(status) = latest_status {
+        if let Some(status) = crate::codec::postgres::trailing_ready_status(response) {
             self.in_transaction = status != b'I';
             if status == b'I' {
                 self.portal_statements.clear();

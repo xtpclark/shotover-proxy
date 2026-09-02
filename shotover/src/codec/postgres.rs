@@ -174,8 +174,13 @@ pub async fn sink_tls_prologue(stream: &mut TcpStream) -> Result<()> {
 /// silently mis-report a transaction as idle.
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum TrailingReadyStatus {
-    /// Not recorded: the message was not produced by the sink decoder (a transform built it from a
-    /// frame), or its frame has been modified since. The answer must be parsed out.
+    /// Not recorded, so the answer has to be parsed out. Three ways to get here: a transform built
+    /// the message from a frame, its frame has been modified since decoding, or it is a PARTIAL
+    /// chunk — which is deliberately left unrecorded because a ReadyForQuery always completes a
+    /// train and so is never inside one.
+    ///
+    /// The first two are cheap to parse; the third is not, and is the reason
+    /// [`trailing_ready_status`] must not be called on a partial. See its doc.
     Unknown,
     /// The decoder read every message and none of them was a ReadyForQuery.
     Absent,
@@ -754,10 +759,21 @@ pub fn is_partial_response(message: &Message) -> bool {
 /// that `Message::frame` then retains alongside the raw bytes — to learn one byte. Non-postgres
 /// messages and dummies answer `None` without being touched.
 ///
-/// The fallback parse is not the cost this avoids: a message with no record either was built from
-/// a frame by a transform (so it is already parsed, and reading the status off it is free) or has
-/// been modified since decoding (same), and both are small — a synthesised error, a backpressure
-/// reply. A large decoded train always carries its record.
+/// # Do not call this on a partial chunk
+///
+/// A partial is recorded [`TrailingReadyStatus::Unknown`] — a ReadyForQuery completes a train, so
+/// one is never inside a chunk — which means asking would fall back to PARSING a chunk that may be
+/// as large as `stream_threshold_bytes`. Guard with [`is_partial_response`] first, as the three
+/// call sites do. Everything else that lands in the fallback is small: a message a transform built
+/// from a frame is already parsed, so reading the status off it is free, and one modified since
+/// decoding is the same. A large decoded train always carries its record.
+///
+/// # It does not remove every parse from every caller
+///
+/// It removes the parse this question used to require. A caller that parses the same response for
+/// another reason still pays for that: `PostgresReadCache` scans for ParameterStatus via
+/// `capture_rendering_gucs` before asking, so in a chain containing the cache the train is parsed
+/// regardless and only `RequestThrottling` and `PostgresSinkCluster` realise the saving.
 pub fn trailing_ready_status(response: &mut Message) -> Option<u8> {
     if let CodecState::Postgres(state) = response.codec_state {
         match state.trailing_ready_status {
