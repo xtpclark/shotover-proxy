@@ -96,7 +96,10 @@ the replica.
 ## Things pgbouncer does NOT fix
 
 - **Whole-train buffering.** Shotover assembles each response in memory (roughly several times its wire
-  size, retained by the allocator). Large results cost the same with or without a pooler.
+  size, retained by the allocator). Large results cost the same with or without a pooler. Under glibc the
+  freed memory is not returned to the OS, so a proxy that served one large result retains ~1 GB for its
+  lifetime; building with `--features jemalloc` (a background purge thread, configured in the binary)
+  drops the retained footprint back to near-idle after the result, though it does not lower the peak.
 - **Extended-protocol per-message cost.** Un-prepared extended-protocol queries are markedly slower than
   simple queries; prepared mode recovers most of it. A pooler adds its own cost on top.
 - **Read-your-writes across the split.** A read after a write may hit a lagging replica; wrap it in a
