@@ -10,7 +10,13 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // Bake the tuning into the binary so operators do not need the `_RJEM_MALLOC_CONF` env var:
 // enable the background purge thread and a short decay. tikv-jemallocator namespaces jemalloc's
-// symbols with `_rjem_`, so the config symbol jemalloc reads at startup is `_rjem_malloc_conf`.
+// symbols with `_rjem_`, so the config symbol jemalloc reads at startup is `_rjem_malloc_conf`
+// (the plain `malloc_conf` symbol would compile but be ignored by the prefixed jemalloc).
+//
+// The layout reliance is intentional: a `&[u8]` static is a fat pointer (data pointer, len), and
+// jemalloc declares `malloc_conf` as `const char*` and reads only the first pointer-sized word — the
+// data pointer — so the NUL-terminated bytes are read as a C string. This is the jemallocator crate's
+// documented idiom (its README uses `Option<&'static [u8]>` under `export_name`).
 #[cfg(feature = "jemalloc")]
 #[allow(non_upper_case_globals)]
 #[unsafe(no_mangle)]
