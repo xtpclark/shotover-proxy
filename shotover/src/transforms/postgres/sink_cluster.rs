@@ -260,6 +260,7 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             topology: self.topology.clone(),
             probe_lock: self.probe_lock.clone(),
             primary_generation: 0,
+            connected_primary: None,
             round_robin: self.round_robin.clone(),
             replica_health: self.replica_health.clone(),
             reads_to_replica: self.reads_to_replica.clone(),
@@ -273,6 +274,7 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             primary: None,
             replica: None,
             replica_addr: None,
+            replica_auth_failed: false,
             startup_complete: false,
             client_user: None,
             client_database: None,
@@ -321,6 +323,11 @@ pub struct PostgresSinkCluster {
     /// invalidates the topology this session actually connected to — never one another session has
     /// since re-probed (review F4; keyed to CONNECT, not reads, so a fresh topology is not cleared).
     primary_generation: u64,
+    /// The address the current `primary` connection was opened to. A session is evicted as stale ONLY
+    /// when the topology's primary address CHANGES — a re-probe that lands on the same primary must
+    /// leave healthy links alone (review F6 re-verify: keying eviction on generation mass-disconnected
+    /// every session after any re-probe, even one that kept the same primary).
+    connected_primary: Option<String>,
     /// pgbouncer-style userlist for replica origination (client username -> cleartext password).
     replica_users: Arc<HashMap<String, String>>,
     round_robin: Arc<AtomicUsize>,
@@ -334,6 +341,10 @@ pub struct PostgresSinkCluster {
     /// Proxy-originated connection to one replica.
     replica: Option<SinkConnection>,
     replica_addr: Option<String>,
+    /// Latched once this session's user fails to authenticate to a replica (a per-user credential
+    /// problem). While set, this session routes reads to the primary and never retries the replica —
+    /// so one bad `replica_users` entry costs only that user, never cools the shared host (review F6).
+    replica_auth_failed: bool,
 
     /// True once the client has finished authenticating against the primary.
     startup_complete: bool,
@@ -388,14 +399,19 @@ impl Transform for PostgresSinkCluster {
         if requests_contain_cancel(&mut chain_state.requests) {
             return self.handle_cancel(chain_state).await;
         }
-        // If a failover re-probed the topology since this session opened its primary link, that link is
-        // to a since-replaced (likely dead) primary. Surface a clean error and close so the client
-        // reconnects onto the current primary with a fresh session, instead of writing to a dead node
-        // or silently losing session state (review F4/F5 re-verify).
+        // If a failover changed the primary to a DIFFERENT host since this session opened its link,
+        // that link is to a since-replaced node. Surface a clean error and close so the client
+        // reconnects onto the current primary. Keyed on the primary ADDRESS, not the generation: a
+        // re-probe that lands on the SAME primary (e.g. after a single pg_terminate_backend) leaves
+        // healthy links untouched (review F6 re-verify — generation-keying mass-disconnected sessions).
         if self.startup_complete && self.primary.is_some() {
-            let current_generation = { self.topology.lock().await.generation };
-            if self.primary_generation != current_generation {
+            let current_primary =
+                { self.topology.lock().await.topology.as_ref().map(|t| t.primary.clone()) };
+            if let Some(current_primary) = current_primary
+                && self.connected_primary.as_deref() != Some(current_primary.as_str())
+            {
                 self.primary = None;
+                self.connected_primary = None;
                 self.outstanding_primary = 0;
                 self.unit_target = None;
                 chain_state.close_client_connection = true;
@@ -558,9 +574,12 @@ impl PostgresSinkCluster {
                         self.primary = None;
                         self.outstanding_primary = 0;
                         self.unit_target = None;
-                        if !is_timeout {
-                            // A broken primary link (crash/failover): discard the cached topology so the
-                            // NEXT connection re-probes and finds a promoted replica.
+                        // A closed socket does not by itself mean the primary is dead (a single
+                        // pg_terminate_backend, an idle-txn timeout, or one crashed backend). Only
+                        // invalidate when the cached primary really is gone or demoted, so a single
+                        // terminated backend does not re-probe and evict every other session (review F6
+                        // re-verify).
+                        if !is_timeout && !self.cached_primary_is_still_primary().await {
                             self.invalidate_topology().await;
                         }
                         return Err(err);
@@ -652,7 +671,9 @@ impl PostgresSinkCluster {
                 // topology so the next connection re-probes for a new primary (review F4).
                 self.primary = None;
                 self.outstanding_primary = 0;
-                if err.downcast_ref::<super::BackendReadTimeout>().is_none() {
+                if err.downcast_ref::<super::BackendReadTimeout>().is_none()
+                    && !self.cached_primary_is_still_primary().await
+                {
                     self.invalidate_topology().await;
                 }
                 return map_startup_error(err, chain_state);
@@ -685,7 +706,7 @@ impl PostgresSinkCluster {
     }
 
     fn replica_available(&self) -> bool {
-        self.replica.is_some() || self.replica_addr.is_some()
+        !self.replica_auth_failed && (self.replica.is_some() || self.replica_addr.is_some())
     }
 
     /// Ensures a topology is known, probing if not. The probe is SINGLE-FLIGHT (a burst of connections
@@ -786,32 +807,41 @@ impl PostgresSinkCluster {
     async fn probe_topology(&self, last_primary: Option<&str>) -> Result<Topology> {
         let mut primaries = vec![];
         let mut replicas = vec![];
-        // If a contact point rejects the probe because it requires md5/SCRAM (which the cluster sink
-        // cannot originate), keep that specific error so a "no primary" outcome surfaces it to the
-        // client instead of a bare "no primary found" / generic internal error.
-        let mut auth_unsupported = None;
+        // Hosts that are ALIVE but rejected the probe (auth rotated, hba, starting up, too many conns,
+        // md5/SCRAM). A last-known primary that lands here must NOT be demoted (review F6 re-verify #2).
+        let mut rejected_alive = vec![];
+        // If a contact point requires md5/SCRAM (which the cluster sink cannot originate), keep that so
+        // a "no primary" outcome surfaces it to the client instead of a bare "no primary found".
+        let mut auth_unsupported = false;
         for host in &self.contact_points {
             match self.probe_host(host).await {
-                Ok(true) => replicas.push(host.clone()),
-                Ok(false) => primaries.push(host.clone()),
-                Err(err) => {
-                    if err.downcast_ref::<BackendAuthUnsupported>().is_some() {
-                        auth_unsupported.get_or_insert(err);
-                    } else {
-                        tracing::warn!("postgres cluster: probe of {host} failed: {err}");
-                    }
+                HostProbe::Replica => replicas.push(host.clone()),
+                HostProbe::Primary => primaries.push(host.clone()),
+                HostProbe::ReachableButRejected {
+                    message,
+                    auth_unsupported: unsupported,
+                } => {
+                    tracing::warn!(
+                        "postgres cluster: probe of {host} rejected but host is alive: {message}"
+                    );
+                    auth_unsupported |= unsupported;
+                    rejected_alive.push(host.clone());
+                }
+                HostProbe::Unreachable(err) => {
+                    tracing::warn!("postgres cluster: probe of {host} failed: {err}");
                 }
             }
         }
-        match self.choose_primary(&primaries, &replicas, last_primary).await {
+        match self
+            .choose_primary(&primaries, &replicas, &rejected_alive, last_primary)
+            .await
+        {
             Some(primary) => Ok(Topology { primary, replicas }),
-            None => match auth_unsupported {
-                Some(err) => Err(err),
-                None => bail!(
-                    "postgres cluster: no primary found among {:?}",
-                    self.contact_points
-                ),
-            },
+            None if auth_unsupported => Err(BackendAuthUnsupported.into()),
+            None => bail!(
+                "postgres cluster: no primary found among {:?}",
+                self.contact_points
+            ),
         }
     }
 
@@ -824,20 +854,33 @@ impl PostgresSinkCluster {
         &self,
         primaries: &[String],
         replicas: &[String],
+        rejected_alive: &[String],
         last_primary: Option<&str>,
     ) -> Option<String> {
-        if primaries.len() > 1 {
-            tracing::error!(
-                "postgres cluster: MORE THAN ONE host reports itself a primary ({primaries:?}) — \
-                 possible un-fenced old primary / split brain; fencing by last-known primary then \
-                 replication source"
-            );
-        }
-        match pick_primary_by_known(primaries, last_primary) {
+        match pick_primary_by_known(primaries, rejected_alive, last_primary) {
             PrimaryChoice::None => None,
-            PrimaryChoice::Chosen(primary) => Some(primary),
+            PrimaryChoice::Chosen(primary) => {
+                if primaries.len() > 1 {
+                    tracing::error!(
+                        "postgres cluster: MORE THAN ONE host reports itself a primary ({primaries:?}) \
+                         — possible un-fenced old primary / split brain; keeping {primary}"
+                    );
+                } else if !primaries.iter().any(|p| p == &primary) {
+                    // We kept a last-known primary that only rejected the probe: it is alive, so do not
+                    // let another writable host be promoted by elimination.
+                    tracing::error!(
+                        "postgres cluster: keeping last-known primary {primary} whose probe was \
+                         rejected (alive but not probeable); NOT promoting another writable host"
+                    );
+                }
+                Some(primary)
+            }
             // Multiple primaries and the last-known one is gone: ask the replicas who they stream from.
             PrimaryChoice::Ambiguous => {
+                tracing::error!(
+                    "postgres cluster: MORE THAN ONE host reports itself a primary ({primaries:?}); \
+                     resolving by replication source"
+                );
                 if let Some(sender) = self.replication_source(replicas).await
                     && let Some(primary) = primaries.iter().find(|p| host_matches(p, &sender))
                 {
@@ -874,18 +917,65 @@ impl PostgresSinkCluster {
         None
     }
 
-    async fn probe_host(&self, host: &str) -> Result<bool> {
-        let mut connection = self.new_backend_connection(host).await?;
+    /// Bounded liveness check on the cached primary: true only if it is reachable AND still reports
+    /// itself the primary. Used before invalidating on a transport error so a single closed backend
+    /// socket does not trigger a full re-probe and evict every other session (review F6 re-verify).
+    async fn cached_primary_is_still_primary(&self) -> bool {
+        let primary_addr = {
+            let state = self.topology.lock().await;
+            state.topology.as_ref().map(|t| t.primary.clone())
+        };
+        let Some(addr) = primary_addr else {
+            return false;
+        };
+        match self.probe_host(&addr).await {
+            // Reachable and still the primary.
+            HostProbe::Primary => true,
+            // Reachable but the probe was rejected (rotated probe password, hba, starting up, too many
+            // connections): the host is ALIVE — keep the topology and fail only this session, rather
+            // than demoting a live primary (review F6 re-verify #2).
+            HostProbe::ReachableButRejected { message, .. } => {
+                tracing::warn!(
+                    "postgres cluster: cached primary {addr} reachable but probe rejected ({message}); \
+                     keeping topology"
+                );
+                true
+            }
+            // Demoted to a replica or genuinely unreachable: a real failover — invalidate.
+            HostProbe::Replica | HostProbe::Unreachable(_) => false,
+        }
+    }
+
+    async fn probe_host(&self, host: &str) -> HostProbe {
+        let mut connection = match self.new_backend_connection(host).await {
+            Ok(connection) => connection,
+            // A connect failure (refused/timeout/reset) means the host is unreachable.
+            Err(err) => return HostProbe::Unreachable(err.to_string()),
+        };
         let database = self.probe_database.clone();
         // Bound the whole authenticate + probe exchange: a host that accepts the connection but
         // never replies must not hang topology discovery.
-        tokio::time::timeout(BACKEND_OP_TIMEOUT, async {
-            authenticate_backend(&mut connection, &self.username, &database, &self.password)
-                .await?;
+        let result = tokio::time::timeout(BACKEND_OP_TIMEOUT, async {
+            authenticate_backend(&mut connection, &self.username, &database, &self.password).await?;
             query_scalar_bool(&mut connection, "SELECT pg_is_in_recovery()").await
         })
-        .await
-        .map_err(|_| anyhow!("timed out probing {host}"))?
+        .await;
+        match result {
+            Err(_elapsed) => HostProbe::Unreachable(format!("timed out probing {host}")),
+            Ok(Ok(true)) => HostProbe::Replica,
+            Ok(Ok(false)) => HostProbe::Primary,
+            // A transport failure mid-probe (reset/EOF) is unreachable...
+            Ok(Err(err)) if err.downcast_ref::<crate::connection::ConnectionError>().is_some() => {
+                HostProbe::Unreachable(err.to_string())
+            }
+            // ...but the host ANSWERING with an error (rotated probe password, hba, 'database is
+            // starting up', too many connections, md5/SCRAM) means it is ALIVE, just not probeable.
+            // Never treat this as gone (review F6 re-verify #2).
+            Ok(Err(err)) => HostProbe::ReachableButRejected {
+                auth_unsupported: err.downcast_ref::<BackendAuthUnsupported>().is_some(),
+                message: err.to_string(),
+            },
+        }
     }
 
     async fn ensure_primary(&mut self) -> Result<()> {
@@ -929,6 +1019,7 @@ impl PostgresSinkCluster {
             addr
         };
         self.primary = Some(self.new_backend_connection(&primary_addr).await?);
+        self.connected_primary = Some(primary_addr);
         Ok(())
     }
 
@@ -997,11 +1088,22 @@ impl PostgresSinkCluster {
                 Ok(())
             }
             Err(err) => {
-                // This replica is unreachable. Cool it down so subsequent reads skip it (no per-read
-                // connect penalty) and clear our choice so the next read reselects a healthy one; the
-                // error surfaces to route(), which falls back to the primary for this read.
-                self.mark_replica_unhealthy(&addr).await;
                 self.replica_addr = None;
+                if err.downcast_ref::<BackendAuthRejected>().is_some() {
+                    // Classify before reacting (review F6): a rejected auth is a PER-USER credential
+                    // problem (a bad/missing replica_users entry), NOT an unreachable host. Cooling the
+                    // host would push every OTHER user off it too. Instead, latch this session onto the
+                    // primary (it never retries the replica) and warn once; the host stays healthy.
+                    tracing::warn!(
+                        "postgres cluster: replica auth failed for user {user} on {addr} ({err}); \
+                         routing this session's reads to the primary"
+                    );
+                    self.replica_auth_failed = true;
+                } else {
+                    // A connect/timeout failure: the HOST is unreachable — cool it down so subsequent
+                    // reads (from any user) skip it without paying the per-read connect penalty.
+                    self.mark_replica_unhealthy(&addr).await;
+                }
                 Err(err)
             }
         }
@@ -1244,6 +1346,21 @@ impl std::fmt::Display for BackendAuthUnsupported {
 
 impl std::error::Error for BackendAuthUnsupported {}
 
+/// A backend returned an ErrorResponse during authentication (e.g. "password authentication failed").
+/// Typed so a REPLICA auth failure is understood as a PER-USER credential problem (a bad/missing
+/// `replica_users` entry) rather than an unreachable host — the host must not be cooled down for it
+/// (review F6). Carries the server's message for the log.
+#[derive(Debug)]
+struct BackendAuthRejected(String);
+
+impl std::fmt::Display for BackendAuthRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backend authentication rejected: {}", self.0)
+    }
+}
+
+impl std::error::Error for BackendAuthRejected {}
+
 /// Turns a startup-time backend failure into what the client should see. An unsupported-auth failure
 /// (a md5/SCRAM backend the cluster sink cannot originate against) becomes a clean FATAL ErrorResponse
 /// that names the fix, and closes the connection — instead of the generic "internal shotover bug"
@@ -1373,10 +1490,10 @@ async fn authenticate_backend(
                         return Err(BackendAuthUnsupported.into());
                     }
                     BackendMessage::ErrorResponse { .. } => {
-                        bail!(
-                            "PostgresSinkCluster backend authentication failed: {}",
-                            message.error_message().unwrap_or("unknown error")
-                        );
+                        return Err(BackendAuthRejected(
+                            message.error_message().unwrap_or("unknown error").to_owned(),
+                        )
+                        .into());
                     }
                     BackendMessage::ReadyForQuery { .. } => return Ok(key),
                     _ => {}
@@ -1384,6 +1501,23 @@ async fn authenticate_backend(
             }
         }
     }
+}
+
+/// The outcome of probing one contact point, classifying reachability so a host that ANSWERS the probe
+/// with an error is never mistaken for a dead one (review F6 re-verify #2).
+enum HostProbe {
+    /// Reachable and not in recovery.
+    Primary,
+    /// Reachable and in recovery.
+    Replica,
+    /// Reachable, but the probe itself was rejected (rotated probe password, hba, 'database is starting
+    /// up', too many connections, md5/SCRAM). The host is alive.
+    ReachableButRejected {
+        message: String,
+        auth_unsupported: bool,
+    },
+    /// A transport failure: connect refused/timeout/reset/EOF. Unreachable.
+    Unreachable(String),
 }
 
 /// The primary decision that can be made from host roles alone, before any replication-source probe.
@@ -1398,17 +1532,25 @@ enum PrimaryChoice {
     Ambiguous,
 }
 
-/// The fencing decision that needs no I/O (review F5): one primary is taken as-is; among several, the
-/// last-known primary is KEPT if it is still one (never flip writes to a returning stale node by
-/// contact-point order); otherwise the caller must consult the replication source.
-fn pick_primary_by_known(primaries: &[String], last_primary: Option<&str>) -> PrimaryChoice {
+/// The fencing decision that needs no I/O (review F5, F6 re-verify #2): a last-known primary that is
+/// either confirmed primary OR alive-but-probe-rejected is KEPT (never demoted by contact-point order,
+/// and never let another writable host win by elimination while the real primary is merely
+/// unprobeable); otherwise one primary is taken as-is and several are Ambiguous (caller consults the
+/// replication source).
+fn pick_primary_by_known(
+    primaries: &[String],
+    rejected_alive: &[String],
+    last_primary: Option<&str>,
+) -> PrimaryChoice {
+    if let Some(last) = last_primary
+        && (primaries.iter().any(|p| p == last) || rejected_alive.iter().any(|p| p == last))
+    {
+        return PrimaryChoice::Chosen(last.to_owned());
+    }
     match primaries.len() {
         0 => PrimaryChoice::None,
         1 => PrimaryChoice::Chosen(primaries[0].clone()),
-        _ => match last_primary {
-            Some(last) if primaries.iter().any(|p| p == last) => PrimaryChoice::Chosen(last.to_owned()),
-            _ => PrimaryChoice::Ambiguous,
-        },
+        _ => PrimaryChoice::Ambiguous,
     }
 }
 
@@ -1506,30 +1648,37 @@ mod tests {
     #[test]
     fn fences_primary_selection() {
         let s = |x: &str| x.to_owned();
+        let none: &[String] = &[];
         // No writable host.
         assert!(matches!(
-            pick_primary_by_known(&[], None),
+            pick_primary_by_known(&[], none, None),
             PrimaryChoice::None
         ));
         // A single primary is taken as-is.
         assert!(matches!(
-            pick_primary_by_known(&[s("a:5432")], None),
+            pick_primary_by_known(&[s("a:5432")], none, None),
             PrimaryChoice::Chosen(p) if p == "a:5432"
         ));
         // Two primaries (split brain), last-known among them: KEEP it, regardless of list order —
         // this is the fence that stops writes flipping to a returning stale node.
         assert!(matches!(
-            pick_primary_by_known(&[s("a:5432"), s("b:5432")], Some("b:5432")),
+            pick_primary_by_known(&[s("a:5432"), s("b:5432")], none, Some("b:5432")),
+            PrimaryChoice::Chosen(p) if p == "b:5432"
+        ));
+        // The last-known primary only REJECTED the probe (alive but not probeable) while another host
+        // is writable: KEEP the last-known one, never promote the other by elimination (F6 re-verify #2).
+        assert!(matches!(
+            pick_primary_by_known(&[s("a:5432")], &[s("b:5432")], Some("b:5432")),
             PrimaryChoice::Chosen(p) if p == "b:5432"
         ));
         // Two primaries, last-known NOT among them (or none): ambiguous -> caller consults the
         // replication source, never contact-point order.
         assert!(matches!(
-            pick_primary_by_known(&[s("a:5432"), s("b:5432")], Some("c:5432")),
+            pick_primary_by_known(&[s("a:5432"), s("b:5432")], none, Some("c:5432")),
             PrimaryChoice::Ambiguous
         ));
         assert!(matches!(
-            pick_primary_by_known(&[s("a:5432"), s("b:5432")], None),
+            pick_primary_by_known(&[s("a:5432"), s("b:5432")], none, None),
             PrimaryChoice::Ambiguous
         ));
     }
