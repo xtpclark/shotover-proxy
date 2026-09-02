@@ -12,7 +12,13 @@
 //!     `COMMIT PREPARED` does evict);
 //!   - a **write that bypasses the proxy** (direct-to-backend, replication) is not seen;
 //!   - it does not know server-side per-role defaults postgres never reports (`ALTER ROLE … SET
-//!     search_path`), so it stays OFF for multi-tenant / untrusted use (see below).
+//!     search_path`), so it stays OFF for multi-tenant / untrusted use (see below);
+//!   - **only when the sink streams** (`stream_threshold_bytes` > 0): a function that changes a
+//!     rendering GUC in its own body (`set_config('timezone', …)`), called in a result large enough
+//!     to be chunked, has its `ParameterStatus` skipped along with the chunk carrying it — so a
+//!     later read on that connection can be keyed under the pre-call GUCs. A top-level `SET` does
+//!     not have this problem (it pins the session and turns the cache off), and at the default
+//!     threshold of 0 the whole train is read and the change is seen.
 //!
 //! ## What it does
 //! For a client's simple `Query` that the grammar analysis proves is a pure, replica-safe read (no
@@ -758,9 +764,12 @@ impl Transform for PostgresReadCache {
             // can never be served from or matched to the cache.
             //
             // The skip means `capture_rendering_gucs` does not see a ParameterStatus carried in a
-            // non-final chunk. That is safe because every statement which changes a rendering GUC
-            // — SET, RESET, set_config(), DISCARD — pins the session, turning the cache off for
-            // this connection before any read can be keyed under the stale value.
+            // non-final chunk. A top-level SET or set_config() pins the session, turning the cache
+            // off before any read can be keyed under the stale value, and startup ParameterStatus
+            // arrives on its own train, which never chunks. What is NOT covered is a function that
+            // changes a rendering GUC inside its body: that makes its own read uncacheable
+            // (`read_calls_impure`) but does not pin the session, so with streaming on a later read
+            // can be keyed under the pre-call GUCs — see the streaming residual in the module doc.
             if is_partial_response(response) {
                 continue;
             }
