@@ -91,14 +91,19 @@ pub(crate) async fn exchange(
         Some(trailing) => {
             while *outstanding > trailing {
                 let before = responses.len();
-                // read_timeout is an IDLE timeout: it bounds the wait for the NEXT chunk of response
-                // data, resetting whenever data arrives, so a large legitimately-streaming result set
-                // is never cut off — only a backend that stalls without producing anything trips it.
+                // read_timeout is a true IDLE timeout: recv_into_or_idle_timeout resets the clock on
+                // every inbound socket chunk (SinkConnection stamps activity BELOW the frame layer, so
+                // a whole response train's progress is visible), meaning a large continuously-streaming
+                // result is never cut off — only a backend that produces nothing for the whole timeout
+                // trips it.
                 match read_timeout {
                     Some(timeout) => {
-                        tokio::time::timeout(timeout, connection.recv_into(&mut responses))
-                            .await
-                            .map_err(|_| BackendReadTimeout)??
+                        if !connection
+                            .recv_into_or_idle_timeout(&mut responses, timeout)
+                            .await?
+                        {
+                            return Err(BackendReadTimeout.into());
+                        }
                     }
                     None => connection.recv_into(&mut responses).await?,
                 }

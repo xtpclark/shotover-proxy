@@ -7,10 +7,12 @@ use crate::tcp;
 use crate::tls::{TlsConnector, ToHostname};
 use futures::{SinkExt, StreamExt};
 use std::io::ErrorKind;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, split};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, split};
 use tokio::net::ToSocketAddrs;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -25,6 +27,12 @@ pub struct SinkConnection {
     connection_closed_rx: mpsc::Receiver<ConnectionError>,
     error: Option<ConnectionError>,
     dummy_response_inserter: DummyResponseInserter,
+    /// Milliseconds since `activity_base` at which the last inbound socket bytes were observed. The
+    /// read half is wrapped in [`ActivityRead`], which stamps this on every non-empty read — even
+    /// mid-response-train (the decoder only surfaces a whole train, so this is the ONLY place
+    /// intra-train progress is visible). Used by `recv_into_or_idle_timeout` for a true IDLE timeout.
+    last_activity: Arc<AtomicU64>,
+    activity_base: Instant,
 }
 
 impl SinkConnection {
@@ -41,6 +49,10 @@ impl SinkConnection {
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Messages>();
         let (connection_closed_tx, connection_closed_rx) = mpsc::channel(1);
 
+        // Tracks the instant of the last inbound socket bytes for a true idle read timeout.
+        let activity_base = Instant::now();
+        let last_activity = Arc::new(AtomicU64::new(0));
+
         if let Some(tls) = tls.as_ref() {
             // Postgres servers expect an SSLRequest and answer it with a raw 'S' before
             // the TLS handshake may begin, so the handshake runs over a prepared stream.
@@ -55,6 +67,7 @@ impl SinkConnection {
             #[cfg(not(feature = "postgres"))]
             let tls_stream = tls.connect(connect_timeout, host).await?;
             let (rx, tx) = split(tls_stream);
+            let rx = ActivityRead::new(rx, last_activity.clone(), activity_base);
             spawn_read_write_tasks(
                 codec_builder,
                 rx,
@@ -69,6 +82,7 @@ impl SinkConnection {
         } else {
             let tcp_stream = tcp::tcp_stream(connect_timeout, destination).await?;
             let (rx, tx) = tcp_stream.into_split();
+            let rx = ActivityRead::new(rx, last_activity.clone(), activity_base);
             spawn_read_write_tasks(
                 codec_builder,
                 rx,
@@ -90,6 +104,8 @@ impl SinkConnection {
             connection_closed_rx,
             error: None,
             dummy_response_inserter,
+            last_activity,
+            activity_base,
         })
     }
 
@@ -165,6 +181,31 @@ impl SinkConnection {
         }
 
         Ok(())
+    }
+
+    /// Like [`Self::recv_into`], but bounded by an IDLE timeout: returns `Ok(false)` if no inbound
+    /// socket bytes arrive for `idle_timeout` (a stalled backend). A response that streams
+    /// continuously is NEVER cut off, even if it takes far longer than `idle_timeout` in total,
+    /// because every chunk resets the idle clock (see [`ActivityRead`]). `Ok(true)` means responses
+    /// were received.
+    pub async fn recv_into_or_idle_timeout(
+        &mut self,
+        responses: &mut Vec<Message>,
+        idle_timeout: Duration,
+    ) -> Result<bool, ConnectionError> {
+        // Start the idle clock at "now" so a stale timestamp from a previous exchange cannot fire
+        // early before this wait has even begun.
+        self.last_activity.store(
+            self.activity_base.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        let last_activity = self.last_activity.clone();
+        let activity_base = self.activity_base;
+        tokio::select! {
+            biased;
+            result = self.recv_into(responses) => result.map(|()| true),
+            () = idle_watchdog(&last_activity, activity_base, idle_timeout) => Ok(false),
+        }
     }
 
     /// Attempts to receive messages, if there are no messages available it immediately returns an empty vec.
@@ -257,6 +298,59 @@ impl RequestPending {
 
     fn get(&self) -> u64 {
         self.count.load(Ordering::SeqCst)
+    }
+}
+
+/// Resolves once no inbound socket activity has been observed for `idle_timeout`. Re-arms whenever
+/// activity is seen (a streaming response keeps resetting it), so it only fires on a genuine stall.
+async fn idle_watchdog(last_activity: &AtomicU64, activity_base: Instant, idle_timeout: Duration) {
+    loop {
+        let now_ms = activity_base.elapsed().as_millis() as u64;
+        let idle = Duration::from_millis(now_ms.saturating_sub(last_activity.load(Ordering::Relaxed)));
+        if idle >= idle_timeout {
+            return;
+        }
+        tokio::time::sleep(idle_timeout - idle).await;
+    }
+}
+
+/// Wraps a read half and records the instant of every non-empty read into a shared atomic. This is
+/// what makes a per-chunk idle timeout possible: the codec only surfaces a WHOLE response train, so
+/// without observing the socket directly there is no visibility into a large response's progress.
+struct ActivityRead<R> {
+    inner: R,
+    last_activity: Arc<AtomicU64>,
+    activity_base: Instant,
+}
+
+impl<R> ActivityRead<R> {
+    fn new(inner: R, last_activity: Arc<AtomicU64>, activity_base: Instant) -> Self {
+        ActivityRead {
+            inner,
+            last_activity,
+            activity_base,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ActivityRead<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll
+            && buf.filled().len() > before
+        {
+            this.last_activity.store(
+                this.activity_base.elapsed().as_millis() as u64,
+                Ordering::Relaxed,
+            );
+        }
+        poll
     }
 }
 
