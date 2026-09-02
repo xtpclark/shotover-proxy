@@ -128,6 +128,27 @@ pub trait TransformConfig: Debug {
     /// Returns sub-chain configs paired with their derived chain names.
     /// Used for recursive traversal of sub-chains during validation.
     fn get_sub_chain_configs(&self) -> Vec<(&crate::config::chain::TransformChainConfig, String)>;
+
+    /// Whether this transform can emit PARTIAL response trains: one response delivered as several
+    /// messages, of which only the last carries the request id. Today only the postgres sinks do,
+    /// and only when configured with a `stream_threshold_bytes`.
+    ///
+    /// Shotover refuses to start a chain in which anything emits partial responses while some
+    /// transform in it does not [accept](Self::accepts_partial_responses) them.
+    fn emits_partial_responses(&self) -> bool {
+        false
+    }
+
+    /// Whether this transform handles receiving a PARTIAL response train correctly.
+    ///
+    /// `false` is the deliberate default: a transform that has not been reviewed against chunked
+    /// responses refuses to run in a streaming chain rather than silently receive a shape it was
+    /// never written for. Answer `true` only if the transform either ignores response bodies, or
+    /// explicitly skips partials before doing anything that assumes a whole train — which includes
+    /// PARSING one, since parsing a chunk is exactly the cost streaming exists to avoid.
+    fn accepts_partial_responses(&self) -> bool {
+        false
+    }
 }
 
 /// Defines which protocols a transform will:

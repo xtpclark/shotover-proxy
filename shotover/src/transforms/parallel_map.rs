@@ -113,6 +113,10 @@ impl TransformConfig for ParallelMapConfig {
             .map(|i| (&self.chain, format!("{}[{i}]", self.name)))
             .collect()
     }
+
+    fn accepts_partial_responses(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]

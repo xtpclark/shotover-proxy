@@ -82,6 +82,16 @@ impl TransformConfig for PostgresSinkSingleConfig {
     fn get_sub_chain_configs(&self) -> Vec<(&crate::config::chain::TransformChainConfig, String)> {
         vec![]
     }
+
+    /// The codec chunks a large response train whenever a threshold is configured, so this sink
+    /// emits partial responses exactly when streaming is switched on.
+    fn emits_partial_responses(&self) -> bool {
+        self.stream_threshold_bytes > 0
+    }
+
+    fn accepts_partial_responses(&self) -> bool {
+        true
+    }
 }
 
 pub struct PostgresSinkSingleBuilder {

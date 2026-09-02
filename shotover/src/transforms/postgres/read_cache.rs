@@ -89,6 +89,7 @@
 //!   cannot size the proxy's memory (F2). NOTE the proxy already buffers a whole response train in
 //!   memory regardless of the cache (a separate architectural limit), so keep `max_bytes` modest.
 
+use crate::codec::postgres::is_partial_response;
 use crate::frame::postgres::{
     BackendMessage, FrontendMessage, PostgresFrame, SqlAnalysis, TxnControl, analyze_sql,
     is_writing_function,
@@ -284,6 +285,10 @@ impl TransformConfig for PostgresReadCacheConfig {
     fn get_sub_chain_configs(&self) -> Vec<(&crate::config::chain::TransformChainConfig, String)> {
         vec![]
     }
+
+    fn accepts_partial_responses(&self) -> bool {
+        true
+    }
 }
 
 struct CacheEntry {
@@ -398,6 +403,7 @@ impl TransformBuilder for PostgresReadCacheBuilder {
             database: None,
             rendering_gucs: BTreeMap::new(),
             in_transaction: false,
+            saw_partial: false,
             session_stateful: false,
             prepared: BoundedEffects::default(),
             portals: BoundedEffects::default(),
@@ -502,6 +508,17 @@ pub struct PostgresReadCache {
     /// SET) that the client never sent are covered.
     rendering_gucs: BTreeMap<String, String>,
     in_transaction: bool,
+    /// Set when a partial chunk passes on this connection, cleared by the next response that
+    /// carries a request id. It marks the train currently arriving as CHUNKED, which makes it
+    /// uncacheable: only the final chunk carries the id, so caching on that id would store the
+    /// TAIL of the result under the whole query's key and later serve a truncated,
+    /// RowDescription-less row set to another session.
+    ///
+    /// Per connection rather than per response batch because `exchange()`'s no-flush-point path
+    /// can return partials in one batch and the chunk that completes the train in a later one.
+    /// Keying it off SEEING a partial rather than off the response's size is what makes it safe: a
+    /// huge chunked train leaves a small final chunk that sails under any size limit.
+    saw_partial: bool,
     /// Latched true once this connection issues a session-pinning statement; the cache is then off for
     /// this connection (its query results may depend on search_path/role the shared cache cannot know).
     session_stateful: bool,
@@ -748,6 +765,12 @@ impl Transform for PostgresReadCache {
         let mut responses = chain_state.call_next_transform().await?;
 
         for response in responses.iter_mut() {
+            // Forwarded untouched, and deliberately skipped before anything parses it: a partial
+            // carries no request id, so it can never be served from or matched to the cache.
+            if is_partial_response(response) {
+                self.saw_partial = true;
+                continue;
+            }
             self.capture_rendering_gucs(response);
             if let Some(status) = trailing_ready_status(response) {
                 self.in_transaction = status != b'I';
@@ -759,13 +782,18 @@ impl Transform for PostgresReadCache {
                     *response = cached;
                 } else if let Some((key, relations, issued_at)) = cache_on_response.remove(&rid) {
                     // A cache miss just answered by the backend: remember it ONLY if it is a clean,
-                    // self-contained, idle result — no ErrorResponse (F8) and a trailing
-                    // ReadyForQuery('I'), never an in-transaction train ending in 'T' (F7).
-                    if response_is_cacheable(response) {
+                    // self-contained, idle result — no ErrorResponse (F8), a trailing
+                    // ReadyForQuery('I'), never an in-transaction train ending in 'T' (F7), and
+                    // never a train that arrived in chunks, of which this is only the tail.
+                    if !self.saw_partial && response_is_cacheable(response) {
                         let size = estimate_response_size(response);
                         self.cache_put(key, response.clone(), size, relations, issued_at);
                     }
                 }
+                // This response carried an id, so the train any preceding partials belonged to is
+                // now complete. Cleared for EVERY id-carrying response, not only cacheable ones, so
+                // a chunked train that ends in an ErrorResponse cannot strand the flag.
+                self.saw_partial = false;
             }
         }
         Ok(responses)
@@ -1092,12 +1120,136 @@ fn trailing_ready_status(response: &mut Message) -> Option<u8> {
 mod tests {
     use super::{
         BoundedEffects, CacheEntry, CacheStore, Frame, Message, PostgresFrame, PostgresReadCache,
-        Relation, StmtEffect, is_pure_function, looks_volatile, relation_name, response_is_cacheable,
+        Relation, StmtEffect, is_pure_function, looks_volatile, relation_name,
+        response_is_cacheable,
     };
-    use crate::frame::postgres::{BackendMessage, analyze_sql};
+    use crate::codec::CodecState;
+    use crate::codec::postgres::PostgresCodecState;
+    use crate::frame::postgres::{BackendMessage, FieldDescription, analyze_sql};
+    use crate::message::Messages;
+    use crate::transforms::Transform;
     use std::collections::{BTreeMap, HashSet};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    /// A backend that answers each request with a canned row-stream train, optionally split the way
+    /// the sink codec splits one above a stream threshold: leading chunks carrying NO request id,
+    /// and a final chunk that carries the id and the trailing ReadyForQuery.
+    struct CannedBackend {
+        chunked: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Transform for CannedBackend {
+        fn get_name(&self) -> &'static str {
+            "CannedBackend"
+        }
+
+        async fn transform<'shorter, 'longer: 'shorter>(
+            &mut self,
+            chain_state: &'shorter mut crate::transforms::ChainState<'longer>,
+        ) -> anyhow::Result<Messages> {
+            let head = vec![
+                BackendMessage::RowDescription {
+                    fields: vec![FieldDescription {
+                        name: "id".to_owned(),
+                        table_oid: 0,
+                        column_attribute_number: 1,
+                        data_type_oid: 23,
+                        data_type_size: 4,
+                        type_modifier: -1,
+                        format_code: 0,
+                    }],
+                },
+                BackendMessage::DataRow {
+                    values: vec![Some(bytes::Bytes::from_static(b"1"))],
+                },
+            ];
+            let tail = vec![
+                BackendMessage::DataRow {
+                    values: vec![Some(bytes::Bytes::from_static(b"2"))],
+                },
+                BackendMessage::CommandComplete {
+                    tag: "SELECT 2".to_owned(),
+                },
+                BackendMessage::ReadyForQuery { status: b'I' },
+            ];
+
+            let mut responses = vec![];
+            for request in &chain_state.requests {
+                let final_messages = if self.chunked {
+                    responses.push(encode_as(
+                        head.clone(),
+                        PostgresCodecState::partial_response(),
+                    ));
+                    tail.clone()
+                } else {
+                    head.iter().cloned().chain(tail.iter().cloned()).collect()
+                };
+                let mut final_chunk = encode_as(final_messages, PostgresCodecState::response());
+                final_chunk.set_request_id(request.id());
+                responses.push(final_chunk);
+            }
+            Ok(responses)
+        }
+    }
+
+    fn encode_as(messages: Vec<BackendMessage>, state: PostgresCodecState) -> Message {
+        let mut bytes = bytes::BytesMut::new();
+        for message in messages {
+            message.encode(&mut bytes).unwrap();
+        }
+        Message::from_bytes(bytes.freeze(), CodecState::Postgres(state))
+    }
+
+    /// Runs one cacheable read through the cache against a backend that answers whole or chunked,
+    /// and reports how many entries the cache ended up holding.
+    async fn cached_entries_after_read(chunked: bool) -> usize {
+        let mut cache = test_cache(&[]);
+        let mut backend = vec![crate::transforms::TransformAndMetrics::new(
+            Box::new(CannedBackend { chunked }),
+            "backend",
+            "CannedBackend",
+        )];
+
+        let request = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
+            crate::frame::postgres::FrontendMessage::Query {
+                query: "SELECT id FROM t".to_owned(),
+            },
+        )));
+        let mut chain_state = crate::transforms::ChainState::new_test(vec![request]);
+        chain_state.reset(&mut backend, "test");
+
+        let responses = cache.transform(&mut chain_state).await.unwrap();
+        // Whatever the backend produced is forwarded on unchanged, chunk count and all, with the
+        // partial still id-less and still marked partial — the cache neither swallows a chunk nor
+        // re-tags one.
+        assert_eq!(responses.len(), if chunked { 2 } else { 1 });
+        if chunked {
+            assert!(super::is_partial_response(&responses[0]));
+            assert_eq!(responses[0].request_id(), None);
+            assert!(!super::is_partial_response(&responses[1]));
+            assert!(responses[1].request_id().is_some());
+        }
+
+        cache.cache.lock().unwrap().entries.len()
+    }
+
+    /// THE regression: a chunked train must not be cached. Only its final chunk carries the request
+    /// id, and that chunk still ends in ReadyForQuery('I') with no ErrorResponse — so without the
+    /// `saw_partial` guard the cache stores the TAIL of the result under the whole query's key and
+    /// later serves a truncated, RowDescription-less row set to another session.
+    #[tokio::test]
+    async fn does_not_cache_a_train_that_arrived_in_chunks() {
+        assert_eq!(cached_entries_after_read(true).await, 0);
+    }
+
+    /// The same read answered as one whole train still caches, so the guard costs nothing when
+    /// streaming is off.
+    #[tokio::test]
+    async fn still_caches_a_whole_train() {
+        assert_eq!(cached_entries_after_read(false).await, 1);
+    }
 
     /// A cache instance with no-op counters and a fresh store, for exercising the per-connection write
     /// logic (classify / apply_effect / finish_transaction) directly.
@@ -1118,6 +1270,7 @@ mod tests {
             database: Some("db".to_owned()),
             rendering_gucs: BTreeMap::new(),
             in_transaction: false,
+            saw_partial: false,
             session_stateful: false,
             prepared: BoundedEffects::default(),
             portals: BoundedEffects::default(),

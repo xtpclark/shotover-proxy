@@ -7,6 +7,55 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::info;
 
+/// Whether anything in this chain, or in any chain nested below it, emits PARTIAL response
+/// trains — a response delivered as several messages, only the last of which carries the
+/// request id.
+fn chain_emits_partial_responses(chain: &crate::config::chain::TransformChainConfig) -> bool {
+    chain.0.iter().any(|config| {
+        config.emits_partial_responses()
+            || config
+                .get_sub_chain_configs()
+                .iter()
+                .any(|(sub_chain, _)| chain_emits_partial_responses(sub_chain))
+    })
+}
+
+/// Collects every transform that would be handed partial response trains it has not
+/// declared it can handle.
+///
+/// A chain is judged as a whole rather than per position: partials travel UP it from
+/// whichever transform emits them, so every transform above the emitter sees them, and a
+/// sub-chain that emits hands them to the transform that owns it — which makes the
+/// enclosing chain a streaming one too. That is deliberately conservative; refusing to
+/// start is always recoverable, silently feeding a transform a shape it cannot read is not.
+///
+/// Mirrors `collect_chain_names` in `run_chains`, including its behaviour of visiting a sub-chain
+/// once per worker for transforms like ParallelMap that report the same chain repeatedly.
+fn collect_partial_response_errors(
+    chain: &crate::config::chain::TransformChainConfig,
+    chain_path: &str,
+    errors: &mut Vec<String>,
+) {
+    if chain_emits_partial_responses(chain) {
+        for config in chain.0.iter() {
+            if !config.accepts_partial_responses() {
+                errors.push(format!(
+                    "Transform {} named {:?} in {chain_path} requires whole response trains, but this chain streams partial ones. Set stream_threshold_bytes: 0 on the sink, or remove the transform.",
+                    config.typetag_name(),
+                    config.get_name(),
+                ));
+            }
+        }
+    }
+
+    for config in chain.0.iter() {
+        for (sub_chain, sub_chain_name) in config.get_sub_chain_configs() {
+            let sub_chain_path = format!("{chain_path} -> subchain {sub_chain_name:?}");
+            collect_partial_response_errors(sub_chain, &sub_chain_path, errors);
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Topology {
@@ -77,6 +126,7 @@ impl Topology {
 
         // Validate name uniqueness across sources, transforms, and chains in a single traversal.
         let mut name_state = NameValidationState::default();
+        let mut partial_response_errors: Vec<String> = Vec::new();
 
         fn collect_chain_names(
             state: &mut NameValidationState,
@@ -115,6 +165,11 @@ impl Topology {
             );
             let root_chain_path = format!("source[{index}] {source_name:?} chain {source_name:?}");
             collect_chain_names(&mut name_state, source.get_chain_config(), &root_chain_path);
+            collect_partial_response_errors(
+                source.get_chain_config(),
+                &root_chain_path,
+                &mut partial_response_errors,
+            );
         }
 
         let duplicate_sources = NameValidationState::duplicate_names(name_state.source_uses);
@@ -147,6 +202,16 @@ impl Topology {
                 for usage in usages {
                     writeln!(topology_errors, "    {usage}")?;
                 }
+            }
+        }
+
+        if !partial_response_errors.is_empty() {
+            writeln!(
+                topology_errors,
+                "Transforms that cannot receive the partial response trains their chain streams:"
+            )?;
+            for error in &partial_response_errors {
+                writeln!(topology_errors, "  {error}")?;
             }
         }
 
@@ -892,5 +957,113 @@ valkey2 source:
 "#;
 
         assert_eq!(error, expected);
+    }
+}
+
+#[cfg(all(test, feature = "postgres", feature = "alpha-transforms"))]
+mod partial_response_validation_tests {
+    use super::{chain_emits_partial_responses, collect_partial_response_errors};
+    use crate::config::chain::TransformChainConfig;
+
+    /// Parses a chain exactly as a topology file would, so these exercise the real config surface
+    /// — typetag dispatch and `deny_unknown_fields` — rather than hand-built config objects.
+    fn chain(yaml: &str) -> TransformChainConfig {
+        let deserializer = serde_yaml::Deserializer::from_str(yaml);
+        serde_yaml::with::singleton_map_recursive::deserialize(deserializer).unwrap()
+    }
+
+    fn errors(yaml: &str) -> Vec<String> {
+        let mut errors = vec![];
+        collect_partial_response_errors(&chain(yaml), "test chain", &mut errors);
+        errors
+    }
+
+    const REDACT_THEN_STREAMING_SINK: &str = r#"
+- PostgresRedactColumn:
+    name: "redact"
+    column: "secret"
+    replacement: "***"
+- PostgresSinkSingle:
+    name: "sink"
+    remote_address: "127.0.0.1:5432"
+    connect_timeout_ms: 3000
+    stream_threshold_bytes: 1048576
+"#;
+
+    const REDACT_THEN_WHOLE_TRAIN_SINK: &str = r#"
+- PostgresRedactColumn:
+    name: "redact"
+    column: "secret"
+    replacement: "***"
+- PostgresSinkSingle:
+    name: "sink"
+    remote_address: "127.0.0.1:5432"
+    connect_timeout_ms: 3000
+"#;
+
+    const STREAMING_SINK_ONLY: &str = r#"
+- PostgresSinkSingle:
+    name: "sink"
+    remote_address: "127.0.0.1:5432"
+    connect_timeout_ms: 3000
+    stream_threshold_bytes: 1048576
+"#;
+
+    /// A chunking sink plus a transform that needs whole trains is refused, and the error names the
+    /// transform and says how to fix it.
+    #[test]
+    fn refuses_streaming_chain_containing_redaction() {
+        let errors = errors(REDACT_THEN_STREAMING_SINK);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("PostgresRedactColumn"), "{}", errors[0]);
+        assert!(errors[0].contains(r#""redact""#), "{}", errors[0]);
+        assert!(
+            errors[0].contains("stream_threshold_bytes: 0"),
+            "{}",
+            errors[0]
+        );
+    }
+
+    /// The same chain with streaming off is accepted. `stream_threshold_bytes` defaults to 0, so no
+    /// topology that starts today can begin failing because of this validation.
+    #[test]
+    fn accepts_the_same_chain_with_streaming_off() {
+        assert!(!chain_emits_partial_responses(&chain(
+            REDACT_THEN_WHOLE_TRAIN_SINK
+        )));
+        assert!(errors(REDACT_THEN_WHOLE_TRAIN_SINK).is_empty());
+    }
+
+    /// A chunking sink on its own is fine: it both emits partials and accepts them.
+    #[test]
+    fn accepts_a_streaming_sink_on_its_own() {
+        assert!(chain_emits_partial_responses(&chain(STREAMING_SINK_ONLY)));
+        assert!(errors(STREAMING_SINK_ONLY).is_empty());
+    }
+
+    /// A Tee whose SUB-chain streams is refused even though the Tee's own chain does not: the
+    /// sub-chain's responses come back to the Tee, which compares whole trains and cannot line up
+    /// chunk boundaries that differ per chain.
+    #[test]
+    fn refuses_tee_whose_subchain_streams() {
+        let yaml = r#"
+- Tee:
+    name: "tee"
+    chain:
+      - PostgresSinkSingle:
+          name: "teed-sink"
+          remote_address: "127.0.0.1:5432"
+          connect_timeout_ms: 3000
+          stream_threshold_bytes: 1048576
+- PostgresSinkSingle:
+    name: "sink"
+    remote_address: "127.0.0.1:5432"
+    connect_timeout_ms: 3000
+"#;
+        let errors = errors(yaml);
+        assert!(
+            errors.iter().any(|e| e.contains("Tee")),
+            "expected the Tee to be named: {errors:?}"
+        );
     }
 }
