@@ -35,6 +35,16 @@ pub struct PostgresSinkSingleConfig {
     /// producing trips it. If unset, a stalled backend can hang the client indefinitely.
     #[serde(default)]
     pub read_timeout_ms: Option<u64>,
+    /// Bytes of an in-progress response train past which the sink codec emits the accumulated whole
+    /// backend messages as a partial chunk, instead of holding the entire result in memory. `0`,
+    /// the default, never chunks.
+    ///
+    /// NOT YET SAFE TO ENABLE and so deliberately undocumented in the user guide: no transform has
+    /// declared whether it accepts partial response trains yet, and `PostgresReadCache` in
+    /// particular would silently cache truncated results. See
+    /// [`PostgresCodecBuilder::with_stream_threshold`].
+    #[serde(default)]
+    pub stream_threshold_bytes: usize,
 }
 
 const NAME: &str = "PostgresSinkSingle";
@@ -57,6 +67,7 @@ impl TransformConfig for PostgresSinkSingleConfig {
             tls,
             self.connect_timeout_ms,
             self.read_timeout_ms,
+            self.stream_threshold_bytes,
         )))
     }
 
@@ -79,6 +90,7 @@ pub struct PostgresSinkSingleBuilder {
     tls: Option<TlsConnector>,
     connect_timeout: Duration,
     read_timeout: Option<Duration>,
+    stream_threshold_bytes: usize,
 }
 
 impl PostgresSinkSingleBuilder {
@@ -88,6 +100,7 @@ impl PostgresSinkSingleBuilder {
         tls: Option<TlsConnector>,
         connect_timeout_ms: u64,
         read_timeout_ms: Option<u64>,
+        stream_threshold_bytes: usize,
     ) -> Self {
         PostgresSinkSingleBuilder {
             name,
@@ -95,6 +108,7 @@ impl PostgresSinkSingleBuilder {
             tls,
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             read_timeout: read_timeout_ms.map(Duration::from_millis),
+            stream_threshold_bytes,
         }
     }
 }
@@ -107,6 +121,7 @@ impl TransformBuilder for PostgresSinkSingleBuilder {
             connection: None,
             connect_timeout: self.connect_timeout,
             read_timeout: self.read_timeout,
+            stream_threshold_bytes: self.stream_threshold_bytes,
             force_run_chain: transform_context.force_run_chain,
             outstanding: 0,
             source_is_tls: transform_context.source_is_tls,
@@ -134,6 +149,7 @@ pub struct PostgresSinkSingle {
     connect_timeout: Duration,
     /// Idle timeout for the next chunk of a backend response (see [`super::exchange`]); None disables.
     read_timeout: Option<Duration>,
+    stream_threshold_bytes: usize,
     force_run_chain: Arc<Notify>,
     /// Requests sent to the server that have not yet been answered — see [`super::exchange`].
     /// Carried across batches because an extended-query pipeline's responses arrive on the batch
@@ -208,7 +224,8 @@ impl Transform for PostgresSinkSingle {
         }
 
         if self.connection.is_none() {
-            let codec = PostgresCodecBuilder::new(Direction::Sink, "PostgresSinkSingle".to_owned());
+            let codec = PostgresCodecBuilder::new(Direction::Sink, "PostgresSinkSingle".to_owned())
+                .with_stream_threshold(self.stream_threshold_bytes);
             self.connection = Some(
                 SinkConnection::new(
                     &self.address,
@@ -373,6 +390,7 @@ mod tests {
             connection: None,
             connect_timeout: Duration::from_secs(1),
             read_timeout: None,
+            stream_threshold_bytes: 0,
             force_run_chain: Arc::new(Notify::new()),
             outstanding: 0,
             source_is_tls: false,

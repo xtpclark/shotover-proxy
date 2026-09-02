@@ -98,6 +98,17 @@ pub struct PostgresSinkClusterConfig {
     /// producing anything trips it. Unset (the default) waits forever, preserving prior behaviour.
     #[serde(default)]
     pub read_timeout_ms: Option<u64>,
+    /// Bytes of an in-progress response train past which the sink codec emits the accumulated whole
+    /// backend messages as a partial chunk, instead of holding the entire result in memory. Applies
+    /// to every backend connection this sink opens, primary and replica alike. `0`, the default,
+    /// never chunks.
+    ///
+    /// NOT YET SAFE TO ENABLE and so deliberately undocumented in the user guide: no transform has
+    /// declared whether it accepts partial response trains yet, and `PostgresReadCache` in
+    /// particular would silently cache truncated results. See
+    /// [`PostgresCodecBuilder::with_stream_threshold`].
+    #[serde(default)]
+    pub stream_threshold_bytes: usize,
     /// Replica addresses to PREFER when routing reads (B2, locality). A read picks a healthy
     /// preferred replica first, then any other healthy replica, then the primary. Entries should be a
     /// subset of `first_contact_points`; an entry that is not currently a replica simply never
@@ -153,6 +164,7 @@ impl TransformConfig for PostgresSinkClusterConfig {
             probe_database: self.probe_database.clone(),
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
             read_timeout: self.read_timeout_ms.map(Duration::from_millis),
+            stream_threshold_bytes: self.stream_threshold_bytes,
             preferred_replicas: self.preferred_replicas.clone(),
             replica_health_cooldown: Duration::from_millis(self.replica_health_cooldown_ms),
             replica_users: Arc::new(self.replica_users.clone()),
@@ -219,6 +231,7 @@ pub struct PostgresSinkClusterBuilder {
     probe_database: String,
     connect_timeout: Duration,
     read_timeout: Option<Duration>,
+    stream_threshold_bytes: usize,
     preferred_replicas: Vec<String>,
     replica_health_cooldown: Duration,
     tls: Option<TlsConnector>,
@@ -253,6 +266,7 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             probe_database: self.probe_database.clone(),
             connect_timeout: self.connect_timeout,
             read_timeout: self.read_timeout,
+            stream_threshold_bytes: self.stream_threshold_bytes,
             preferred_replicas: self.preferred_replicas.clone(),
             replica_health_cooldown: self.replica_health_cooldown,
             replica_users: self.replica_users.clone(),
@@ -313,6 +327,7 @@ pub struct PostgresSinkCluster {
     probe_database: String,
     connect_timeout: Duration,
     read_timeout: Option<Duration>,
+    stream_threshold_bytes: usize,
     preferred_replicas: Vec<String>,
     replica_health_cooldown: Duration,
     tls: Option<TlsConnector>,
@@ -1159,7 +1174,8 @@ impl PostgresSinkCluster {
     async fn new_backend_connection(&self, host: &str) -> Result<SinkConnection> {
         SinkConnection::new(
             host,
-            PostgresCodecBuilder::new(Direction::Sink, "PostgresSinkCluster".to_owned()),
+            PostgresCodecBuilder::new(Direction::Sink, "PostgresSinkCluster".to_owned())
+                .with_stream_threshold(self.stream_threshold_bytes),
             &self.tls,
             self.connect_timeout,
             self.force_run_chain.clone(),

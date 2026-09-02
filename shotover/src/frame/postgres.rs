@@ -271,17 +271,15 @@ impl PostgresFrame {
 
     pub fn as_codec_state(&self) -> PostgresCodecState {
         match self {
-            PostgresFrame::Request(message) => PostgresCodecState {
-                is_request: true,
-                startup: matches!(
-                    message,
-                    FrontendMessage::Startup { .. } | FrontendMessage::CancelRequest { .. }
-                ),
-            },
-            PostgresFrame::Response(_) => PostgresCodecState {
-                is_request: false,
-                startup: false,
-            },
+            PostgresFrame::Request(message) => PostgresCodecState::request(matches!(
+                message,
+                FrontendMessage::Startup { .. } | FrontendMessage::CancelRequest { .. }
+            )),
+            // A frame carries no record of having been a partial chunk, so a message REBUILT from
+            // one via `Message::from_frame` claims to be a whole response. Transforms that branch
+            // on `partial` must mutate a partial in place, which preserves its codec state, rather
+            // than reconstruct it.
+            PostgresFrame::Response(_) => PostgresCodecState::response(),
         }
     }
 }
@@ -1748,20 +1746,6 @@ mod tests {
         frame
     }
 
-    fn request_state(startup: bool) -> PostgresCodecState {
-        PostgresCodecState {
-            is_request: true,
-            startup,
-        }
-    }
-
-    fn response_state() -> PostgresCodecState {
-        PostgresCodecState {
-            is_request: false,
-            startup: false,
-        }
-    }
-
     /// A startup message as sent by psql: protocol 3.0, user and database parameters.
     #[test]
     fn test_startup_round_trip() {
@@ -1777,7 +1761,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        let frame = round_trip(&bytes, request_state(true));
+        let frame = round_trip(&bytes, PostgresCodecState::request(true));
         match frame {
             PostgresFrame::Request(FrontendMessage::Startup {
                 protocol_version,
@@ -1800,7 +1784,7 @@ mod tests {
         .encode(&mut bytes)
         .unwrap();
         assert_eq!(bytes.len(), 16);
-        round_trip(&bytes, request_state(true));
+        round_trip(&bytes, PostgresCodecState::request(true));
     }
 
     #[test]
@@ -1812,7 +1796,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        let frame = round_trip(&bytes, request_state(false));
+        let frame = round_trip(&bytes, PostgresCodecState::request(false));
         assert_eq!(crate::message::QueryType::Read, query_type(&frame));
     }
 
@@ -1826,7 +1810,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        let frame = round_trip(&bytes, request_state(false));
+        let frame = round_trip(&bytes, PostgresCodecState::request(false));
         assert_eq!(crate::message::QueryType::Write, query_type(&frame));
 
         let mut bytes = BytesMut::new();
@@ -1839,7 +1823,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        round_trip(&bytes, request_state(false));
+        round_trip(&bytes, PostgresCodecState::request(false));
 
         for message in [
             FrontendMessage::Describe {
@@ -1860,7 +1844,7 @@ mod tests {
         ] {
             let mut bytes = BytesMut::new();
             message.encode(&mut bytes).unwrap();
-            round_trip(&bytes, request_state(false));
+            round_trip(&bytes, PostgresCodecState::request(false));
         }
     }
 
@@ -1907,7 +1891,7 @@ mod tests {
         ] {
             message.encode(&mut bytes).unwrap();
         }
-        let frame = round_trip(&bytes, response_state());
+        let frame = round_trip(&bytes, PostgresCodecState::response());
         match &frame {
             PostgresFrame::Response(messages) => {
                 assert_eq!(messages.len(), 5);
@@ -1942,7 +1926,7 @@ mod tests {
         ] {
             message.encode(&mut bytes).unwrap();
         }
-        round_trip(&bytes, response_state());
+        round_trip(&bytes, PostgresCodecState::response());
     }
 
     /// SASL authentication messages: SCRAM-SHA-256 offer, continue, final.
@@ -1954,7 +1938,7 @@ mod tests {
         })
         .encode(&mut bytes)
         .unwrap();
-        let frame = round_trip(&bytes, response_state());
+        let frame = round_trip(&bytes, PostgresCodecState::response());
         match frame {
             PostgresFrame::Response(messages) => match &messages[0] {
                 BackendMessage::Authentication(AuthenticationMessage::Sasl { mechanisms }) => {
@@ -1971,13 +1955,13 @@ mod tests {
         })
         .encode(&mut bytes)
         .unwrap();
-        round_trip(&bytes, response_state());
+        round_trip(&bytes, PostgresCodecState::response());
 
         let mut bytes = BytesMut::new();
         FrontendMessage::AuthenticationData(Bytes::from_static(b"n,,n=,r=clientnonce"))
             .encode(&mut bytes)
             .unwrap();
-        round_trip(&bytes, request_state(false));
+        round_trip(&bytes, PostgresCodecState::request(false));
     }
 
     #[test]
@@ -1996,7 +1980,7 @@ mod tests {
         ] {
             message.encode(&mut bytes).unwrap();
         }
-        let frame = round_trip(&bytes, response_state());
+        let frame = round_trip(&bytes, PostgresCodecState::response());
         match frame {
             PostgresFrame::Response(messages) => {
                 assert_eq!(
@@ -2017,7 +2001,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        round_trip(&bytes, response_state());
+        round_trip(&bytes, PostgresCodecState::response());
 
         let mut bytes = BytesMut::new();
         for message in [
@@ -2027,7 +2011,7 @@ mod tests {
             message.encode(&mut bytes).unwrap();
             let length = message_wire_length(&bytes, false).unwrap().unwrap();
             let message_bytes = bytes.split_to(length);
-            round_trip(&message_bytes, request_state(false));
+            round_trip(&message_bytes, PostgresCodecState::request(false));
         }
 
         let mut bytes = BytesMut::new();
@@ -2036,7 +2020,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        round_trip(&bytes, request_state(false));
+        round_trip(&bytes, PostgresCodecState::request(false));
     }
 
     /// An unknown tag must parse to Raw and round trip byte identically.
@@ -2046,7 +2030,7 @@ mod tests {
         bytes.put_u8(b'!');
         bytes.put_i32(9);
         bytes.extend_from_slice(b"weird");
-        let frame = round_trip(&bytes, request_state(false));
+        let frame = round_trip(&bytes, PostgresCodecState::request(false));
         match frame {
             PostgresFrame::Request(FrontendMessage::Raw { tag, body }) => {
                 assert_eq!(tag, b'!');
@@ -2064,7 +2048,7 @@ mod tests {
         bytes.put_u8(b'T');
         bytes.put_i32(6);
         bytes.put_i16(999);
-        let frame = round_trip(&bytes, response_state());
+        let frame = round_trip(&bytes, PostgresCodecState::response());
         match frame {
             PostgresFrame::Response(messages) => {
                 assert!(matches!(messages[0], BackendMessage::Raw { tag: b'T', .. }));
