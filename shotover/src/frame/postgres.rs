@@ -1035,6 +1035,17 @@ impl BackendMessage {
             _ => None,
         }
     }
+
+    /// The SQLSTATE code (the `C` field) of an error response, if this is one.
+    pub fn error_code(&self) -> Option<&str> {
+        match self {
+            BackendMessage::ErrorResponse { fields } => fields
+                .iter()
+                .find(|(field_type, _)| *field_type == b'C')
+                .map(|(_, value)| value.as_str()),
+            _ => None,
+        }
+    }
 }
 
 impl Display for PostgresFrame {

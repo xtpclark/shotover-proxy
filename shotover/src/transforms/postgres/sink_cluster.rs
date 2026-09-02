@@ -985,7 +985,18 @@ impl PostgresSinkCluster {
             Ok(Err(err)) if err.downcast_ref::<crate::connection::ConnectionError>().is_some() => {
                 HostProbe::Unreachable(err.to_string())
             }
-            // ...but the host ANSWERING with an error (rotated probe password, hba, 'database is
+            // ...and a class-08 (connection_exception) SQLSTATE on the probe QUERY means the backend
+            // link is failing even though something answered — a pooler that cannot reach the backend
+            // does this — so treat it as unreachable and let failover proceed rather than depend on the
+            // pooler closing the connection.
+            Ok(Err(err))
+                if err
+                    .downcast_ref::<ProbeQueryError>()
+                    .is_some_and(|e| e.sqlstate.starts_with("08")) =>
+            {
+                HostProbe::Unreachable(err.to_string())
+            }
+            // ...but the host ANSWERING with any other error (rotated probe password, hba, 'database is
             // starting up', too many connections, md5/SCRAM) means it is ALIVE, just not probeable.
             // Never treat this as gone (review F6 re-verify #2).
             Ok(Err(err)) => HostProbe::ReachableButRejected {
@@ -1381,6 +1392,23 @@ impl std::fmt::Display for BackendAuthRejected {
 
 impl std::error::Error for BackendAuthRejected {}
 
+/// The probe QUERY (post-auth `pg_is_in_recovery()`) returned an ErrorResponse. Carries the SQLSTATE so
+/// a class-08 (connection_exception) answer — which a pooler emits when it cannot reach the backend —
+/// is classified as Unreachable (failover proceeds) rather than "alive but rejected".
+#[derive(Debug)]
+struct ProbeQueryError {
+    sqlstate: String,
+    message: String,
+}
+
+impl std::fmt::Display for ProbeQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "probe query failed ({}): {}", self.sqlstate, self.message)
+    }
+}
+
+impl std::error::Error for ProbeQueryError {}
+
 /// No contact point currently reports itself a primary — every host is down or a failover is mid-flight
 /// (the crash→promotion window). Typed so `map_startup_error` surfaces a clean, retryable FATAL to the
 /// client instead of the generic "internal shotover bug" text (review F10).
@@ -1670,10 +1698,11 @@ async fn query_scalar_bool(connection: &mut SinkConnection, sql: &str) -> Result
                         return Ok(value.as_ref() == b"t");
                     }
                     BackendMessage::ErrorResponse { .. } => {
-                        bail!(
-                            "query {sql} failed: {}",
-                            message.error_message().unwrap_or("unknown error")
-                        );
+                        return Err(ProbeQueryError {
+                            sqlstate: message.error_code().unwrap_or("").to_owned(),
+                            message: message.error_message().unwrap_or("unknown error").to_owned(),
+                        }
+                        .into());
                     }
                     _ => {}
                 }
