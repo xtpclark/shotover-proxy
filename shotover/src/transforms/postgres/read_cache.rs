@@ -41,9 +41,10 @@
 //!     so such a read is never cached AND invalidates the whole cache. Known non-table side effects
 //!     (nextval/advisory/set_config) are excluded from the evict-all so they do not gut the cache.
 //!   - **Extended-protocol prepared writes invalidate at Execute, not Parse** (review F-INV-2). A driver
-//!     Parses once and Bind/Executes many; each statement's effect is recorded at Parse (bounded, FIFO)
-//!     and COPIED into the portal at Bind (so a `Close(S)` cannot orphan it — F-INV-7), then applied at
-//!     every Execute. An Execute of an untracked portal evicts everything (counted).
+//!     Parses once and Bind/Executes many; each statement's effect is recorded at Parse (bounded,
+//!     approximately-LRU so a hot statement survives cold churn — F-INV-8/Y9) and COPIED into the portal
+//!     at Bind (so a `Close(S)` cannot orphan it — F-INV-7), then applied at every Execute. An Execute of
+//!     an untracked portal evicts everything (counted).
 //!   - **Transaction boundaries are tracked in BOTH protocols** (review F-INV-4/5). BEGIN/COMMIT/ROLLBACK
 //!     are classified from the parse tree (`analyze_sql().txn`), so `BEGIN`/`COMMIT` sent as extended
 //!     Parse/Bind/Execute — how pgjdbc/npgsql/pgx work — are seen, and `ROLLBACK TO SAVEPOINT` / SAVEPOINT
@@ -61,7 +62,8 @@
 //! underlying table, and likewise a cached read of a partitioned/inherited parent is not evicted by a
 //! write to a child — the proxy has no catalog connection to resolve view/partition -> base tables
 //! (`relkind`/`pg_inherits`). A trigger-driven write to another table is invisible to the analysis for
-//! the same reason. Deferred.
+//! the same reason. `COMMIT PREPARED` on THIS proxy evicts everything (review Y7), but a two-phase txn
+//! committed through a DIFFERENT proxy instance is not seen (no shared state). All deferred.
 //!
 //! WAL / LISTEN-NOTIFY sourced invalidation and extended-protocol read caching remain out of scope.
 //!
@@ -426,36 +428,45 @@ enum StmtEffect {
 /// driver's prepared-statement cache fits; pgjdbc defaults to 256).
 const MAX_PREPARED: usize = 4096;
 
-/// A bounded, FIFO-evicting map of extended-protocol statement/portal effects, so a client that Parses
-/// or Binds unbounded distinct names cannot grow it. The oldest entry is dropped; an Execute that then
-/// finds nothing falls back to `StmtEffect::Unknown` (evict-all, counted).
+/// A bounded, approximately-LRU map of extended-protocol statement/portal effects, so a client that
+/// Parses or Binds unbounded distinct names cannot grow it. Each entry carries a recency stamp bumped on
+/// access (`get`); on overflow the LEAST-recently-used entry is dropped, NOT the oldest — a client that
+/// keeps re-using a hot prepared statement while churning cold ones keeps the hot ones (review Y9). An
+/// Execute that then finds nothing falls back to `StmtEffect::Unknown` (evict-all, counted).
 #[derive(Default)]
 struct BoundedEffects {
-    map: HashMap<String, StmtEffect>,
-    order: std::collections::VecDeque<String>,
+    map: HashMap<String, (StmtEffect, u64)>,
+    clock: u64,
 }
 
 impl BoundedEffects {
     fn insert(&mut self, name: String, effect: StmtEffect) {
-        if !self.map.contains_key(&name) {
-            if self.map.len() >= MAX_PREPARED
-                && let Some(oldest) = self.order.pop_front()
-            {
-                self.map.remove(&oldest);
-            }
-            self.order.push_back(name.clone());
+        self.clock += 1;
+        if !self.map.contains_key(&name)
+            && self.map.len() >= MAX_PREPARED
+            && let Some(victim) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone())
+        {
+            self.map.remove(&victim);
         }
-        self.map.insert(name, effect);
+        self.map.insert(name, (effect, self.clock));
     }
 
-    fn get(&self, name: &str) -> Option<&StmtEffect> {
-        self.map.get(name)
+    /// Returns the effect and marks it most-recently-used.
+    fn get(&mut self, name: &str) -> Option<StmtEffect> {
+        self.clock += 1;
+        let now = self.clock;
+        self.map.get_mut(name).map(|(effect, used)| {
+            *used = now;
+            effect.clone()
+        })
     }
 
     fn remove(&mut self, name: &str) {
-        if self.map.remove(name).is_some() {
-            self.order.retain(|n| n != name);
-        }
+        self.map.remove(name);
     }
 }
 
@@ -631,7 +642,6 @@ impl Transform for PostgresReadCache {
                         let effect = self
                             .prepared
                             .get(&statement_name)
-                            .cloned()
                             .unwrap_or(StmtEffect::Unknown);
                         self.portals.insert(portal_name, effect);
                     }
@@ -640,11 +650,7 @@ impl Transform for PostgresReadCache {
                     // Apply the effect the portal was bound with (review F-INV-2/4/6). Extended writes
                     // are deferred to the implicit-transaction Sync or the explicit COMMIT.
                     if self.invalidate_on_write {
-                        let effect = self
-                            .portals
-                            .get(&portal_name)
-                            .cloned()
-                            .unwrap_or(StmtEffect::Unknown);
+                        let effect = self.portals.get(&portal_name).unwrap_or(StmtEffect::Unknown);
                         self.apply_effect(&effect, &mut explicit_txn, true);
                     }
                 }
@@ -669,11 +675,18 @@ impl Transform for PostgresReadCache {
                     if self.invalidate_on_write && !explicit_txn {
                         self.finish_transaction(true);
                     }
-                    // Apply this statement's effect: a simple-protocol autocommit write commits
-                    // immediately (evict now), everything else follows the shared transaction model.
+                    // Apply this statement's effect. A simple Query string may contain BOTH a write and
+                    // transaction control (`BEGIN; UPDATE t; COMMIT` in one PQexec), so apply the txn part
+                    // first (BEGIN opens the txn / COMMIT flushes what precedes it) and then the write —
+                    // never dropping one for the other. A simple-protocol autocommit write commits
+                    // immediately (evict now); an in-explicit-txn write defers to COMMIT.
                     if self.invalidate_on_write {
-                        let effect = self.classify(&analysis);
-                        self.apply_effect(&effect, &mut explicit_txn, false);
+                        if let Some(txn) = analysis.txn.clone() {
+                            self.apply_txn_control(&txn, &mut explicit_txn);
+                        }
+                        if let Some(inv) = self.statement_invalidation(&analysis) {
+                            self.note_write(inv, explicit_txn);
+                        }
                     }
                     if analysis.pins_session {
                         // SET search_path/role, PREPARE, temp tables, …: turn the cache off for this
@@ -833,16 +846,28 @@ impl PostgresReadCache {
                 self.untracked_execute.increment(1);
                 self.note_write((Vec::new(), true), *explicit_txn || deferred);
             }
-            StmtEffect::Txn(TxnControl::Begin) => *explicit_txn = true,
-            StmtEffect::Txn(TxnControl::Commit { chain }) => {
+            StmtEffect::Txn(txn) => self.apply_txn_control(txn, explicit_txn),
+        }
+    }
+
+    /// Apply a transaction-control statement's effect on the deferred set and the explicit-txn flag.
+    fn apply_txn_control(&mut self, txn: &TxnControl, explicit_txn: &mut bool) {
+        match txn {
+            TxnControl::Begin => *explicit_txn = true,
+            TxnControl::Commit { chain } => {
                 self.finish_transaction(true);
                 *explicit_txn = *chain;
             }
-            StmtEffect::Txn(TxnControl::Rollback { chain }) => {
+            TxnControl::Rollback { chain } => {
                 self.finish_transaction(false);
                 *explicit_txn = *chain;
             }
-            StmtEffect::Txn(TxnControl::Nested) => {}
+            TxnControl::CommitPrepared => {
+                // Commits a two-phase txn that may have been PREPAREd on another connection; its writes
+                // are unknown here, so evict everything (review Y7). It runs standalone, so evict now.
+                self.evict(&[], true);
+            }
+            TxnControl::Nested => {}
         }
     }
 
@@ -1132,6 +1157,9 @@ mod tests {
         assert_eq!(analyze_sql("SAVEPOINT sp").txn, Some(TxnControl::Nested));
         assert_eq!(analyze_sql("RELEASE SAVEPOINT sp").txn, Some(TxnControl::Nested));
         assert_eq!(analyze_sql("COMMIT AND CHAIN").txn, Some(TxnControl::Commit { chain: true }));
+        // Y7: COMMIT PREPARED is distinct (evict-all); ROLLBACK PREPARED committed nothing (Nested).
+        assert_eq!(analyze_sql("COMMIT PREPARED 'tx'").txn, Some(TxnControl::CommitPrepared));
+        assert_eq!(analyze_sql("ROLLBACK PREPARED 'tx'").txn, Some(TxnControl::Nested));
         assert_eq!(analyze_sql("SELECT 1").txn, None);
         assert_eq!(analyze_sql("UPDATE t SET v=1").txn, None);
     }
@@ -1281,17 +1309,9 @@ mod tests {
     ) {
         let effect = cache.classify(&analyze_sql(sql));
         cache.prepared.insert(stmt.to_owned(), effect);
-        let bound = cache
-            .prepared
-            .get(stmt)
-            .cloned()
-            .unwrap_or(StmtEffect::Unknown);
+        let bound = cache.prepared.get(stmt).unwrap_or(StmtEffect::Unknown);
         cache.portals.insert(portal.to_owned(), bound);
-        let effect = cache
-            .portals
-            .get(portal)
-            .cloned()
-            .unwrap_or(StmtEffect::Unknown);
+        let effect = cache.portals.get(portal).unwrap_or(StmtEffect::Unknown);
         cache.apply_effect(&effect, explicit_txn, true);
     }
 
@@ -1319,11 +1339,12 @@ mod tests {
         let mut explicit_txn = false;
 
         // Parse s9 (a write to t); Bind p9<-s9; Close S s9; Execute p9.
-        cache.prepared.insert("s9".to_owned(), cache.classify(&analyze_sql("UPDATE t SET v=1")));
-        let bound = cache.prepared.get("s9").cloned().unwrap();
+        let s9 = cache.classify(&analyze_sql("UPDATE t SET v=1"));
+        cache.prepared.insert("s9".to_owned(), s9);
+        let bound = cache.prepared.get("s9").unwrap();
         cache.portals.insert("p9".to_owned(), bound);
         cache.prepared.remove("s9"); // Close(S)
-        let effect = cache.portals.get("p9").cloned().unwrap_or(StmtEffect::Unknown);
+        let effect = cache.portals.get("p9").unwrap_or(StmtEffect::Unknown);
         cache.apply_effect(&effect, &mut explicit_txn, true);
         cache.finish_transaction(true); // Sync
 
@@ -1404,5 +1425,50 @@ mod tests {
         cache.finish_transaction(false); // ROLLBACK
         assert_eq!(entries(&cache), 1, "ROLLBACK discards the deferred eviction");
         assert!(cache.txn_dirty.is_empty());
+    }
+
+    #[test]
+    fn multi_statement_simple_query_evicts_its_write() {
+        // A single simple-Query string that both writes and commits (BEGIN; UPDATE; COMMIT in one
+        // PQexec) must still evict the write — it was being dropped in favour of the txn effect.
+        let mut cache = test_cache(&[]);
+        prime(&cache, key("select v from t"), rel("t"));
+        let mut explicit_txn = false;
+        let analysis = analyze_sql("BEGIN; UPDATE t SET v=1; COMMIT");
+        // Mirror the simple-Query arm: the txn part first, then the write part.
+        if let Some(txn) = analysis.txn.clone() {
+            cache.apply_txn_control(&txn, &mut explicit_txn);
+        }
+        if let Some(inv) = cache.statement_invalidation(&analysis) {
+            cache.note_write(inv, explicit_txn);
+        }
+        assert_eq!(entries(&cache), 0, "the UPDATE inside the multi-statement string evicted t");
+        assert!(!explicit_txn, "the string's COMMIT left the transaction");
+    }
+
+    #[test]
+    fn commit_prepared_evicts_everything() {
+        // Y7: COMMIT PREPARED commits a two-phase txn possibly PREPAREd on another connection, so its
+        // writes are unknown here -> evict the whole cache (closes the same-proxy 2PC gap).
+        let mut cache = test_cache(&[]);
+        prime(&cache, key("read a"), rel("x"));
+        prime(&cache, key("read b"), rel("y"));
+        let mut explicit_txn = false;
+        let cp = cache.classify(&analyze_sql("COMMIT PREPARED 'tx'"));
+        cache.apply_effect(&cp, &mut explicit_txn, false);
+        assert_eq!(entries(&cache), 0, "COMMIT PREPARED evicted everything");
+    }
+
+    #[test]
+    fn bounded_effects_lru_keeps_the_hot_entry() {
+        // Y9: a hot entry re-used while cold ones churn past the cap survives, because eviction is LRU
+        // (least-recently-USED), not FIFO (oldest-inserted, which was exactly the hot one).
+        use super::MAX_PREPARED;
+        let mut b = BoundedEffects::default();
+        b.insert("hot".to_owned(), StmtEffect::Neutral);
+        for i in 0..(MAX_PREPARED + 100) {
+            b.insert(format!("cold{i}"), StmtEffect::Neutral);
+            assert!(b.get("hot").is_some(), "hot survives churn because each round re-uses it");
+        }
     }
 }

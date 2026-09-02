@@ -1165,8 +1165,12 @@ pub enum TxnControl {
     Commit { chain: bool },
     /// ROLLBACK / ABORT — ends it; discard the deferred invalidation. `chain` opens a new one.
     Rollback { chain: bool },
-    /// SAVEPOINT / RELEASE / ROLLBACK TO / COMMIT PREPARED / ROLLBACK PREPARED — does NOT end the
-    /// current transaction; keep it open and keep the deferred set.
+    /// COMMIT PREPARED — commits a two-phase transaction that may have been PREPAREd on a DIFFERENT
+    /// connection, so its writes are unknown here; a cache must evict everything (review Y7). Runs
+    /// standalone (never inside a transaction block).
+    CommitPrepared,
+    /// SAVEPOINT / RELEASE / ROLLBACK TO / ROLLBACK PREPARED — does NOT end the current transaction (or,
+    /// for ROLLBACK PREPARED, aborts a two-phase txn that committed nothing); keep the deferred set.
     Nested,
 }
 
@@ -1399,6 +1403,7 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
                     TransStmtBegin | TransStmtStart => TxnControl::Begin,
                     TransStmtCommit | TransStmtPrepare => TxnControl::Commit { chain: txn.chain },
                     TransStmtRollback => TxnControl::Rollback { chain: txn.chain },
+                    TransStmtCommitPrepared => TxnControl::CommitPrepared,
                     _ => TxnControl::Nested,
                 });
             }

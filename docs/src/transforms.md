@@ -687,7 +687,9 @@ Residuals remain, bounded by `ttl_ms`: eviction is at the write REQUEST, not the
 commits (a window of the commit latency itself), and — because the proxy has no catalog connection to
 resolve `relkind`/`pg_inherits` or triggers — a cached `SELECT` over a **view** or a **partitioned/
 inherited parent** is evicted by a write naming that relation but NOT by a write to its base table or
-child, and a **trigger-driven** write to another table is invisible to the analysis. It also cannot see
+child, and a **trigger-driven** write to another table is invisible to the analysis. A `COMMIT PREPARED`
+on this proxy evicts everything, but a two-phase transaction committed through a **different proxy
+instance** is not seen. It also cannot see
 server-side per-role defaults that postgres does not report (`ALTER ROLE … SET search_path`). **Do not
 enable it for untrusted clients, or any deployment that relies on per-role/invisible search_path or role
 customisation.** Because the proxy already buffers whole response trains in memory, keep `max_bytes`
