@@ -13,14 +13,17 @@
 //! answered from that cache — the backend is never contacted — until the entry's TTL elapses.
 //!
 //! ## UNSAFE for multi-tenant / untrusted / per-connection-search_path use
-//! This is a convenience cache, NOT a correctness boundary. It is keyed by (database, user, query) and
-//! assumes DEFAULT session state. It hardens against the state it CAN see — a session-pinning statement
-//! via the simple OR extended protocol (`SET search_path`/`SET role`/PREPARE/temp tables) and a
-//! state-affecting startup parameter (`options`/`search_path`/`role`/`session_authorization`) turn the
-//! cache OFF for that connection — but it CANNOT see server-side per-role defaults (`ALTER ROLE … SET
-//! search_path`). Do not enable it for untrusted clients or any deployment that relies on per-role or
-//! otherwise-invisible search_path/role customisation: a cached result could then be served across
-//! tenants. (Reviewer F1.)
+//! This is a convenience cache, NOT a correctness boundary. The key is (database, user, rendering
+//! fingerprint, query), where the rendering fingerprint is the server-reported rendering GUCs
+//! (client_encoding/DateStyle/TimeZone/IntervalStyle/…), so two clients with different timezone/
+//! encoding/date formatting never share a result (F1c). It hardens against the rest of the state it CAN
+//! see — a session-pinning statement via the simple OR extended protocol (`SET search_path`/`SET
+//! role`/PREPARE/temp tables) and a state-affecting startup parameter (`options`/`search_path`/`role`/
+//! `session_authorization`/`extra_float_digits`) turn the cache OFF for that connection. But it CANNOT
+//! see what the server never reports: per-role search_path/role defaults (`ALTER ROLE … SET
+//! search_path` — search_path is not a reported GUC). Do not enable it for untrusted clients or any
+//! deployment that relies on per-role/otherwise-invisible search_path/role customisation: a cached
+//! result could then be served across tenants. (Reviewer F1/F1c.)
 //!
 //! ## What it deliberately does NOT do — the SPIKE's finding
 //! - **No write invalidation (the hard part).** A write to a table does NOT evict cached reads of that
@@ -50,12 +53,26 @@ use anyhow::Result;
 use async_trait::async_trait;
 use metrics::{Counter, counter};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// (database, user, query text) — the cache key. See the module doc for why identity is part of it.
-type CacheKey = (String, String, String);
+/// (database, user, rendering fingerprint, query text) — the cache key. The rendering fingerprint is
+/// the server-reported rendering GUCs (client_encoding/DateStyle/TimeZone/…) so two clients with
+/// different timezone/encoding/date formatting never share a cached result (review F1c). See the
+/// module doc for why identity is part of the key.
+type CacheKey = (String, String, String, String);
+
+/// The reported GUCs that change how result VALUES render; two clients differing on any of these must
+/// not share cached bytes. These are all in the postgres startup ParameterStatus set.
+const RENDERING_GUCS: &[&str] = &[
+    "client_encoding",
+    "datestyle",
+    "intervalstyle",
+    "timezone",
+    "integer_datetimes",
+    "standard_conforming_strings",
+];
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -155,6 +172,7 @@ impl TransformBuilder for PostgresReadCacheBuilder {
             misses: self.misses.clone(),
             user: None,
             database: None,
+            rendering_gucs: BTreeMap::new(),
             in_transaction: false,
             session_stateful: false,
         })
@@ -179,6 +197,11 @@ pub struct PostgresReadCache {
     // Per-connection state:
     user: Option<String>,
     database: Option<String>,
+    /// The server-reported rendering GUCs (from startup ParameterStatus); part of the cache key so a
+    /// result rendered under one timezone/encoding/date style is never served to a client using
+    /// another (review F1c). Captured canonically from the server, so per-role defaults (ALTER ROLE …
+    /// SET) that the client never sent are covered.
+    rendering_gucs: BTreeMap<String, String>,
     in_transaction: bool,
     /// Latched true once this connection issues a session-pinning statement; the cache is then off for
     /// this connection (its query results may depend on search_path/role the shared cache cannot know).
@@ -235,7 +258,10 @@ impl Transform for PostgresReadCache {
                             // Any per-connection state customisation the cache key cannot capture turns
                             // the cache off for this session — a custom search_path/role would make a
                             // shared cached result wrong (review F1).
+                            // extra_float_digits changes float rendering but is NOT reported in
+                            // ParameterStatus, so it cannot be keyed — latch off if the client sets it.
                             "options" | "search_path" | "role" | "session_authorization"
+                            | "extra_float_digits"
                                 if !value.is_empty() =>
                             {
                                 self.session_stateful = true;
@@ -273,7 +299,7 @@ impl Transform for PostgresReadCache {
                         (Some(u), Some(d)) => (u.clone(), d.clone()),
                         _ => continue,
                     };
-                    let key = (database, user, query);
+                    let key = (database, user, rendering_fingerprint(&self.rendering_gucs), query);
                     if let Some(mut response) = self.cache_get(&key) {
                         response.set_request_id(rid);
                         serve_from_cache.insert(rid, response);
@@ -291,6 +317,7 @@ impl Transform for PostgresReadCache {
         let mut responses = chain_state.call_next_transform().await?;
 
         for response in responses.iter_mut() {
+            self.capture_rendering_gucs(response);
             if let Some(status) = trailing_ready_status(response) {
                 self.in_transaction = status != b'I';
             }
@@ -315,6 +342,21 @@ impl Transform for PostgresReadCache {
 }
 
 impl PostgresReadCache {
+    /// Records the server's rendering GUCs from a ParameterStatus (sent at startup, and on any change)
+    /// so they can key the cache (review F1c).
+    fn capture_rendering_gucs(&mut self, response: &mut Message) {
+        if let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() {
+            for message in messages.iter() {
+                if let BackendMessage::ParameterStatus { name, value } = message {
+                    let name = name.to_ascii_lowercase();
+                    if RENDERING_GUCS.contains(&name.as_str()) {
+                        self.rendering_gucs.insert(name, value.clone());
+                    }
+                }
+            }
+        }
+    }
+
     fn cache_get(&self, key: &CacheKey) -> Option<Message> {
         let mut store = self.cache.lock().ok()?;
         match store.entries.get(key) {
@@ -366,6 +408,18 @@ impl PostgresReadCache {
             );
         }
     }
+}
+
+/// A stable string of the rendering GUCs (BTreeMap iterates sorted), used as part of the cache key.
+fn rendering_fingerprint(gucs: &BTreeMap<String, String>) -> String {
+    let mut fingerprint = String::new();
+    for (name, value) in gucs {
+        fingerprint.push_str(name);
+        fingerprint.push('=');
+        fingerprint.push_str(value);
+        fingerprint.push(';');
+    }
+    fingerprint
 }
 
 /// True if a query begins a transaction.
