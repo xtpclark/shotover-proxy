@@ -654,7 +654,9 @@ A TTL read-through cache for the postgres simple-query protocol: it serves the c
 identical, cacheable read within a TTL window instead of forwarding it to the backend.
 
 Only a pure, replica-safe simple `Query` with no volatile construct (`now()`, `random()`, `nextval`,
-`current_user`, …) is cacheable. The key is `(database, user, rendering-fingerprint, query)`, where the
+`current_user`, …) and no function the proxy cannot prove pure is cacheable — a `SELECT my_proc(...)`
+whose function is neither a known-pure builtin nor listed in `pure_functions` is treated as a possible
+writer (it might `INSERT`/`UPDATE`) and is never cached. The key is `(database, user, rendering-fingerprint, query)`, where the
 rendering fingerprint is the server-reported rendering GUCs (`client_encoding`/`DateStyle`/`TimeZone`/…)
 so two clients with different timezone/encoding/date formatting never share a result. A response is
 stored only if it is a clean idle result — no `ErrorResponse`, and a trailing `ReadyForQuery('I')`, so
@@ -667,16 +669,20 @@ state-affecting startup parameter (`options`/`search_path`/`role`/`session_autho
 evicts the cached reads of its target tables BEFORE it is forwarded, so a following read cannot be
 answered from a now-stale entry. The write's targets come from the same grammar analysis (`INSERT`/
 `UPDATE`/`DELETE`/`MERGE`, including a write hidden in a CTE); a write whose targets cannot be enumerated
-— a stored-procedure `CALL`, a `DO` block, `COPY … FROM`, or an unparseable statement — evicts the WHOLE
-cache. Writes arriving via the extended protocol (`Parse`) invalidate too, even though extended-protocol
-reads are never cached. Table names are matched by bare (schema-stripped, lowercased) name, so
-invalidation is over-eager across schemas rather than ever missing. A read whose request was issued at or
-before the most recent invalidation is not stored (the read-after-write race guard).
+— a stored-procedure `CALL`, a `DO` block, `COPY … FROM`, an unparseable statement, or a read calling an
+unproven function — evicts the WHOLE cache. Table names are matched by bare (schema-stripped, lowercased)
+name, so invalidation is over-eager across schemas rather than ever missing. Three subtler shapes are
+covered: a **prepared write invalidates at `Execute`, not `Parse`** (a driver Parses once and
+Bind/Executes many, so invalidating only at Parse missed every write after the first); a write **inside
+an explicit transaction defers its invalidation to `COMMIT`** (`ROLLBACK` discards it), so a concurrent
+read cannot cache the not-yet-committed value; and a read whose request was issued at or before the most
+recent invalidation is not stored (the read-after-write race guard).
 
-Two residuals remain, bounded by `ttl_ms`: eviction is at the write REQUEST, not its COMMIT (a read
-issued after a write evicts but before it commits can cache the pre-commit value), and a cached
-`SELECT` over a **view** is evicted only by a write naming the view, not by a write to the view's
-underlying table (the proxy has no catalog connection to resolve view → base tables). It also cannot see
+Residuals remain, bounded by `ttl_ms`: eviction is at the write REQUEST, not the instant the backend
+commits (a window of the commit latency itself), and — because the proxy has no catalog connection to
+resolve `relkind`/`pg_inherits` or triggers — a cached `SELECT` over a **view** or a **partitioned/
+inherited parent** is evicted by a write naming that relation but NOT by a write to its base table or
+child, and a **trigger-driven** write to another table is invisible to the analysis. It also cannot see
 server-side per-role defaults that postgres does not report (`ALTER ROLE … SET search_path`). **Do not
 enable it for untrusted clients, or any deployment that relies on per-role/invisible search_path or role
 customisation.** Because the proxy already buffers whole response trains in memory, keep `max_bytes`
@@ -699,6 +705,11 @@ Metrics: `shotover_postgres_read_cache_hits_count`, `shotover_postgres_read_cach
     # Evict cached reads of a table when a write to it is seen (optional, default true). Turn OFF only
     # in front of a read-only replica where no write can arrive on the same chain.
     #invalidate_on_write: true
+    # Function names (bare, case-insensitive) you certify as PURE — read-only and deterministic. A read
+    # calling a function that is neither a known-pure builtin nor listed here is treated as a possible
+    # writer: not cached, and it invalidates the cache. List your read-only stored functions to let
+    # their SELECTs cache again (optional, default empty).
+    #pure_functions: ["my_readonly_fn"]
 ```
 
 When either bound is reached the cache does NOT evict LRU: it drops expired entries, and if it is still
