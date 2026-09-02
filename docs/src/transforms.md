@@ -647,11 +647,15 @@ This transform will send/receive postgres messages to a single postgres instance
 
 ### PostgresReadCache
 
-> **EXPERIMENTAL SPIKE — NOT a correctness boundary, and UNSAFE for multi-tenant or untrusted use.**
-> Enabling it requires the `alpha-transforms` feature.
+> **ALPHA — write-invalidated, with documented residuals; UNSAFE for multi-tenant or untrusted use.**
+> Enabling it requires the `alpha-transforms` feature. Staleness is possible only through the residuals
+> listed below — a cached read of a **view** or **partition parent/child** is not evicted by a write to
+> its base table or child, a **trigger-driven** write to another table is invisible, a two-phase commit
+> through a **different proxy instance** is not seen, and a **write that bypasses the proxy** is not seen.
 
-A TTL read-through cache for the postgres simple-query protocol: it serves the cached response for an
-identical, cacheable read within a TTL window instead of forwarding it to the backend.
+A write-invalidated read-through cache for the postgres simple-query protocol: it serves the cached
+response for an identical, cacheable read instead of forwarding it to the backend, and evicts cached
+reads that writes make stale.
 
 Only a pure, replica-safe simple `Query` with no volatile construct (`now()`, `random()`, `nextval`,
 `current_user`, …) and no function the proxy cannot prove pure is cacheable — a `SELECT my_proc(...)`

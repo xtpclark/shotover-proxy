@@ -1,8 +1,18 @@
-//! SPIKE — a TTL read-through result cache for the postgres simple-query protocol.
+//! ALPHA — a write-invalidated read-through result cache for the postgres simple-query protocol, with
+//! documented residuals.
 //!
-//! This is an experimental exploration (feature `alpha-transforms`), not a production cache. It
-//! serves the cached response for an identical, cacheable read within a TTL window instead of
-//! forwarding it to the backend.
+//! Behind the `alpha-transforms` feature. It serves the cached response for an identical, cacheable read
+//! instead of forwarding it to the backend, and evicts what writes make stale (see Write invalidation).
+//! Staleness is possible only through the documented residuals below — do not enable it where any of them
+//! would be a correctness problem:
+//!   - a cached read of a **view** or a **partitioned/inherited parent** is not evicted by a write to its
+//!     base table or child (no catalog connection to resolve `relkind`/`pg_inherits`);
+//!   - a **trigger-driven** write to another table is invisible to the analysis;
+//!   - a two-phase transaction committed through a **different proxy instance** is not seen (a same-proxy
+//!     `COMMIT PREPARED` does evict);
+//!   - a **write that bypasses the proxy** (direct-to-backend, replication) is not seen;
+//!   - it does not know server-side per-role defaults postgres never reports (`ALTER ROLE … SET
+//!     search_path`), so it stays OFF for multi-tenant / untrusted use (see below).
 //!
 //! ## What it does
 //! For a client's simple `Query` that the grammar analysis proves is a pure, replica-safe read (no
