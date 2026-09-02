@@ -181,6 +181,16 @@ pub struct PostgresCodecState {
     ///
     /// A partial chunk NEVER carries a request id — see [`PostgresDecoder::emit_partial_chunk`].
     pub partial: bool,
+    /// Sink responses only: this message COMPLETES a train that was delivered in chunks. It carries
+    /// the request id and the train's trailing messages, but everything before it already went out
+    /// in earlier, id-less partials — so to anything that wants a WHOLE train (to cache it, to
+    /// compare it, to learn a row shape from it) this is a fragment, not a result.
+    ///
+    /// Stamped by the decoder, which is the only layer that knows it chunked. A transform must not
+    /// try to re-derive it by remembering that a partial went past: responses from more than one
+    /// backend connection are merged into a single batch by the cluster sink, so a transform cannot
+    /// tell which train an earlier partial belonged to. This flag rides on the message it describes.
+    pub chunked_tail: bool,
 }
 
 impl PostgresCodecState {
@@ -190,6 +200,7 @@ impl PostgresCodecState {
             is_request: true,
             startup,
             partial: false,
+            chunked_tail: false,
         }
     }
 
@@ -199,6 +210,7 @@ impl PostgresCodecState {
             is_request: false,
             startup: false,
             partial: false,
+            chunked_tail: false,
         }
     }
 
@@ -210,6 +222,17 @@ impl PostgresCodecState {
             is_request: false,
             startup: false,
             partial: true,
+            chunked_tail: false,
+        }
+    }
+
+    /// The message that completes a train already partly delivered as chunks.
+    pub fn chunked_response_tail() -> Self {
+        Self {
+            is_request: false,
+            startup: false,
+            partial: false,
+            chunked_tail: true,
         }
     }
 }
@@ -233,8 +256,8 @@ impl PostgresCodecBuilder {
     /// ([`TransformConfig::accepts_partial_responses`](crate::transforms::TransformConfig::accepts_partial_responses)),
     /// and shotover refuses to start a chain that streams into one that cannot — so a wrong
     /// combination is a startup error naming the transform, never silent misbehaviour.
-    /// `PostgresRedactColumn`, `Tee` and `DebugPrinter` are the notable refusals; run those with
-    /// `stream_threshold_bytes: 0` until each grows a streaming-aware variant.
+    /// Each transform declares its own answer and says why, so the authoritative list is the
+    /// declarations themselves rather than a copy here that would rot.
     ///
     /// A separate method rather than a `new` argument because [`CodecBuilder::new`]'s signature is
     /// fixed by the trait.
@@ -361,6 +384,9 @@ pub struct PostgresDecoder {
     pending: VecDeque<RequestInfo>,
     /// Sink only: the raw bytes of the response train being accumulated.
     train: BytesMut,
+    /// Sink only: the train in progress has already had chunks emitted, so the message that
+    /// completes it holds only the tail of the result. Cleared when that message is emitted.
+    train_chunked: bool,
     /// Sink only: when the train started accumulating.
     train_started_at: Option<Instant>,
     /// Sink only: an error was returned for an extended protocol request, the server is
@@ -397,6 +423,7 @@ impl PostgresDecoder {
             request_rx,
             pending: VecDeque::new(),
             train: BytesMut::new(),
+            train_chunked: false,
             train_started_at: None,
             discarding_until_sync: false,
             copy_mode: None,
@@ -537,9 +564,17 @@ impl PostgresDecoder {
                     }
 
                     let info = self.pending.pop_front().unwrap();
+                    // A train that had chunks emitted completes with only its tail, and says so:
+                    // everything upstream that needs a whole train reads this off the message
+                    // instead of trying to remember what went past earlier.
+                    let state = if std::mem::take(&mut self.train_chunked) {
+                        PostgresCodecState::chunked_response_tail()
+                    } else {
+                        PostgresCodecState::response()
+                    };
                     let mut message = Message::from_bytes_at_instant(
                         self.train.split().freeze(),
-                        CodecState::Postgres(PostgresCodecState::response()),
+                        CodecState::Postgres(state),
                         self.train_started_at.take(),
                     );
                     message.set_request_id(info.id);
@@ -591,6 +626,7 @@ impl PostgresDecoder {
     /// `train_started_at` is deliberately not taken: the latency sample covers the whole train and
     /// is recorded once, by the final chunk.
     fn emit_partial_chunk(&mut self) -> Message {
+        self.train_chunked = true;
         // `mem::replace` rather than `BytesMut::split`: split would leave `train` holding only the
         // SPARE capacity of the buffer it just handed to the chunk, and because the chunk keeps
         // that buffer alive `BytesMut` cannot reclaim it — every following append would reallocate
@@ -636,6 +672,12 @@ impl PostgresDecoder {
 /// `CodecState::Dummy` carried by a dummy response.
 pub fn is_partial_response(message: &Message) -> bool {
     matches!(message.codec_state, CodecState::Postgres(state) if state.partial)
+}
+
+/// Whether `message` completes a response train that was delivered in chunks, and therefore holds
+/// only the tail of its result. See [`PostgresCodecState::chunked_tail`].
+pub fn is_chunked_train_tail(message: &Message) -> bool {
+    matches!(message.codec_state, CodecState::Postgres(state) if state.chunked_tail)
 }
 
 /// Whether `bytes` holds a whole number of backend messages, i.e. walking their length headers
@@ -914,8 +956,9 @@ mod postgres_tests {
 
     /// The streaming contract, asserted identically for every chunked train: it arrived in more
     /// than one message; every chunk but the last is an id-less partial; the last carries
-    /// `query_id` and is whole; and the chunks concatenate back to exactly the bytes the server
-    /// sent, so no byte was dropped, duplicated or reordered by chunking.
+    /// `query_id` and is marked as the TAIL of a chunked train rather than a whole response; and
+    /// the chunks concatenate back to exactly the bytes the server sent, so no byte was dropped,
+    /// duplicated or reordered by chunking.
     fn assert_chunked_train(messages: Messages, query_id: MessageId, train: &BytesMut) {
         assert!(
             messages.len() > 1,
@@ -934,6 +977,10 @@ mod postgres_tests {
         }
         assert_eq!(final_chunk.request_id(), Some(query_id));
         assert!(!is_partial(final_chunk));
+        // Everything above the codec learns "this result is not whole" from this stamp, so it must
+        // be set by the decoder itself — a transform cannot re-derive it, because the cluster sink
+        // merges responses from two backend connections into one batch.
+        assert!(is_chunked_train_tail(final_chunk));
 
         let mut rejoined = BytesMut::new();
         for message in messages {
@@ -1139,6 +1186,8 @@ mod postgres_tests {
         let mut messages = decoder.decode(&mut chunk).unwrap().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].request_id(), Some(query_id));
+        // A whole train is not a tail: nothing upstream should treat it as a fragment.
+        assert!(!is_chunked_train_tail(&messages[0]));
         match messages[0].frame().unwrap() {
             Frame::Postgres(PostgresFrame::Response(train)) => {
                 assert_eq!(train.len(), 5);
