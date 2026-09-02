@@ -227,19 +227,14 @@ impl PostgresCodecBuilder {
     /// [`PostgresDecoder::stream_threshold_bytes`], which records what this does and does not bound
     /// on its own). `0`, the default, never chunks.
     ///
-    /// # Not yet safe to enable
+    /// # Which chains may enable it
     ///
-    /// Transforms have not yet declared whether they accept partial response trains, and nothing
-    /// yet refuses a chain that needs whole ones:
-    /// * `PostgresReadCache` fails SILENTLY. It acts only on responses carrying a request id, so a
-    ///   chunked result reaches it as the final chunk alone — which still ends in
-    ///   `ReadyForQuery('I')` and is duly cached, storing the TAIL of the result under the whole
-    ///   query's key and serving it, RowDescription-less, to every later hit.
-    /// * `PostgresRedactColumn` fails closed, but incoherently: chunks after the first have no
-    ///   known row shape, and the error it synthesises inherits the partial's absent request id.
-    /// * A response-comparing `Tee` sees chunk boundaries that may differ per chain.
-    ///
-    /// Chain validation that refuses these combinations lands with the transform contract.
+    /// Every transform declares whether it can receive partial trains
+    /// ([`TransformConfig::accepts_partial_responses`](crate::transforms::TransformConfig::accepts_partial_responses)),
+    /// and shotover refuses to start a chain that streams into one that cannot — so a wrong
+    /// combination is a startup error naming the transform, never silent misbehaviour.
+    /// `PostgresRedactColumn`, `Tee` and `DebugPrinter` are the notable refusals; run those with
+    /// `stream_threshold_bytes: 0` until each grows a streaming-aware variant.
     ///
     /// A separate method rather than a `new` argument because [`CodecBuilder::new`]'s signature is
     /// fixed by the trait.

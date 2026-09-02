@@ -767,6 +767,11 @@ impl Transform for PostgresReadCache {
         for response in responses.iter_mut() {
             // Forwarded untouched, and deliberately skipped before anything parses it: a partial
             // carries no request id, so it can never be served from or matched to the cache.
+            //
+            // The skip means `capture_rendering_gucs` does not see a ParameterStatus carried in a
+            // non-final chunk. That is safe because every statement which changes a rendering GUC
+            // — SET, RESET, set_config(), DISCARD — pins the session, turning the cache off for
+            // this connection before any read can be keyed under the stale value.
             if is_partial_response(response) {
                 self.saw_partial = true;
                 continue;

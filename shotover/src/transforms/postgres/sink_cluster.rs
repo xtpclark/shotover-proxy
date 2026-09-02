@@ -106,10 +106,10 @@ pub struct PostgresSinkClusterConfig {
     /// to every backend connection this sink opens, primary and replica alike. `0`, the default,
     /// never chunks.
     ///
-    /// NOT YET SAFE TO ENABLE and so deliberately undocumented in the user guide: no transform has
-    /// declared whether it accepts partial response trains yet, and `PostgresReadCache` in
-    /// particular would silently cache truncated results. See
-    /// [`PostgresCodecBuilder::with_stream_threshold`].
+    /// Transforms that cannot handle partial trains are refused at startup with an error naming
+    /// them, rather than silently misbehaving — see
+    /// [`PostgresCodecBuilder::with_stream_threshold`]. Still undocumented in the user guide, and
+    /// still defaulted off, until the remaining steps bound memory end to end.
     #[serde(default)]
     pub stream_threshold_bytes: usize,
     /// Replica addresses to PREFER when routing reads (B2, locality). A read picks a healthy
