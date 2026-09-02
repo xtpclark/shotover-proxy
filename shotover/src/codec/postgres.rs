@@ -377,11 +377,16 @@ pub struct PostgresDecoder {
     /// than grow past this many bytes. `0` never chunks, which is the default and reproduces the
     /// unchunked behaviour exactly.
     ///
-    /// On its own this removes the single result-sized accumulation buffer and the repeated
-    /// doublings that grew it — it does NOT yet bound total in-flight memory, because
-    /// [`crate::transforms::postgres::exchange`] collects every chunk of a train before returning
-    /// (partials carry no request id, so nothing satisfies its drain loop until the final chunk).
-    /// Bounding that is the bounded sink channel's job.
+    /// On its own this takes peak RSS for a large result from roughly 6x the result size down to
+    /// roughly 1.6x, by removing the result-sized accumulation buffer and the repeated doublings
+    /// that grew it (measured on a 442 MB result: 2748 MB peak unchunked, 740-836 MB at a 1 MiB
+    /// threshold, 658 MB at 64 KiB).
+    ///
+    /// It does NOT yet bound memory to O(threshold). The remaining ~1.6x is the chunks themselves:
+    /// [`crate::transforms::postgres::exchange`] collects every chunk of a train before returning,
+    /// because partials carry no request id and so nothing satisfies its drain loop until the final
+    /// chunk — plus the source encoder's copy. Reaching O(threshold) needs the chain to forward
+    /// partials incrementally and a bounded sink channel.
     stream_threshold_bytes: usize,
 }
 
