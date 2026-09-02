@@ -1368,11 +1368,11 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
                 replica_safe = false;
                 pins_session = true;
             }
-            // DISCARD ALL/PLANS/TEMP resets search_path and the rendering GUCs, so a later read on
-            // this connection renders differently from one on a connection that never discarded.
-            // It reaches the cache only as ParameterStatus messages inside the response train, and
-            // a train large enough to be chunked can hide them in a partial the cache skips, so
-            // pinning the session here is what keeps the cache key honest either way.
+            // DISCARD resets state that belongs to one backend: TEMP drops this session's
+            // temporary tables, PLANS its cached plans, SEQUENCES its sequence state, ALL of those
+            // plus prepared statements, cursors and GUCs. So it must run on the node the session
+            // keeps using, and a later read that depends on the reset must not diverge to a replica
+            // that never saw it. Previously unmodelled, and so replica-eligible.
             NodeEnum::DiscardStmt(_) => {
                 replica_safe = false;
                 pins_session = true;
@@ -1657,9 +1657,8 @@ mod tests {
             "LISTEN channel",
             "DECLARE c CURSOR FOR SELECT * FROM t",
             "CREATE TEMP TABLE tmp (a int)",
-            // DISCARD resets search_path and the rendering GUCs. The server announces that only as
-            // ParameterStatus inside the response train, which a chunked train can hide from the
-            // cache, so the pin is what keeps a later read from being keyed under the old GUCs.
+            // DISCARD's reset is per backend (temp tables, cached plans, sequence state,
+            // prepared statements, GUCs), so the session must pin to the node that ran it.
             "DISCARD ALL",
             "DISCARD PLANS",
             "DISCARD TEMP",
