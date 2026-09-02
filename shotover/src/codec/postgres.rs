@@ -385,7 +385,12 @@ pub struct PostgresDecoder {
     /// Sink only: the raw bytes of the response train being accumulated.
     train: BytesMut,
     /// Sink only: the train in progress has already had chunks emitted, so the message that
-    /// completes it holds only the tail of the result. Cleared when that message is emitted.
+    /// completes it holds only the tail of the result.
+    ///
+    /// Set only by [`PostgresDecoder::emit_partial_chunk`] and cleared only where the completing
+    /// message is built, in the same `mem::take` that reads it. That single site is load-bearing:
+    /// a second path that emitted a completing message without going through it would leave the
+    /// tail unstamped, and everything above the codec would treat a fragment as a whole result.
     train_chunked: bool,
     /// Sink only: when the train started accumulating.
     train_started_at: Option<Instant>,
@@ -521,13 +526,20 @@ impl PostgresDecoder {
                 }
             };
 
-            // Flush what has accumulated BEFORE appending a message that would push the train
-            // past the threshold, so the train buffer never has to grow beyond it and each chunk
-            // pins only its own allocation. A non-empty train is always an incomplete one (the
-            // completion arm empties it), so no check against `train_action` is needed here. Never
-            // while the server is discarding until a Sync: those requests are answered by dummies
-            // below, and a Sync train is not streamable anyway.
-            if self.stream_threshold_bytes > 0
+            // Decided before the flush so that a message which COMPLETES the train can never
+            // trigger one. A train that only crosses the threshold on its terminator does not need
+            // splitting, and splitting it would emit a pointless chunk and stamp the result as a
+            // chunked tail — making a result that fitted perfectly well uncacheable. `train_action`
+            // reads none of the state the flush touches, so deciding it first is free.
+            let action = train_action(head_kind, tag, auth_code, self.copy_mode);
+
+            // Flush what has accumulated BEFORE appending a message that would push the train past
+            // the threshold, so the train buffer never has to grow beyond it and each chunk pins
+            // only its own allocation. Never while the server is discarding until a Sync: those
+            // requests are answered by dummies below, and a Sync train is not streamable anyway.
+            if matches!(action, TrainAction::Continue)
+                && self.stream_threshold_bytes > 0
+                // Not an empty chunk when the train's very first message is itself over-sized.
                 && !self.train.is_empty()
                 && self.train.len() + bytes.len() > self.stream_threshold_bytes
                 && head_streamable
@@ -544,7 +556,6 @@ impl PostgresDecoder {
             }
             self.train.extend_from_slice(&bytes);
 
-            let action = train_action(head_kind, tag, auth_code, self.copy_mode);
             match action {
                 TrainAction::Continue => {}
                 TrainAction::Complete | TrainAction::CompleteAndDiscard => {
@@ -1539,6 +1550,41 @@ mod postgres_tests {
     #[test]
     fn test_sink_discard_until_sync_unaffected_by_streaming() {
         assert_error_skips_to_sync(sink_codec_with_threshold(1));
+    }
+
+    /// Streaming: a train that only crosses the threshold on its TERMINATING message is not
+    /// split. Splitting it would emit a pointless chunk and stamp the result as a chunked tail,
+    /// making a result that fitted perfectly well uncacheable upstream.
+    #[test]
+    fn test_sink_does_not_chunk_on_the_terminating_message() {
+        let mut backend = vec![row_description("n")];
+        backend.extend((0..20).map(|i| BackendMessage::DataRow {
+            values: vec![Some(Bytes::from(i.to_string()))],
+        }));
+        backend.push(BackendMessage::CommandComplete {
+            tag: "SELECT 20".to_owned(),
+        });
+        // Everything up to the terminator fits the threshold exactly, so only the ReadyForQuery
+        // that ends the train can cross it.
+        let threshold = encode_backend(backend.clone()).len();
+        backend.push(BackendMessage::ReadyForQuery { status: b'I' });
+        let train = encode_backend(backend);
+        assert!(train.len() > threshold);
+
+        let (mut decoder, mut encoder) = sink_codec_with_threshold(threshold);
+        let mut sent = BytesMut::new();
+        let query = query_message("SELECT n FROM t");
+        let query_id = query.id();
+        encoder.encode(vec![query], &mut sent).unwrap();
+
+        let mut response = train.clone();
+        let messages = decoder.decode(&mut response).unwrap().unwrap();
+
+        assert_eq!(messages.len(), 1, "the terminator must not split the train");
+        assert_eq!(messages[0].request_id(), Some(query_id));
+        assert!(!is_partial(&messages[0]));
+        assert!(!is_chunked_train_tail(&messages[0]));
+        assert_eq!(message_bytes(messages.into_iter().next().unwrap()), train);
     }
 
     /// Streaming: a startup train is never chunked, however low the threshold. Auth trains are
