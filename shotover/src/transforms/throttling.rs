@@ -152,12 +152,12 @@ impl Transform for RequestThrottling {
             // Track the transaction state from real responses' ReadyForQuery (postgres only), so a
             // later throttle rejection can mirror it (review F9). The message_type() check is cheap and
             // avoids parsing non-postgres responses.
-            // Skipped before the scan, not by it: the scan parses, and the parse is retained
-            // (see `TransformConfig::accepts_partial_responses`).
+            // Partials are skipped before the lookup, not by it: a partial carries no record of
+            // a ReadyForQuery, so asking would fall back to parsing the chunk — the cost streaming
+            // exists to avoid (see `TransformConfig::accepts_partial_responses`).
             #[cfg(feature = "postgres")]
-            if response.message_type() == MessageType::Postgres
-                && !crate::codec::postgres::is_partial_response(response)
-                && let Some(status) = postgres_trailing_rfq_status(response)
+            if !crate::codec::postgres::is_partial_response(response)
+                && let Some(status) = crate::codec::postgres::trailing_ready_status(response)
             {
                 self.last_rfq_status = status;
             }
@@ -170,21 +170,6 @@ impl Transform for RequestThrottling {
 
         Ok(responses)
     }
-}
-
-/// The status byte of the last ReadyForQuery in a postgres response, if any.
-#[cfg(feature = "postgres")]
-fn postgres_trailing_rfq_status(response: &mut Message) -> Option<u8> {
-    use crate::frame::Frame;
-    use crate::frame::postgres::{BackendMessage, PostgresFrame};
-    if let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() {
-        for message in messages.iter().rev() {
-            if let BackendMessage::ReadyForQuery { status } = message {
-                return Some(*status);
-            }
-        }
-    }
-    None
 }
 
 /// Rewrites the ReadyForQuery status of a postgres backpressure response so it reflects the session's

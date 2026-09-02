@@ -24,7 +24,7 @@
 
 use crate::codec::{
     CodecBuilder, Direction,
-    postgres::{PostgresCodecBuilder, is_partial_response},
+    postgres::{PostgresCodecBuilder, is_partial_response, trailing_ready_status},
 };
 use crate::connection::SinkConnection;
 use crate::frame::postgres::{
@@ -1374,18 +1374,6 @@ fn classify_request(request: &mut Message) -> RequestRoute {
         Some(Frame::Dummy) => RequestRoute::Neutral,
         _ => RequestRoute::Primary,
     }
-}
-
-/// Returns the status byte of the last ReadyForQuery in a response, if any.
-fn trailing_ready_status(response: &mut Message) -> Option<u8> {
-    if let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() {
-        for message in messages.iter().rev() {
-            if let BackendMessage::ReadyForQuery { status } = message {
-                return Some(*status);
-            }
-        }
-    }
-    None
 }
 
 /// Originates authentication to a backend using a configured password. Supports trust and

@@ -95,7 +95,7 @@
 //!   cannot size the proxy's memory (F2). NOTE the proxy already buffers a whole response train in
 //!   memory regardless of the cache (a separate architectural limit), so keep `max_bytes` modest.
 
-use crate::codec::postgres::{is_chunked_train_tail, is_partial_response};
+use crate::codec::postgres::{is_chunked_train_tail, is_partial_response, trailing_ready_status};
 use crate::frame::postgres::{
     BackendMessage, FrontendMessage, PostgresFrame, SqlAnalysis, TxnControl, analyze_sql,
     is_writing_function,
@@ -1105,18 +1105,6 @@ fn looks_volatile(query: &str) -> bool {
     ];
     let lowered = query.to_ascii_lowercase();
     MARKERS.iter().any(|m| lowered.contains(m))
-}
-
-/// The status byte of the last ReadyForQuery in a response, if any.
-fn trailing_ready_status(response: &mut Message) -> Option<u8> {
-    if let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() {
-        for message in messages.iter().rev() {
-            if let BackendMessage::ReadyForQuery { status } = message {
-                return Some(*status);
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]

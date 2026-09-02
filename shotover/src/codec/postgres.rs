@@ -1,7 +1,8 @@
 use super::{CodecWriteError, Direction, message_latency};
 use crate::codec::{CodecBuilder, CodecReadError, CodecState};
 use crate::frame::postgres::{
-    CANCEL_REQUEST_CODE, GSSENC_REQUEST_CODE, SSL_REQUEST_CODE, message_wire_length,
+    BackendMessage, CANCEL_REQUEST_CODE, GSSENC_REQUEST_CODE, PostgresFrame, SSL_REQUEST_CODE,
+    message_wire_length,
 };
 use crate::frame::{Frame, MessageType};
 use crate::message::{Encodable, Message, MessageId, Messages};
@@ -166,6 +167,22 @@ pub async fn sink_tls_prologue(stream: &mut TcpStream) -> Result<()> {
     }
 }
 
+/// What the decoder observed of a response's trailing ReadyForQuery.
+///
+/// Three states, not `Option<u8>`, because `None` would have to mean both "this train has no
+/// ReadyForQuery" and "nobody recorded one" — and a caller that read the second as the first would
+/// silently mis-report a transaction as idle.
+#[derive(Debug, Clone, PartialEq, Copy)]
+pub enum TrailingReadyStatus {
+    /// Not recorded: the message was not produced by the sink decoder (a transform built it from a
+    /// frame), or its frame has been modified since. The answer must be parsed out.
+    Unknown,
+    /// The decoder read every message and none of them was a ReadyForQuery.
+    Absent,
+    /// The status byte of the last ReadyForQuery the decoder saw.
+    Present(u8),
+}
+
 /// Per message connection level state needed to parse and reencode postgres messages.
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub struct PostgresCodecState {
@@ -191,6 +208,9 @@ pub struct PostgresCodecState {
     /// backend connection are merged into a single batch by the cluster sink, so a transform cannot
     /// tell which train an earlier partial belonged to. This flag rides on the message it describes.
     pub chunked_tail: bool,
+    /// What the decoder saw of this response's trailing ReadyForQuery, so that asking for it costs
+    /// a field read rather than a parse of the whole train. See [`trailing_ready_status`].
+    pub trailing_ready_status: TrailingReadyStatus,
 }
 
 impl PostgresCodecState {
@@ -201,6 +221,7 @@ impl PostgresCodecState {
             startup,
             partial: false,
             chunked_tail: false,
+            trailing_ready_status: TrailingReadyStatus::Unknown,
         }
     }
 
@@ -211,6 +232,7 @@ impl PostgresCodecState {
             startup: false,
             partial: false,
             chunked_tail: false,
+            trailing_ready_status: TrailingReadyStatus::Unknown,
         }
     }
 
@@ -223,6 +245,10 @@ impl PostgresCodecState {
             startup: false,
             partial: true,
             chunked_tail: false,
+            // A ReadyForQuery always completes a train, so it is never inside a partial. Left
+            // Unknown rather than Absent because every caller skips partials before asking, so
+            // claiming knowledge here would buy nothing and could only ever be wrong.
+            trailing_ready_status: TrailingReadyStatus::Unknown,
         }
     }
 
@@ -233,7 +259,14 @@ impl PostgresCodecState {
             startup: false,
             partial: false,
             chunked_tail: true,
+            trailing_ready_status: TrailingReadyStatus::Unknown,
         }
+    }
+
+    /// Records what the decoder saw of this response's trailing ReadyForQuery.
+    pub fn with_trailing_ready_status(mut self, status: TrailingReadyStatus) -> Self {
+        self.trailing_ready_status = status;
+        self
     }
 }
 
@@ -384,6 +417,10 @@ pub struct PostgresDecoder {
     pending: VecDeque<RequestInfo>,
     /// Sink only: the raw bytes of the response train being accumulated.
     train: BytesMut,
+    /// Sink only: the status byte of the last ReadyForQuery appended to the train in progress.
+    /// Taken when the train completes, so the completing message can carry it and nothing upstream
+    /// has to parse a whole result to learn one byte.
+    train_ready_status: Option<u8>,
     /// Sink only: the train in progress has already had chunks emitted, so the message that
     /// completes it holds only the tail of the result.
     ///
@@ -428,6 +465,7 @@ impl PostgresDecoder {
             request_rx,
             pending: VecDeque::new(),
             train: BytesMut::new(),
+            train_ready_status: None,
             train_chunked: false,
             train_started_at: None,
             discarding_until_sync: false,
@@ -504,6 +542,12 @@ impl PostgresDecoder {
             } else {
                 None
             };
+            // A ReadyForQuery is tag, length, then one status byte.
+            let ready_status = if tag == b'Z' && length >= 6 {
+                Some(src[5])
+            } else {
+                None
+            };
             let bytes = src.split_to(length);
             tracing::debug!(
                 "{}: incoming postgres message:\n{}",
@@ -519,7 +563,14 @@ impl PostgresDecoder {
                     // Forward each as its own unrequested response message.
                     messages.push(Message::from_bytes_at_instant(
                         bytes.freeze(),
-                        CodecState::Postgres(PostgresCodecState::response()),
+                        CodecState::Postgres(
+                            PostgresCodecState::response().with_trailing_ready_status(
+                                match ready_status {
+                                    Some(status) => TrailingReadyStatus::Present(status),
+                                    None => TrailingReadyStatus::Absent,
+                                },
+                            ),
+                        ),
                         Some(received_at),
                     ));
                     continue;
@@ -555,6 +606,9 @@ impl PostgresDecoder {
                 self.train_started_at = Some(received_at);
             }
             self.train.extend_from_slice(&bytes);
+            if let Some(status) = ready_status {
+                self.train_ready_status = Some(status);
+            }
 
             match action {
                 TrainAction::Continue => {}
@@ -578,11 +632,19 @@ impl PostgresDecoder {
                     // A train that had chunks emitted completes with only its tail, and says so:
                     // everything upstream that needs a whole train reads this off the message
                     // instead of trying to remember what went past earlier.
+                    // Stamped on EVERY train completion, including the CompleteAndDiscard 'E'
+                    // tail: a decoded train that reached a transform without its status recorded
+                    // would send that transform back to parsing the whole result.
+                    let status = match self.train_ready_status.take() {
+                        Some(status) => TrailingReadyStatus::Present(status),
+                        None => TrailingReadyStatus::Absent,
+                    };
                     let state = if std::mem::take(&mut self.train_chunked) {
                         PostgresCodecState::chunked_response_tail()
                     } else {
                         PostgresCodecState::response()
-                    };
+                    }
+                    .with_trailing_ready_status(status);
                     let mut message = Message::from_bytes_at_instant(
                         self.train.split().freeze(),
                         CodecState::Postgres(state),
@@ -683,6 +745,39 @@ impl PostgresDecoder {
 /// `CodecState::Dummy` carried by a dummy response.
 pub fn is_partial_response(message: &Message) -> bool {
     matches!(message.codec_state, CodecState::Postgres(state) if state.partial)
+}
+
+/// The status byte of the last ReadyForQuery in a postgres response, or `None` if it has none.
+///
+/// Reads what the decoder recorded where there is a record, which is the entire point: the
+/// alternative is parsing a whole response train — for a large result, millions of typed messages
+/// that `Message::frame` then retains alongside the raw bytes — to learn one byte. Non-postgres
+/// messages and dummies answer `None` without being touched.
+///
+/// The fallback parse is not the cost this avoids: a message with no record either was built from
+/// a frame by a transform (so it is already parsed, and reading the status off it is free) or has
+/// been modified since decoding (same), and both are small — a synthesised error, a backpressure
+/// reply. A large decoded train always carries its record.
+pub fn trailing_ready_status(response: &mut Message) -> Option<u8> {
+    if let CodecState::Postgres(state) = response.codec_state {
+        match state.trailing_ready_status {
+            TrailingReadyStatus::Present(status) => return Some(status),
+            TrailingReadyStatus::Absent => return None,
+            TrailingReadyStatus::Unknown => {}
+        }
+    } else {
+        // A dummy, or another protocol entirely: never parse it looking for postgres messages.
+        return None;
+    }
+
+    if let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() {
+        for message in messages.iter().rev() {
+            if let BackendMessage::ReadyForQuery { status } = message {
+                return Some(*status);
+            }
+        }
+    }
+    None
 }
 
 /// Whether `message` completes a response train that was delivered in chunks, and therefore holds
@@ -992,6 +1087,11 @@ mod postgres_tests {
         // be set by the decoder itself — a transform cannot re-derive it, because the cluster sink
         // merges responses from two backend connections into one batch.
         assert!(is_chunked_train_tail(final_chunk));
+        // The ReadyForQuery that ends the train is in this chunk, so its status is recorded here.
+        assert_eq!(
+            final_chunk.codec_state.as_postgres().trailing_ready_status,
+            TrailingReadyStatus::Present(b'I')
+        );
 
         let mut rejoined = BytesMut::new();
         for message in messages {
@@ -1550,6 +1650,99 @@ mod postgres_tests {
     #[test]
     fn test_sink_discard_until_sync_unaffected_by_streaming() {
         assert_error_skips_to_sync(sink_codec_with_threshold(1));
+    }
+
+    /// The decoder records the trailing ReadyForQuery status as it closes a train, so asking for it
+    /// costs a field read. Without the record every caller parses the whole result to learn a byte.
+    #[test]
+    fn test_sink_records_trailing_ready_status() {
+        let (mut decoder, mut encoder) = sink_codec();
+        let mut sent = BytesMut::new();
+        encoder
+            .encode(vec![query_message("SELECT n FROM t")], &mut sent)
+            .unwrap();
+
+        let mut response = encode_backend(vec![
+            row_description("n"),
+            BackendMessage::DataRow {
+                values: vec![Some(Bytes::from_static(b"1"))],
+            },
+            BackendMessage::CommandComplete {
+                tag: "SELECT 1".to_owned(),
+            },
+            BackendMessage::ReadyForQuery { status: b'T' },
+        ]);
+        let mut messages = decoder.decode(&mut response).unwrap().unwrap();
+
+        assert_eq!(
+            messages[0].codec_state.as_postgres().trailing_ready_status,
+            TrailingReadyStatus::Present(b'T')
+        );
+        assert_eq!(trailing_ready_status(&mut messages[0]), Some(b'T'));
+    }
+
+    /// A train with no ReadyForQuery records that fact, rather than leaving callers unable to tell
+    /// "no ReadyForQuery" from "nobody looked" — which would have them parse it to find out.
+    #[test]
+    fn test_sink_records_absent_ready_status() {
+        let (mut decoder, mut encoder) = sink_codec();
+        let mut sent = BytesMut::new();
+        let parse = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
+            FrontendMessage::Parse {
+                statement_name: "".to_owned(),
+                query: "SELECT 1".to_owned(),
+                parameter_data_types: vec![],
+            },
+        )));
+        encoder.encode(vec![parse], &mut sent).unwrap();
+
+        let mut response = encode_backend(vec![BackendMessage::ParseComplete]);
+        let mut messages = decoder.decode(&mut response).unwrap().unwrap();
+
+        assert_eq!(
+            messages[0].codec_state.as_postgres().trailing_ready_status,
+            TrailingReadyStatus::Absent
+        );
+        assert_eq!(trailing_ready_status(&mut messages[0]), None);
+    }
+
+    /// THE safety property: a transform that rewrites a ReadyForQuery must not leave the decoder's
+    /// record readable, or the next reader gets the status the response USED to carry.
+    /// `RequestThrottling::set_postgres_rfq_status` does exactly this rewrite.
+    #[test]
+    fn test_trailing_ready_status_is_invalidated_by_a_frame_change() {
+        let (mut decoder, mut encoder) = sink_codec();
+        let mut sent = BytesMut::new();
+        encoder
+            .encode(vec![query_message("SELECT n FROM t")], &mut sent)
+            .unwrap();
+
+        let mut response = encode_backend(vec![
+            BackendMessage::CommandComplete {
+                tag: "SELECT 0".to_owned(),
+            },
+            BackendMessage::ReadyForQuery { status: b'I' },
+        ]);
+        let mut messages = decoder.decode(&mut response).unwrap().unwrap();
+        assert_eq!(trailing_ready_status(&mut messages[0]), Some(b'I'));
+
+        match messages[0].frame().unwrap() {
+            Frame::Postgres(PostgresFrame::Response(train)) => {
+                for message in train.iter_mut() {
+                    if let BackendMessage::ReadyForQuery { status } = message {
+                        *status = b'T';
+                    }
+                }
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+        messages[0].invalidate_cache();
+
+        assert_eq!(
+            trailing_ready_status(&mut messages[0]),
+            Some(b'T'),
+            "the rewritten status must be read, not the decoder's record of the original"
+        );
     }
 
     /// Streaming: a train that only crosses the threshold on its TERMINATING message is not

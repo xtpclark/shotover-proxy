@@ -467,7 +467,13 @@ impl Message {
     /// * Clears caches used by getter methods
     /// * If `Message::frame()` has been called the message bytes must be regenerated from the `Frame` when sent to the DB
     pub fn invalidate_cache(&mut self) {
-        // TODO: clear message details cache fields if we ever add any
+        // The frame is now the source of truth, so anything the decoder recorded about the original
+        // bytes is stale — a transform that rewrites a ReadyForQuery status must not leave the old
+        // one readable.
+        #[cfg(feature = "postgres")]
+        if let CodecState::Postgres(state) = &mut self.codec_state {
+            state.trailing_ready_status = crate::codec::postgres::TrailingReadyStatus::Unknown;
+        }
 
         self.inner = self.inner.take().map(|x| x.invalidate_cache());
     }
