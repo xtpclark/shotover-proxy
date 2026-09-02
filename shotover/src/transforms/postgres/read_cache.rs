@@ -12,23 +12,32 @@
 //! one Message) keyed by `(database, user, query text)`. A later identical read from any connection is
 //! answered from that cache — the backend is never contacted — until the entry's TTL elapses.
 //!
-//! ## What it deliberately does NOT do — the SPIKE's findings
+//! ## UNSAFE for multi-tenant / untrusted / per-connection-search_path use
+//! This is a convenience cache, NOT a correctness boundary. It is keyed by (database, user, query) and
+//! assumes DEFAULT session state. It hardens against the state it CAN see — a session-pinning statement
+//! via the simple OR extended protocol (`SET search_path`/`SET role`/PREPARE/temp tables) and a
+//! state-affecting startup parameter (`options`/`search_path`/`role`/`session_authorization`) turn the
+//! cache OFF for that connection — but it CANNOT see server-side per-role defaults (`ALTER ROLE … SET
+//! search_path`). Do not enable it for untrusted clients or any deployment that relies on per-role or
+//! otherwise-invisible search_path/role customisation: a cached result could then be served across
+//! tenants. (Reviewer F1.)
+//!
+//! ## What it deliberately does NOT do — the SPIKE's finding
 //! - **No write invalidation (the hard part).** A write to a table does NOT evict cached reads of that
 //!   table. Staleness is bounded ONLY by `ttl_ms`. Coherent invalidation needs per-query table-
 //!   dependency analysis plus write interception (or WAL/trigger/LISTEN-NOTIFY sourced invalidation),
 //!   which is the real work and is deferred. This is why it is keyed by TTL, not correctness.
-//! - **Session state.** The cache is keyed by user+database only, so it assumes DEFAULT session state.
-//!   Any statement the analyzer flags as session-pinning (`SET search_path`, `SET role`, `PREPARE`,
-//!   temp tables, …) turns the cache OFF for that connection (`session_stateful` latch), because a
-//!   changed search_path/role would make a shared cached result wrong. A deployment that customises
-//!   search_path per connection should not enable this cache.
-//! - **Simple query only.** Extended-protocol (Parse/Bind/Execute) reads are never cached.
-//! - **Reads inside a transaction are never cached** (the cached ReadyForQuery status would be wrong,
-//!   and the read is not repeatable-read-isolated anyway).
 //!
-//! In short: this proves the mechanics (capture a response train, replay it to a later identical read,
-//! bound it by TTL, gate it to safe queries) and isolates the one genuinely hard problem —
-//! invalidation — as the next step.
+//! ## Bounds and gates
+//! - **Simple query only.** Extended-protocol (Parse/Bind/Execute) reads are never cached.
+//! - **Never inside a transaction.** Transaction boundaries are tracked from the REQUEST stream too, so
+//!   a pipelined `[BEGIN, SELECT, COMMIT]` is not mistaken for idle (F7); a train is stored only if its
+//!   trailing ReadyForQuery is idle ('I'), never 'T'.
+//! - **Never an error.** A train containing an ErrorResponse is not cached, so a transient error is not
+//!   replayed to other sessions (F8).
+//! - **Bounded by BOTH `max_entries` AND `max_bytes`** (estimated payload), so a few large results
+//!   cannot size the proxy's memory (F2). NOTE the proxy already buffers a whole response train in
+//!   memory regardless of the cache (a separate architectural limit), so keep `max_bytes` modest.
 
 use crate::frame::postgres::{BackendMessage, FrontendMessage, PostgresFrame, analyze_sql};
 use crate::frame::{Frame, MessageType};
@@ -59,10 +68,18 @@ pub struct PostgresReadCacheConfig {
     /// entries are skipped rather than growing without bound.
     #[serde(default = "default_max_entries")]
     pub max_entries: usize,
+    /// Upper bound on TOTAL cached bytes (estimated from response payloads). Without it a few large
+    /// result sets from an unprivileged client size the proxy's memory (review F2). Default 64 MiB.
+    #[serde(default = "default_max_bytes")]
+    pub max_bytes: usize,
 }
 
 fn default_max_entries() -> usize {
     1024
+}
+
+fn default_max_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 const NAME: &str = "PostgresReadCache";
@@ -82,7 +99,8 @@ impl TransformConfig for PostgresReadCacheConfig {
             name: self.name.clone(),
             ttl: Duration::from_millis(self.ttl_ms),
             max_entries: self.max_entries,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            max_bytes: self.max_bytes,
+            cache: Arc::new(Mutex::new(CacheStore::default())),
             hits: counter!("shotover_postgres_read_cache_hits_count", "chain" => chain.clone(), "transform" => NAME),
             misses: counter!("shotover_postgres_read_cache_misses_count", "chain" => chain, "transform" => NAME),
         }))
@@ -101,12 +119,26 @@ impl TransformConfig for PostgresReadCacheConfig {
     }
 }
 
-type SharedCache = Arc<Mutex<HashMap<CacheKey, (Instant, Message)>>>;
+struct CacheEntry {
+    expiry: Instant,
+    response: Message,
+    size: usize,
+}
+
+/// The shared cache plus a running byte total, so the store can be bounded by bytes as well as entries.
+#[derive(Default)]
+struct CacheStore {
+    entries: HashMap<CacheKey, CacheEntry>,
+    total_bytes: usize,
+}
+
+type SharedCache = Arc<Mutex<CacheStore>>;
 
 pub struct PostgresReadCacheBuilder {
     name: String,
     ttl: Duration,
     max_entries: usize,
+    max_bytes: usize,
     cache: SharedCache,
     hits: Counter,
     misses: Counter,
@@ -117,6 +149,7 @@ impl TransformBuilder for PostgresReadCacheBuilder {
         Box::new(PostgresReadCache {
             ttl: self.ttl,
             max_entries: self.max_entries,
+            max_bytes: self.max_bytes,
             cache: self.cache.clone(),
             hits: self.hits.clone(),
             misses: self.misses.clone(),
@@ -139,6 +172,7 @@ impl TransformBuilder for PostgresReadCacheBuilder {
 pub struct PostgresReadCache {
     ttl: Duration,
     max_entries: usize,
+    max_bytes: usize,
     cache: SharedCache,
     hits: Counter,
     misses: Counter,
@@ -156,6 +190,7 @@ pub struct PostgresReadCache {
 enum Kind {
     Startup(Vec<(String, String)>),
     Query(String),
+    Parse(String),
     Other,
 }
 
@@ -172,6 +207,10 @@ impl Transform for PostgresReadCache {
         let mut serve_from_cache: MessageIdMap<Message> = MessageIdMap::default();
         let mut cache_on_response: MessageIdMap<CacheKey> = MessageIdMap::default();
 
+        // Transaction state tracked across THIS batch from the request stream, seeded from the
+        // session's last-seen ReadyForQuery, so a pipelined [BEGIN, SELECT, COMMIT] is never treated as
+        // idle (review F7).
+        let mut in_txn = self.in_transaction;
         for request in &mut chain_state.requests {
             let rid = request.id();
             let kind = match request.frame() {
@@ -182,6 +221,9 @@ impl Transform for PostgresReadCache {
                 Some(Frame::Postgres(PostgresFrame::Request(FrontendMessage::Query { query }))) => {
                     Kind::Query(query.clone())
                 }
+                Some(Frame::Postgres(PostgresFrame::Request(FrontendMessage::Parse {
+                    query, ..
+                }))) => Kind::Parse(query.clone()),
                 _ => Kind::Other,
             };
             match kind {
@@ -190,8 +232,24 @@ impl Transform for PostgresReadCache {
                         match name.as_str() {
                             "user" => self.user = Some(value),
                             "database" => self.database = Some(value),
+                            // Any per-connection state customisation the cache key cannot capture turns
+                            // the cache off for this session — a custom search_path/role would make a
+                            // shared cached result wrong (review F1).
+                            "options" | "search_path" | "role" | "session_authorization"
+                                if !value.is_empty() =>
+                            {
+                                self.session_stateful = true;
+                            }
                             _ => {}
                         }
+                    }
+                }
+                Kind::Parse(query) => {
+                    // A session-state statement issued via the EXTENDED protocol (how every major driver
+                    // sends SET) must also turn the cache off; the simple-query latch alone missed it and
+                    // leaked another session's search_path (review F1).
+                    if analyze_sql(&query).pins_session {
+                        self.session_stateful = true;
                     }
                 }
                 Kind::Query(query) => {
@@ -202,10 +260,12 @@ impl Transform for PostgresReadCache {
                         self.session_stateful = true;
                         continue;
                     }
-                    if self.session_stateful
-                        || self.in_transaction
-                        || !analysis.replica_safe
-                        || looks_volatile(&query)
+                    if is_txn_begin(&query) {
+                        in_txn = true;
+                    } else if is_txn_end(&query) {
+                        in_txn = false;
+                    }
+                    if self.session_stateful || in_txn || !analysis.replica_safe || looks_volatile(&query)
                     {
                         continue;
                     }
@@ -240,8 +300,13 @@ impl Transform for PostgresReadCache {
                     // with the cached response train.
                     *response = cached;
                 } else if let Some(key) = cache_on_response.remove(&rid) {
-                    // A cache miss just answered by the backend: remember its response train.
-                    self.cache_put(key, response.clone());
+                    // A cache miss just answered by the backend: remember it ONLY if it is a clean,
+                    // self-contained, idle result — no ErrorResponse (F8) and a trailing
+                    // ReadyForQuery('I'), never an in-transaction train ending in 'T' (F7).
+                    if response_is_cacheable(response) {
+                        let size = estimate_response_size(response);
+                        self.cache_put(key, response.clone(), size);
+                    }
                 }
             }
         }
@@ -251,26 +316,110 @@ impl Transform for PostgresReadCache {
 
 impl PostgresReadCache {
     fn cache_get(&self, key: &CacheKey) -> Option<Message> {
-        let mut cache = self.cache.lock().ok()?;
-        let expired = matches!(cache.get(key), Some((expiry, _)) if *expiry <= Instant::now());
-        if expired {
-            cache.remove(key);
-            return None;
+        let mut store = self.cache.lock().ok()?;
+        match store.entries.get(key) {
+            Some(entry) if entry.expiry <= Instant::now() => {
+                if let Some(removed) = store.entries.remove(key) {
+                    store.total_bytes = store.total_bytes.saturating_sub(removed.size);
+                }
+                None
+            }
+            Some(entry) => Some(entry.response.clone()),
+            None => None,
         }
-        cache.get(key).map(|(_, response)| response.clone())
     }
 
-    fn cache_put(&self, key: CacheKey, response: Message) {
-        if let Ok(mut cache) = self.cache.lock() {
-            let now = Instant::now();
-            if cache.len() >= self.max_entries {
-                cache.retain(|_, (expiry, _)| *expiry > now);
-                if cache.len() >= self.max_entries {
-                    return;
-                }
-            }
-            cache.insert(key, (now + self.ttl, response));
+    fn cache_put(&self, key: CacheKey, response: Message, size: usize) {
+        // Never cache an unmeasurable result, or one larger than the whole budget.
+        if size == 0 || size > self.max_bytes {
+            return;
         }
+        if let Ok(mut store) = self.cache.lock() {
+            let now = Instant::now();
+            // Prune expired entries first, reclaiming their bytes.
+            let mut freed = 0usize;
+            store.entries.retain(|_, e| {
+                if e.expiry > now {
+                    true
+                } else {
+                    freed += e.size;
+                    false
+                }
+            });
+            store.total_bytes = store.total_bytes.saturating_sub(freed);
+            // Replacing an existing key reclaims its bytes before we re-count.
+            if let Some(old) = store.entries.remove(&key) {
+                store.total_bytes = store.total_bytes.saturating_sub(old.size);
+            }
+            // Bounded by BOTH entries and bytes; when full, skip this entry rather than evict others.
+            if store.entries.len() >= self.max_entries || store.total_bytes + size > self.max_bytes {
+                return;
+            }
+            store.total_bytes += size;
+            store.entries.insert(
+                key,
+                CacheEntry {
+                    expiry: now + self.ttl,
+                    response,
+                    size,
+                },
+            );
+        }
+    }
+}
+
+/// True if a query begins a transaction.
+fn is_txn_begin(query: &str) -> bool {
+    let q = query.trim_start().to_ascii_lowercase();
+    q.starts_with("begin") || q.starts_with("start transaction")
+}
+
+/// True if a query ends a transaction.
+fn is_txn_end(query: &str) -> bool {
+    let q = query.trim_start().to_ascii_lowercase();
+    q.starts_with("commit") || q.starts_with("rollback") || q.starts_with("end") || q.starts_with("abort")
+}
+
+/// A response train may be cached only if it is a clean idle result: it contains NO ErrorResponse (a
+/// cached error would be replayed to other sessions — F8) and its trailing ReadyForQuery reports idle
+/// ('I'), never an in-transaction 'T'/'E' (F7).
+fn response_is_cacheable(response: &mut Message) -> bool {
+    if let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() {
+        let mut trailing_idle = false;
+        for message in messages.iter() {
+            match message {
+                BackendMessage::ErrorResponse { .. } => return false,
+                BackendMessage::ReadyForQuery { status } => trailing_idle = *status == b'I',
+                _ => {}
+            }
+        }
+        trailing_idle
+    } else {
+        false
+    }
+}
+
+/// Estimates a response train's payload size (dominated by DataRow values) for the byte bound.
+fn estimate_response_size(response: &mut Message) -> usize {
+    match response.frame() {
+        Some(Frame::Postgres(PostgresFrame::Response(messages))) => {
+            messages.iter().map(backend_message_size).sum()
+        }
+        _ => 0,
+    }
+}
+
+fn backend_message_size(message: &BackendMessage) -> usize {
+    match message {
+        BackendMessage::DataRow { values } => {
+            values
+                .iter()
+                .map(|v| v.as_ref().map_or(0, |b| b.len()) + 4)
+                .sum::<usize>()
+                + 8
+        }
+        // Rough fixed overhead for RowDescription / CommandComplete / ReadyForQuery / etc.
+        _ => 64,
     }
 }
 
@@ -319,7 +468,10 @@ fn trailing_ready_status(response: &mut Message) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_volatile;
+    use super::{
+        Frame, Message, PostgresFrame, is_txn_begin, is_txn_end, looks_volatile, response_is_cacheable,
+    };
+    use crate::frame::postgres::BackendMessage;
 
     #[test]
     fn volatile_reads_are_not_cacheable() {
@@ -329,5 +481,41 @@ mod tests {
         assert!(looks_volatile("SELECT current_user"));
         assert!(!looks_volatile("SELECT id, name FROM accounts WHERE id = 1"));
         assert!(!looks_volatile("SELECT count(*) FROM orders"));
+    }
+
+    #[test]
+    fn transaction_boundaries() {
+        assert!(is_txn_begin("BEGIN"));
+        assert!(is_txn_begin("  begin transaction"));
+        assert!(is_txn_begin("START TRANSACTION"));
+        assert!(!is_txn_begin("SELECT 1"));
+        assert!(is_txn_end("COMMIT"));
+        assert!(is_txn_end("rollback"));
+        assert!(is_txn_end("END"));
+        assert!(!is_txn_end("SELECT 1"));
+    }
+
+    fn response(messages: Vec<BackendMessage>) -> Message {
+        Message::from_frame(Frame::Postgres(PostgresFrame::Response(messages)))
+    }
+
+    #[test]
+    fn only_clean_idle_results_are_cacheable() {
+        // A normal idle result (ends in ReadyForQuery('I')) is cacheable.
+        let mut ok = response(vec![BackendMessage::ReadyForQuery { status: b'I' }]);
+        assert!(response_is_cacheable(&mut ok));
+
+        // A train ending inside a transaction ('T') is NOT cacheable (review F7).
+        let mut in_txn = response(vec![BackendMessage::ReadyForQuery { status: b'T' }]);
+        assert!(!response_is_cacheable(&mut in_txn));
+
+        // A train containing an ErrorResponse is NOT cacheable (review F8).
+        let mut err = response(vec![
+            BackendMessage::ErrorResponse {
+                fields: vec![(b'C', "42P01".to_owned())],
+            },
+            BackendMessage::ReadyForQuery { status: b'I' },
+        ]);
+        assert!(!response_is_cacheable(&mut err));
     }
 }
