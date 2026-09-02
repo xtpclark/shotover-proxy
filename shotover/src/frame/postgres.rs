@@ -1177,6 +1177,10 @@ pub struct SqlAnalysis {
     /// `DO` block, `CALL`, `COPY ... FROM`, or an unparseable statement — so a cache must evict
     /// everything rather than risk serving stale data.
     pub opaque_write: bool,
+    /// Bare, lowercased names of every function the statement CALLS (pg_query `functions`). A read that
+    /// calls a function whose body the proxy cannot see (any user function) might write; PostgresReadCache
+    /// uses this to refuse to cache such a read and to invalidate for it. Empty for a parse failure.
+    pub functions: Vec<String>,
 }
 
 /// True if a RangeVar names a temporary relation (relpersistence 't').
@@ -1198,7 +1202,7 @@ fn into_clause_is_temp(into: Option<&pg_query::protobuf::IntoClause>) -> bool {
 /// This list is best-effort and cannot be complete — any volatile or user-defined function may
 /// write, and a `SELECT` that calls one is not detected here. It covers the common built-ins whose
 /// silent misbehaviour on a replica is worst.
-fn is_writing_function(name: &str) -> bool {
+pub(crate) fn is_writing_function(name: &str) -> bool {
     let bare = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
     // Advisory locks in all forms (pg_advisory_lock, pg_try_advisory_xact_lock_shared, …): taking
     // one on a replica silently breaks the mutual exclusion the caller intended.
@@ -1250,6 +1254,7 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
                 writes: Vec::new(),
                 // Unparseable and not provably a read: a cache must assume it could have written.
                 opaque_write: true,
+                functions: Vec::new(),
             };
         }
     };
@@ -1426,6 +1431,10 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
         reads,
         writes,
         opaque_write,
+        functions: functions
+            .iter()
+            .map(|f| f.rsplit('.').next().unwrap_or(f).to_ascii_lowercase())
+            .collect(),
     }
 }
 
@@ -1651,6 +1660,13 @@ mod tests {
 
         // COPY ... TO is a read direction — it must NOT evict the whole cache.
         assert!(!analyze_sql("COPY t TO STDOUT").opaque_write);
+
+        // Called functions are surfaced (bare, lowercased) so the cache can judge a read's purity.
+        let f = analyze_sql("SELECT COUNT(*), Upper(name) FROM t");
+        assert!(f.functions.contains(&"count".to_owned()));
+        assert!(f.functions.contains(&"upper".to_owned()));
+        assert!(analyze_sql("SELECT log_ev('x')").functions.contains(&"log_ev".to_owned()));
+        assert!(analyze_sql("INSERT INTO t VALUES (1)").functions.is_empty());
 
         // The cache-gutting false positives are excluded: transaction control, row locks, SET, and
         // sequence bumps change no cached table, so they invalidate nothing.
