@@ -22,7 +22,10 @@
 //! the same session are NOT automatically pinned to the primary, so a session that needs
 //! read-your-writes should wrap the read in a transaction (transactions pin to the primary).
 
-use crate::codec::{CodecBuilder, Direction, postgres::PostgresCodecBuilder};
+use crate::codec::{
+    CodecBuilder, Direction,
+    postgres::{PostgresCodecBuilder, is_partial_response},
+};
 use crate::connection::SinkConnection;
 use crate::frame::postgres::{
     AuthenticationMessage, BackendMessage, FrontendMessage, PostgresFrame, analyze_sql,
@@ -192,6 +195,16 @@ impl TransformConfig for PostgresSinkClusterConfig {
 
     fn get_sub_chain_configs(&self) -> Vec<(&crate::config::chain::TransformChainConfig, String)> {
         vec![]
+    }
+
+    /// The codec chunks a large response train whenever a threshold is configured, so this sink
+    /// emits partial responses exactly when streaming is switched on.
+    fn emits_partial_responses(&self) -> bool {
+        self.stream_threshold_bytes > 0
+    }
+
+    fn accepts_partial_responses(&self) -> bool {
+        true
     }
 }
 
@@ -655,6 +668,12 @@ impl PostgresSinkCluster {
     /// Updates transaction/unit state from the trailing ReadyForQuery of a response batch.
     fn note_unit_boundary(&mut self, responses: &mut [Message]) {
         for response in responses.iter_mut() {
+            // A ReadyForQuery completes a train, so it is only ever in the final chunk; a partial
+            // is skipped before `trailing_ready_status` rather than by it, because that function
+            // parses the whole message and the parse is then cached on it.
+            if is_partial_response(response) {
+                continue;
+            }
             if let Some(status) = trailing_ready_status(response) {
                 // A ReadyForQuery ends the current unit and reports transaction state.
                 self.in_transaction = status != b'I';
