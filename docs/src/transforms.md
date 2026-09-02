@@ -663,26 +663,42 @@ issues any session-pinning statement (`SET`/`PREPARE`/temp table, simple OR exte
 state-affecting startup parameter (`options`/`search_path`/`role`/`session_authorization`/
 `extra_float_digits`).
 
-The one thing it deliberately does NOT do is **write invalidation** — a write to a table does not evict
-cached reads of it, so staleness is bounded ONLY by `ttl_ms`. It also cannot see server-side per-role
-defaults that postgres does not report (`ALTER ROLE … SET search_path`). **Do not enable it for
-untrusted clients, or any deployment that relies on per-role/invisible search_path or role
+**Write invalidation** is on by default (`invalidate_on_write`): a write seen on the request stream
+evicts the cached reads of its target tables BEFORE it is forwarded, so a following read cannot be
+answered from a now-stale entry. The write's targets come from the same grammar analysis (`INSERT`/
+`UPDATE`/`DELETE`/`MERGE`, including a write hidden in a CTE); a write whose targets cannot be enumerated
+— a stored-procedure `CALL`, a `DO` block, `COPY … FROM`, or an unparseable statement — evicts the WHOLE
+cache. Writes arriving via the extended protocol (`Parse`) invalidate too, even though extended-protocol
+reads are never cached. Table names are matched by bare (schema-stripped, lowercased) name, so
+invalidation is over-eager across schemas rather than ever missing. A read whose request was issued at or
+before the most recent invalidation is not stored (the read-after-write race guard).
+
+Two residuals remain, bounded by `ttl_ms`: eviction is at the write REQUEST, not its COMMIT (a read
+issued after a write evicts but before it commits can cache the pre-commit value), and a cached
+`SELECT` over a **view** is evicted only by a write naming the view, not by a write to the view's
+underlying table (the proxy has no catalog connection to resolve view → base tables). It also cannot see
+server-side per-role defaults that postgres does not report (`ALTER ROLE … SET search_path`). **Do not
+enable it for untrusted clients, or any deployment that relies on per-role/invisible search_path or role
 customisation.** Because the proxy already buffers whole response trains in memory, keep `max_bytes`
 modest.
 
-Metrics: `shotover_postgres_read_cache_hits_count` and `shotover_postgres_read_cache_misses_count`.
+Metrics: `shotover_postgres_read_cache_hits_count`, `shotover_postgres_read_cache_misses_count`, and
+`shotover_postgres_read_cache_evictions_count` (entries dropped by write invalidation).
 
 ```yaml
 - PostgresReadCache:
     name: "read-cache"
-    # How long a cached read is served before it is re-fetched (ms). This is the ONLY bound on
-    # staleness (there is no write invalidation) — keep it short.
+    # How long a cached read is served before it is re-fetched (ms). With invalidate_on_write on this
+    # bounds only the residual races below; keep it short.
     ttl_ms: 5000
     # Maximum number of cached entries (optional, default 1024).
     #max_entries: 1024
     # Maximum total cached bytes, estimated from response payloads (optional, default 16 MiB). A
     # result larger than this, or one that would exceed the total, is not cached.
     #max_bytes: 16777216
+    # Evict cached reads of a table when a write to it is seen (optional, default true). Turn OFF only
+    # in front of a read-only replica where no write can arrive on the same chain.
+    #invalidate_on_write: true
 ```
 
 When either bound is reached the cache does NOT evict LRU: it drops expired entries, and if it is still

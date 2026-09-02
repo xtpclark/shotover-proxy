@@ -25,11 +25,26 @@
 //! deployment that relies on per-role/otherwise-invisible search_path/role customisation: a cached
 //! result could then be served across tenants. (Reviewer F1/F1c.)
 //!
-//! ## What it deliberately does NOT do — the SPIKE's finding
-//! - **No write invalidation (the hard part).** A write to a table does NOT evict cached reads of that
-//!   table. Staleness is bounded ONLY by `ttl_ms`. Coherent invalidation needs per-query table-
-//!   dependency analysis plus write interception (or WAL/trigger/LISTEN-NOTIFY sourced invalidation),
-//!   which is the real work and is deferred. This is why it is keyed by TTL, not correctness.
+//! ## Write invalidation (best-effort, request-path)
+//! A write seen on the REQUEST stream evicts the cached reads it could have made stale, BEFORE it is
+//! forwarded, so a subsequent read cannot be answered from a now-stale entry (`invalidate_on_write`,
+//! default on). The grammar analysis names the write's target tables (`analyze_sql().writes`) and the
+//! cache keeps a reverse index table -> cached keys; a write whose targets cannot be enumerated (a
+//! stored-procedure `CALL`, a `DO` block, `COPY ... FROM`, or an unparseable statement — `opaque_write`)
+//! evicts the WHOLE cache. Writes arriving via the extended protocol (Parse) invalidate too, even though
+//! extended-protocol READS are never cached. Table names are matched by bare (schema-stripped,
+//! lowercased) name, so a write is over-eager across schemas rather than ever missing an eviction.
+//!
+//! A race guard bounds the classic read-after-write window: a read whose response is produced but whose
+//! request was issued at or before the most recent invalidation is NOT stored (it may pre-date the
+//! write). Two residuals remain, bounded by `ttl_ms` and documented rather than solved:
+//!   1. **Eviction is at the write REQUEST, not its COMMIT.** A concurrent read issued *after* the write
+//!      evicts but *before* the write commits can fetch and cache the pre-commit value.
+//!   2. **Views are invalidated by their own name, not their base tables.** A cached `SELECT FROM a_view`
+//!      is evicted by a write naming the view, but NOT by a write to the view's underlying table — the
+//!      proxy has no catalog connection to resolve view -> base tables (`relkind`). Deferred.
+//!
+//! WAL / LISTEN-NOTIFY sourced invalidation and extended-protocol read caching remain out of scope.
 //!
 //! ## Bounds and gates
 //! - **Simple query only.** Extended-protocol (Parse/Bind/Execute) reads are never cached.
@@ -63,6 +78,18 @@ use std::time::{Duration, Instant};
 /// module doc for why identity is part of the key.
 type CacheKey = (String, String, String, String);
 
+/// (database, bare table name) — a relation a cached read depends on / a write targets. The name is
+/// schema-stripped and lowercased so a write is over-eager across schemas rather than ever missing an
+/// eviction; the database scopes it so a write in one database never evicts another's cached reads.
+type Relation = (String, String);
+
+/// The bare, lowercased table name pg_query reports, for reverse-index keying. Schema-stripped on
+/// purpose: the proxy does not know the connection's search_path, so `public.t`, `t`, and `other.t` all
+/// fold to `t` — a write to any of them evicts cached reads of all (safe over-eviction, never a miss).
+fn relation_name(raw: &str) -> String {
+    raw.rsplit('.').next().unwrap_or(raw).to_ascii_lowercase()
+}
+
 /// The reported GUCs that change how result VALUES render; two clients differing on any of these must
 /// not share cached bytes. These are all in the postgres startup ParameterStatus set.
 const RENDERING_GUCS: &[&str] = &[
@@ -89,10 +116,19 @@ pub struct PostgresReadCacheConfig {
     /// result sets from an unprivileged client size the proxy's memory (review F2). Default 64 MiB.
     #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
+    /// Evict cached reads of a table when a write to it is seen on the request stream (default true).
+    /// Turning this OFF reverts to pure TTL staleness — only for a read-only replica the cache sits in
+    /// front of, where no write can arrive on the same chain.
+    #[serde(default = "default_invalidate_on_write")]
+    pub invalidate_on_write: bool,
 }
 
 fn default_max_entries() -> usize {
     1024
+}
+
+fn default_invalidate_on_write() -> bool {
+    true
 }
 
 fn default_max_bytes() -> usize {
@@ -119,9 +155,11 @@ impl TransformConfig for PostgresReadCacheConfig {
             ttl: Duration::from_millis(self.ttl_ms),
             max_entries: self.max_entries,
             max_bytes: self.max_bytes,
+            invalidate_on_write: self.invalidate_on_write,
             cache: Arc::new(Mutex::new(CacheStore::default())),
             hits: counter!("shotover_postgres_read_cache_hits_count", "chain" => chain.clone(), "transform" => NAME),
-            misses: counter!("shotover_postgres_read_cache_misses_count", "chain" => chain, "transform" => NAME),
+            misses: counter!("shotover_postgres_read_cache_misses_count", "chain" => chain.clone(), "transform" => NAME),
+            evictions: counter!("shotover_postgres_read_cache_evictions_count", "chain" => chain, "transform" => NAME),
         }))
     }
 
@@ -142,13 +180,79 @@ struct CacheEntry {
     expiry: Instant,
     response: Message,
     size: usize,
+    /// The relations this cached read depends on, so the reverse index can be cleaned when the entry
+    /// is removed for any reason (eviction, expiry, replacement).
+    relations: Vec<Relation>,
 }
 
-/// The shared cache plus a running byte total, so the store can be bounded by bytes as well as entries.
+/// The shared cache plus a running byte total, a reverse index (relation -> the cached keys that read
+/// it) for write invalidation, and the instant of the most recent invalidation (the race guard).
 #[derive(Default)]
 struct CacheStore {
     entries: HashMap<CacheKey, CacheEntry>,
     total_bytes: usize,
+    /// relation -> the set of cache keys whose read depends on it. Kept in lockstep with each entry's
+    /// `relations`, so a write to a relation evicts exactly the reads that touched it.
+    by_relation: HashMap<Relation, std::collections::HashSet<CacheKey>>,
+    /// The instant of the most recent invalidation (a targeted or whole-cache eviction). A response
+    /// whose request was issued at or before this must not be stored — it may pre-date the write.
+    last_invalidation: Option<Instant>,
+}
+
+impl CacheStore {
+    /// Inserts an entry and links it into the reverse index and byte total. The one path by which an
+    /// entry ever enters `entries`, mirror of `remove_entry`, so `by_relation` and `total_bytes` stay
+    /// in step. The caller has already enforced the size/count bounds.
+    fn insert_entry(&mut self, key: CacheKey, entry: CacheEntry) {
+        self.total_bytes += entry.size;
+        for relation in &entry.relations {
+            self.by_relation
+                .entry(relation.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        self.entries.insert(key, entry);
+    }
+
+    /// Removes an entry and unlinks it from the reverse index and byte total. The one path by which an
+    /// entry ever leaves `entries`, so `by_relation` and `total_bytes` can never drift.
+    fn remove_entry(&mut self, key: &CacheKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.size);
+            for relation in &entry.relations {
+                if let Some(keys) = self.by_relation.get_mut(relation) {
+                    keys.remove(key);
+                    if keys.is_empty() {
+                        self.by_relation.remove(relation);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Evicts every cached read that depends on `relation`; returns how many entries were dropped.
+    fn evict_relation(&mut self, relation: &Relation, now: Instant) -> u64 {
+        self.last_invalidation = Some(now);
+        let Some(keys) = self.by_relation.get(relation) else {
+            return 0;
+        };
+        let keys: Vec<CacheKey> = keys.iter().cloned().collect();
+        for key in &keys {
+            self.remove_entry(key);
+        }
+        keys.len() as u64
+    }
+
+    /// Evicts the entire cache (a write whose targets could not be enumerated); returns how many
+    /// entries were dropped.
+    fn evict_all(&mut self, now: Instant) -> u64 {
+        self.last_invalidation = Some(now);
+        let dropped = self.entries.len() as u64;
+        self.entries.clear();
+        self.by_relation.clear();
+        self.total_bytes = 0;
+        dropped
+    }
 }
 
 type SharedCache = Arc<Mutex<CacheStore>>;
@@ -158,9 +262,11 @@ pub struct PostgresReadCacheBuilder {
     ttl: Duration,
     max_entries: usize,
     max_bytes: usize,
+    invalidate_on_write: bool,
     cache: SharedCache,
     hits: Counter,
     misses: Counter,
+    evictions: Counter,
 }
 
 impl TransformBuilder for PostgresReadCacheBuilder {
@@ -169,9 +275,11 @@ impl TransformBuilder for PostgresReadCacheBuilder {
             ttl: self.ttl,
             max_entries: self.max_entries,
             max_bytes: self.max_bytes,
+            invalidate_on_write: self.invalidate_on_write,
             cache: self.cache.clone(),
             hits: self.hits.clone(),
             misses: self.misses.clone(),
+            evictions: self.evictions.clone(),
             user: None,
             database: None,
             rendering_gucs: BTreeMap::new(),
@@ -193,9 +301,11 @@ pub struct PostgresReadCache {
     ttl: Duration,
     max_entries: usize,
     max_bytes: usize,
+    invalidate_on_write: bool,
     cache: SharedCache,
     hits: Counter,
     misses: Counter,
+    evictions: Counter,
     // Per-connection state:
     user: Option<String>,
     database: Option<String>,
@@ -230,7 +340,10 @@ impl Transform for PostgresReadCache {
         chain_state: &'shorter mut ChainState<'longer>,
     ) -> Result<Messages> {
         let mut serve_from_cache: MessageIdMap<Message> = MessageIdMap::default();
-        let mut cache_on_response: MessageIdMap<CacheKey> = MessageIdMap::default();
+        // rid -> (key, relations the read depends on, instant the read was issued). The last two feed
+        // the reverse index and the race guard when the response comes back.
+        let mut cache_on_response: MessageIdMap<(CacheKey, Vec<Relation>, Instant)> =
+            MessageIdMap::default();
 
         // Transaction state tracked across THIS batch from the request stream, seeded from the
         // session's last-seen ReadyForQuery, so a pipelined [BEGIN, SELECT, COMMIT] is never treated as
@@ -273,15 +386,27 @@ impl Transform for PostgresReadCache {
                     }
                 }
                 Kind::Parse(query) => {
+                    let analysis = analyze_sql(&query);
                     // A session-state statement issued via the EXTENDED protocol (how every major driver
                     // sends SET) must also turn the cache off; the simple-query latch alone missed it and
                     // leaked another session's search_path (review F1).
-                    if analyze_sql(&query).pins_session {
+                    if analysis.pins_session {
                         self.session_stateful = true;
+                    }
+                    // A WRITE via the extended protocol invalidates too, even though extended-protocol
+                    // READS are never cached — a driver INSERTing via Parse/Bind/Execute must still evict
+                    // the simple-query reads it made stale.
+                    if self.invalidate_on_write {
+                        self.apply_invalidation(&analysis);
                     }
                 }
                 Kind::Query(query) => {
                     let analysis = analyze_sql(&query);
+                    // Evict what this statement makes stale BEFORE it is forwarded, so a later read in
+                    // the same batch cannot be served a now-stale entry. A no-op for a pure read.
+                    if self.invalidate_on_write {
+                        self.apply_invalidation(&analysis);
+                    }
                     if analysis.pins_session {
                         // SET search_path/role, PREPARE, temp tables, …: turn the cache off for this
                         // connection so a state-dependent result is never served from a shared cache.
@@ -301,14 +426,26 @@ impl Transform for PostgresReadCache {
                         (Some(u), Some(d)) => (u.clone(), d.clone()),
                         _ => continue,
                     };
-                    let key = (database, user, rendering_fingerprint(&self.rendering_gucs), query);
+                    let key = (
+                        database.clone(),
+                        user,
+                        rendering_fingerprint(&self.rendering_gucs),
+                        query,
+                    );
                     if let Some(mut response) = self.cache_get(&key) {
                         response.set_request_id(rid);
                         serve_from_cache.insert(rid, response);
                         request.replace_with_dummy();
                         self.hits.increment(1);
                     } else {
-                        cache_on_response.insert(rid, key);
+                        // Remember what this read depends on (reverse index) and when it was issued
+                        // (race guard), so a write racing it cannot leave a stale entry behind.
+                        let relations: Vec<Relation> = analysis
+                            .reads
+                            .iter()
+                            .map(|table| (database.clone(), relation_name(table)))
+                            .collect();
+                        cache_on_response.insert(rid, (key, relations, Instant::now()));
                         self.misses.increment(1);
                     }
                 }
@@ -328,13 +465,13 @@ impl Transform for PostgresReadCache {
                     // A cache hit: the dummy the sink produced for the suppressed request is replaced
                     // with the cached response train.
                     *response = cached;
-                } else if let Some(key) = cache_on_response.remove(&rid) {
+                } else if let Some((key, relations, issued_at)) = cache_on_response.remove(&rid) {
                     // A cache miss just answered by the backend: remember it ONLY if it is a clean,
                     // self-contained, idle result — no ErrorResponse (F8) and a trailing
                     // ReadyForQuery('I'), never an in-transaction train ending in 'T' (F7).
                     if response_is_cacheable(response) {
                         let size = estimate_response_size(response);
-                        self.cache_put(key, response.clone(), size);
+                        self.cache_put(key, response.clone(), size, relations, issued_at);
                     }
                 }
             }
@@ -359,13 +496,40 @@ impl PostgresReadCache {
         }
     }
 
+    /// Evicts the cached reads a write makes stale. `opaque_write` (a CALL/DO/COPY FROM/unparseable
+    /// statement whose targets are unknown) drops the whole cache; otherwise each named target relation
+    /// is evicted. A no-op for a pure read (empty `writes`, `opaque_write` false).
+    fn apply_invalidation(&self, analysis: &crate::frame::postgres::SqlAnalysis) {
+        if !analysis.opaque_write && analysis.writes.is_empty() {
+            return;
+        }
+        let Ok(mut store) = self.cache.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        // A write's database is this connection's; without it a relation cannot be keyed, so fall back
+        // to dropping everything. In practice a write only arrives on a started connection.
+        let evicted = match (analysis.opaque_write, &self.database) {
+            (true, _) | (false, None) => store.evict_all(now),
+            (false, Some(database)) => {
+                let database = database.clone();
+                let mut evicted = 0;
+                for table in &analysis.writes {
+                    evicted += store.evict_relation(&(database.clone(), relation_name(table)), now);
+                }
+                evicted
+            }
+        };
+        if evicted > 0 {
+            self.evictions.increment(evicted);
+        }
+    }
+
     fn cache_get(&self, key: &CacheKey) -> Option<Message> {
         let mut store = self.cache.lock().ok()?;
         match store.entries.get(key) {
             Some(entry) if entry.expiry <= Instant::now() => {
-                if let Some(removed) = store.entries.remove(key) {
-                    store.total_bytes = store.total_bytes.saturating_sub(removed.size);
-                }
+                store.remove_entry(key);
                 None
             }
             Some(entry) => Some(entry.response.clone()),
@@ -373,39 +537,48 @@ impl PostgresReadCache {
         }
     }
 
-    fn cache_put(&self, key: CacheKey, response: Message, size: usize) {
+    fn cache_put(
+        &self,
+        key: CacheKey,
+        response: Message,
+        size: usize,
+        relations: Vec<Relation>,
+        issued_at: Instant,
+    ) {
         // Never cache an unmeasurable result, or one larger than the whole budget.
         if size == 0 || size > self.max_bytes {
             return;
         }
         if let Ok(mut store) = self.cache.lock() {
-            let now = Instant::now();
-            // Prune expired entries first, reclaiming their bytes.
-            let mut freed = 0usize;
-            store.entries.retain(|_, e| {
-                if e.expiry > now {
-                    true
-                } else {
-                    freed += e.size;
-                    false
-                }
-            });
-            store.total_bytes = store.total_bytes.saturating_sub(freed);
-            // Replacing an existing key reclaims its bytes before we re-count.
-            if let Some(old) = store.entries.remove(&key) {
-                store.total_bytes = store.total_bytes.saturating_sub(old.size);
+            // Race guard: if a write invalidated at or after this read was issued, the response may
+            // pre-date the write — do not store it. Staleness then falls back to a fresh fetch.
+            if store.last_invalidation.is_some_and(|t| issued_at <= t) {
+                return;
             }
+            let now = Instant::now();
+            // Prune expired entries first (through remove_entry, so the reverse index stays in step).
+            let expired: Vec<CacheKey> = store
+                .entries
+                .iter()
+                .filter(|(_, e)| e.expiry <= now)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in &expired {
+                store.remove_entry(key);
+            }
+            // Replacing an existing key reclaims its bytes and reverse-index links before we re-count.
+            store.remove_entry(&key);
             // Bounded by BOTH entries and bytes; when full, skip this entry rather than evict others.
             if store.entries.len() >= self.max_entries || store.total_bytes + size > self.max_bytes {
                 return;
             }
-            store.total_bytes += size;
-            store.entries.insert(
+            store.insert_entry(
                 key,
                 CacheEntry {
                     expiry: now + self.ttl,
                     response,
                     size,
+                    relations,
                 },
             );
         }
@@ -525,9 +698,11 @@ fn trailing_ready_status(response: &mut Message) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Frame, Message, PostgresFrame, is_txn_begin, is_txn_end, looks_volatile, response_is_cacheable,
+        CacheEntry, CacheStore, Frame, Message, PostgresFrame, Relation, is_txn_begin, is_txn_end,
+        looks_volatile, relation_name, response_is_cacheable,
     };
     use crate::frame::postgres::BackendMessage;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn volatile_reads_are_not_cacheable() {
@@ -573,5 +748,78 @@ mod tests {
             BackendMessage::ReadyForQuery { status: b'I' },
         ]);
         assert!(!response_is_cacheable(&mut err));
+    }
+
+    fn key(query: &str) -> super::CacheKey {
+        ("db".to_owned(), "u".to_owned(), String::new(), query.to_owned())
+    }
+
+    fn rel(name: &str) -> Relation {
+        ("db".to_owned(), name.to_owned())
+    }
+
+    fn entry(size: usize, relations: Vec<Relation>) -> CacheEntry {
+        CacheEntry {
+            expiry: Instant::now() + Duration::from_secs(60),
+            response: response(vec![BackendMessage::ReadyForQuery { status: b'I' }]),
+            size,
+            relations,
+        }
+    }
+
+    #[test]
+    fn relation_name_is_schema_stripped_and_lowercased() {
+        assert_eq!(relation_name("orders"), "orders");
+        assert_eq!(relation_name("public.orders"), "orders");
+        assert_eq!(relation_name("Sales.Orders"), "orders");
+    }
+
+    #[test]
+    fn evict_relation_drops_only_dependents_and_keeps_index_consistent() {
+        let mut store = CacheStore::default();
+        store.insert_entry(key("select from orders"), entry(100, vec![rel("orders")]));
+        store.insert_entry(key("select from customers"), entry(200, vec![rel("customers")]));
+        // A read joining both tables depends on both.
+        store.insert_entry(
+            key("select from orders join customers"),
+            entry(50, vec![rel("orders"), rel("customers")]),
+        );
+        assert_eq!(store.entries.len(), 3);
+        assert_eq!(store.total_bytes, 350);
+
+        let now = Instant::now();
+        let dropped = store.evict_relation(&rel("orders"), now);
+        assert_eq!(dropped, 2, "both orders-dependent reads evicted");
+        assert!(store.entries.contains_key(&key("select from customers")));
+        assert!(!store.entries.contains_key(&key("select from orders")));
+        assert_eq!(store.total_bytes, 200, "byte total tracks the survivors");
+        // The reverse index no longer lists orders, and customers still lists only the survivor.
+        assert!(!store.by_relation.contains_key(&rel("orders")));
+        assert_eq!(store.by_relation.get(&rel("customers")).unwrap().len(), 1);
+        assert_eq!(store.last_invalidation, Some(now));
+    }
+
+    #[test]
+    fn evict_all_clears_everything() {
+        let mut store = CacheStore::default();
+        store.insert_entry(key("a"), entry(100, vec![rel("orders")]));
+        store.insert_entry(key("b"), entry(100, vec![rel("customers")]));
+        let now = Instant::now();
+        let dropped = store.evict_all(now);
+        assert_eq!(dropped, 2);
+        assert!(store.entries.is_empty());
+        assert!(store.by_relation.is_empty());
+        assert_eq!(store.total_bytes, 0);
+        assert_eq!(store.last_invalidation, Some(now));
+    }
+
+    #[test]
+    fn remove_entry_unlinks_from_every_relation_bucket() {
+        let mut store = CacheStore::default();
+        store.insert_entry(key("j"), entry(10, vec![rel("orders"), rel("customers")]));
+        store.remove_entry(&key("j"));
+        assert!(store.entries.is_empty());
+        assert!(store.by_relation.is_empty(), "no dangling reverse-index buckets");
+        assert_eq!(store.total_bytes, 0);
     }
 }
