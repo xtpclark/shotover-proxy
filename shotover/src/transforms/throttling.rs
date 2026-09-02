@@ -152,11 +152,8 @@ impl Transform for RequestThrottling {
             // Track the transaction state from real responses' ReadyForQuery (postgres only), so a
             // later throttle rejection can mirror it (review F9). The message_type() check is cheap and
             // avoids parsing non-postgres responses.
-            // A partial chunk cannot contain a ReadyForQuery — that message completes a train,
-            // so it is only ever in the final chunk — but it is skipped BEFORE the scan rather
-            // than after, because the scan parses the whole message. Parsing a chunk of DataRows
-            // into typed frames, which `Message::frame` then caches alongside the raw bytes, is
-            // exactly the cost streaming exists to avoid.
+            // Skipped before the scan, not by it: the scan parses, and the parse is retained
+            // (see `TransformConfig::accepts_partial_responses`).
             #[cfg(feature = "postgres")]
             if response.message_type() == MessageType::Postgres
                 && !crate::codec::postgres::is_partial_response(response)

@@ -262,6 +262,13 @@ impl TransformConfig for TeeConfig {
         }
         configs
     }
+
+    /// `false`: Tee compares a response against the one its sub-chain produced, and chunk
+    /// boundaries depend on when each chain's backend flushed — so the two sides would be compared
+    /// at different offsets. Run a teed chain with `stream_threshold_bytes: 0`.
+    fn accepts_partial_responses(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]

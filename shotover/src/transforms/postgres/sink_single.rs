@@ -83,8 +83,6 @@ impl TransformConfig for PostgresSinkSingleConfig {
         vec![]
     }
 
-    /// The codec chunks a large response train whenever a threshold is configured, so this sink
-    /// emits partial responses exactly when streaming is switched on.
     fn emits_partial_responses(&self) -> bool {
         self.stream_threshold_bytes > 0
     }

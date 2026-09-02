@@ -197,8 +197,6 @@ impl TransformConfig for PostgresSinkClusterConfig {
         vec![]
     }
 
-    /// The codec chunks a large response train whenever a threshold is configured, so this sink
-    /// emits partial responses exactly when streaming is switched on.
     fn emits_partial_responses(&self) -> bool {
         self.stream_threshold_bytes > 0
     }
@@ -668,9 +666,9 @@ impl PostgresSinkCluster {
     /// Updates transaction/unit state from the trailing ReadyForQuery of a response batch.
     fn note_unit_boundary(&mut self, responses: &mut [Message]) {
         for response in responses.iter_mut() {
-            // A ReadyForQuery completes a train, so it is only ever in the final chunk; a partial
-            // is skipped before `trailing_ready_status` rather than by it, because that function
-            // parses the whole message and the parse is then cached on it.
+            // Skipped before `trailing_ready_status`, not by it: it parses, and the parse is
+            // retained (see `TransformConfig::accepts_partial_responses`). A ReadyForQuery only
+            // ever completes a train, so no partial can hold one anyway.
             if is_partial_response(response) {
                 continue;
             }

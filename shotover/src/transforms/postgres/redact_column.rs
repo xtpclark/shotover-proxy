@@ -103,6 +103,14 @@ impl TransformConfig for PostgresRedactColumnConfig {
     fn get_sub_chain_configs(&self) -> Vec<(&crate::config::chain::TransformChainConfig, String)> {
         vec![]
     }
+
+    /// `false`: redaction learns a row shape from the RowDescription that opens a train and then
+    /// rewrites every DataRow against it, so a chunk arriving without that shape can only fail
+    /// closed. A streaming-aware variant is its own piece of work; until then run redaction with
+    /// `stream_threshold_bytes: 0`.
+    fn accepts_partial_responses(&self) -> bool {
+        false
+    }
 }
 
 pub struct PostgresRedactColumnBuilder {

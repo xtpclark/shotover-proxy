@@ -7,36 +7,32 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::info;
 
-/// Whether anything in this chain, or in any chain nested below it, emits PARTIAL response
-/// trains — a response delivered as several messages, only the last of which carries the
-/// request id.
-fn chain_emits_partial_responses(chain: &crate::config::chain::TransformChainConfig) -> bool {
-    chain.0.iter().any(|config| {
-        config.emits_partial_responses()
-            || config
-                .get_sub_chain_configs()
-                .iter()
-                .any(|(sub_chain, _)| chain_emits_partial_responses(sub_chain))
-    })
-}
-
-/// Collects every transform that would be handed partial response trains it has not
-/// declared it can handle.
+/// Collects every transform that would be handed partial response trains — a response delivered as
+/// several messages, only the last of which carries the request id — that it has not declared it
+/// can handle. Returns whether this chain, or any chain nested below it, streams at all.
 ///
-/// A chain is judged as a whole rather than per position: partials travel UP it from
-/// whichever transform emits them, so every transform above the emitter sees them, and a
-/// sub-chain that emits hands them to the transform that owns it — which makes the
-/// enclosing chain a streaming one too. That is deliberately conservative; refusing to
+/// A chain is judged as a whole rather than per position: partials travel UP it from whichever
+/// transform emits them, so every transform above the emitter sees them, and a sub-chain that
+/// emits hands them to the transform that owns it — which makes the enclosing chain a streaming one
+/// too. That is deliberately conservative, and the right direction to be wrong in: refusing to
 /// start is always recoverable, silently feeding a transform a shape it cannot read is not.
-///
-/// Mirrors `collect_chain_names` in `run_chains`, including its behaviour of visiting a sub-chain
-/// once per worker for transforms like ParallelMap that report the same chain repeatedly.
 fn collect_partial_response_errors(
     chain: &crate::config::chain::TransformChainConfig,
     chain_path: &str,
     errors: &mut Vec<String>,
-) {
-    if chain_emits_partial_responses(chain) {
+) -> bool {
+    let mut streams = false;
+    for config in chain.0.iter() {
+        streams |= config.emits_partial_responses();
+        for (sub_chain, sub_chain_name) in config.get_sub_chain_configs() {
+            let sub_chain_path = format!("{chain_path} -> subchain {sub_chain_name:?}");
+            // `|=` after the call, never before: short-circuiting would skip a nested chain's own
+            // errors once something earlier had already streamed.
+            streams |= collect_partial_response_errors(sub_chain, &sub_chain_path, errors);
+        }
+    }
+
+    if streams {
         for config in chain.0.iter() {
             if !config.accepts_partial_responses() {
                 errors.push(format!(
@@ -48,12 +44,7 @@ fn collect_partial_response_errors(
         }
     }
 
-    for config in chain.0.iter() {
-        for (sub_chain, sub_chain_name) in config.get_sub_chain_configs() {
-            let sub_chain_path = format!("{chain_path} -> subchain {sub_chain_name:?}");
-            collect_partial_response_errors(sub_chain, &sub_chain_path, errors);
-        }
-    }
+    streams
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -962,7 +953,7 @@ valkey2 source:
 
 #[cfg(all(test, feature = "postgres", feature = "alpha-transforms"))]
 mod partial_response_validation_tests {
-    use super::{chain_emits_partial_responses, collect_partial_response_errors};
+    use super::collect_partial_response_errors;
     use crate::config::chain::TransformChainConfig;
 
     /// Parses a chain exactly as a topology file would, so these exercise the real config surface
@@ -976,6 +967,10 @@ mod partial_response_validation_tests {
         let mut errors = vec![];
         collect_partial_response_errors(&chain(yaml), "test chain", &mut errors);
         errors
+    }
+
+    fn streams(yaml: &str) -> bool {
+        collect_partial_response_errors(&chain(yaml), "test chain", &mut vec![])
     }
 
     const REDACT_THEN_STREAMING_SINK: &str = r#"
@@ -1028,16 +1023,14 @@ mod partial_response_validation_tests {
     /// topology that starts today can begin failing because of this validation.
     #[test]
     fn accepts_the_same_chain_with_streaming_off() {
-        assert!(!chain_emits_partial_responses(&chain(
-            REDACT_THEN_WHOLE_TRAIN_SINK
-        )));
+        assert!(!streams(REDACT_THEN_WHOLE_TRAIN_SINK));
         assert!(errors(REDACT_THEN_WHOLE_TRAIN_SINK).is_empty());
     }
 
     /// A chunking sink on its own is fine: it both emits partials and accepts them.
     #[test]
     fn accepts_a_streaming_sink_on_its_own() {
-        assert!(chain_emits_partial_responses(&chain(STREAMING_SINK_ONLY)));
+        assert!(streams(STREAMING_SINK_ONLY));
         assert!(errors(STREAMING_SINK_ONLY).is_empty());
     }
 
