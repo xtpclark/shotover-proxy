@@ -41,6 +41,7 @@ impl TransformConfig for RequestThrottlingConfig {
             ))),
             max_requests_per_second: self.max_requests_per_second,
             throttled_requests: MessageIdMap::default(),
+            last_rfq_status: b'I',
         }))
     }
 
@@ -70,6 +71,9 @@ struct RequestThrottling {
     limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>>,
     max_requests_per_second: NonZeroU32,
     throttled_requests: MessageIdMap<Message>,
+    /// The last ReadyForQuery status seen on this connection (postgres only), so a throttle rejection
+    /// mirrors the session's real transaction state instead of always reporting idle 'I' (review F9).
+    last_rfq_status: u8,
 }
 
 impl TransformBuilder for RequestThrottling {
@@ -123,8 +127,14 @@ impl Transform for RequestThrottling {
                     }
                 };
                 if throttle {
-                    self.throttled_requests
-                        .insert(request.id(), request.to_backpressure()?);
+                    let mut backpressure = request.to_backpressure()?;
+                    // Mirror the session's current transaction state so a throttled request inside a
+                    // transaction does not falsely report idle to a status-tracking driver (review F9).
+                    #[cfg(feature = "postgres")]
+                    if self.last_rfq_status != b'I' {
+                        set_postgres_rfq_status(&mut backpressure, self.last_rfq_status);
+                    }
+                    self.throttled_requests.insert(request.id(), backpressure);
                     request.replace_with_dummy();
                 }
             }
@@ -135,6 +145,15 @@ impl Transform for RequestThrottling {
 
         // replace dummy responses with throttle messages
         for response in responses.iter_mut() {
+            // Track the transaction state from real responses' ReadyForQuery (postgres only), so a
+            // later throttle rejection can mirror it (review F9). The message_type() check is cheap and
+            // avoids parsing non-postgres responses.
+            #[cfg(feature = "postgres")]
+            if response.message_type() == MessageType::Postgres
+                && let Some(status) = postgres_trailing_rfq_status(response)
+            {
+                self.last_rfq_status = status;
+            }
             if let Some(request_id) = response.request_id()
                 && let Some(error_response) = self.throttled_requests.remove(&request_id)
             {
@@ -143,6 +162,41 @@ impl Transform for RequestThrottling {
         }
 
         Ok(responses)
+    }
+}
+
+/// The status byte of the last ReadyForQuery in a postgres response, if any.
+#[cfg(feature = "postgres")]
+fn postgres_trailing_rfq_status(response: &mut Message) -> Option<u8> {
+    use crate::frame::Frame;
+    use crate::frame::postgres::{BackendMessage, PostgresFrame};
+    if let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() {
+        for message in messages.iter().rev() {
+            if let BackendMessage::ReadyForQuery { status } = message {
+                return Some(*status);
+            }
+        }
+    }
+    None
+}
+
+/// Rewrites the ReadyForQuery status of a postgres backpressure response so it reflects the session's
+/// real transaction state.
+#[cfg(feature = "postgres")]
+fn set_postgres_rfq_status(response: &mut Message, status: u8) {
+    use crate::frame::Frame;
+    use crate::frame::postgres::{BackendMessage, PostgresFrame};
+    if let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() {
+        let mut changed = false;
+        for message in messages.iter_mut() {
+            if let BackendMessage::ReadyForQuery { status: s } = message {
+                *s = status;
+                changed = true;
+            }
+        }
+        if changed {
+            response.invalidate_cache();
+        }
     }
 }
 
@@ -163,6 +217,7 @@ mod test {
                         limiter: Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(20u32)))),
                         max_requests_per_second: nonzero!(20u32),
                         throttled_requests: MessageIdMap::default(),
+                        last_rfq_status: b'I',
                     }) as Box<dyn TransformBuilder>,
                     Box::new(NullSink::new("NullSink".to_string())),
                 ],
@@ -187,6 +242,7 @@ mod test {
                         limiter: Arc::new(RateLimiter::direct(Quota::per_second(nonzero!(100u32)))),
                         max_requests_per_second: nonzero!(100u32),
                         throttled_requests: MessageIdMap::default(),
+                        last_rfq_status: b'I',
                     }) as Box<dyn TransformBuilder>,
                     Box::new(NullSink::new("NullSink".to_string())),
                 ],

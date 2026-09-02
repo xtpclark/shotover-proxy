@@ -524,7 +524,14 @@ impl PostgresSinkCluster {
 
     /// Sends a batch to the chosen backend, collects its responses, and updates unit/transaction
     /// state from the trailing ReadyForQuery.
-    async fn route(&mut self, target: Target, requests: Messages) -> Result<Messages> {
+    async fn route(&mut self, target: Target, mut requests: Messages) -> Result<Messages> {
+        // A batch of only suppressed (dummy) requests produces dummy responses without touching a
+        // backend, so it must not overwrite the session's unit_target — otherwise a throttle/cache hit
+        // would pin every following read to the primary, since a dummy response carries no
+        // ReadyForQuery to close the unit (F11).
+        let is_dummy_only = requests
+            .iter_mut()
+            .all(|r| matches!(r.frame(), Some(Frame::Dummy)));
         let target = if target == Target::Replica {
             match self.ensure_replica().await {
                 Ok(()) => {
@@ -546,7 +553,14 @@ impl PostgresSinkCluster {
         } else {
             target
         };
-        self.unit_target = Some(target);
+        // A dummy-only batch keeps whatever unit is open (or none) and rides the existing connection;
+        // only a batch with a real request pins the unit.
+        let target = if is_dummy_only {
+            self.unit_target.unwrap_or(target)
+        } else {
+            self.unit_target = Some(target);
+            target
+        };
 
         // Send to the chosen node, tracking that node's outstanding responses. Extended-query
         // batches that carry no Flush/Sync produce no responses yet; super::exchange handles that
@@ -838,10 +852,13 @@ impl PostgresSinkCluster {
         {
             Some(primary) => Ok(Topology { primary, replicas }),
             None if auth_unsupported => Err(BackendAuthUnsupported.into()),
-            None => bail!(
-                "postgres cluster: no primary found among {:?}",
-                self.contact_points
-            ),
+            None => {
+                tracing::warn!(
+                    "postgres cluster: no primary found among {:?}",
+                    self.contact_points
+                );
+                Err(NoPrimaryAvailable.into())
+            }
         }
     }
 
@@ -1308,6 +1325,9 @@ fn classify_request(request: &mut Message) -> RequestRoute {
             | FrontendMessage::CopyFail { .. } => RequestRoute::Neutral,
             _ => RequestRoute::Primary,
         },
+        // A suppressed request (a throttle/cache dummy from an upstream transform) carries no routing
+        // decision of its own — it must not force the batch (or the session) onto the primary (F11).
+        Some(Frame::Dummy) => RequestRoute::Neutral,
         _ => RequestRoute::Primary,
     }
 }
@@ -1361,15 +1381,36 @@ impl std::fmt::Display for BackendAuthRejected {
 
 impl std::error::Error for BackendAuthRejected {}
 
+/// No contact point currently reports itself a primary — every host is down or a failover is mid-flight
+/// (the crash→promotion window). Typed so `map_startup_error` surfaces a clean, retryable FATAL to the
+/// client instead of the generic "internal shotover bug" text (review F10).
+#[derive(Debug)]
+struct NoPrimaryAvailable;
+
+impl std::fmt::Display for NoPrimaryAvailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no postgres primary is currently available (all contact points down or a failover is in \
+             progress); please retry"
+        )
+    }
+}
+
+impl std::error::Error for NoPrimaryAvailable {}
+
 /// Turns a startup-time backend failure into what the client should see. An unsupported-auth failure
 /// (a md5/SCRAM backend the cluster sink cannot originate against) becomes a clean FATAL ErrorResponse
 /// that names the fix, and closes the connection — instead of the generic "internal shotover bug"
 /// error a client gets when a transform returns Err. Any other failure propagates unchanged.
 fn map_startup_error(err: anyhow::Error, chain_state: &mut ChainState) -> Result<Messages> {
-    // 0A000 = feature_not_supported (md5/SCRAM backend); 08006 = connection_failure (backend stalled).
+    // 0A000 = feature_not_supported (md5/SCRAM backend); 08006 = connection_failure (backend stalled
+    // or no primary currently available).
     let sqlstate = if err.downcast_ref::<BackendAuthUnsupported>().is_some() {
         "0A000"
-    } else if err.downcast_ref::<super::BackendReadTimeout>().is_some() {
+    } else if err.downcast_ref::<super::BackendReadTimeout>().is_some()
+        || err.downcast_ref::<NoPrimaryAvailable>().is_some()
+    {
         "08006"
     } else {
         return Err(err);
