@@ -1153,6 +1153,23 @@ pub fn query_name(frame: &PostgresFrame) -> Option<String> {
 
 /// Classifies a request for QueryCounter and QueryTypeFilter.
 /// The result of statically analysing a SQL string with the real postgres grammar.
+/// Transaction-control effect of a statement, from pg_query's `TransactionStmt.kind`. Used by
+/// PostgresReadCache to know when to apply or discard its deferred invalidation across BOTH the simple
+/// and extended protocols (a bare `starts_with("rollback")` wrongly caught `ROLLBACK TO SAVEPOINT`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxnControl {
+    /// BEGIN / START TRANSACTION — opens an explicit transaction.
+    Begin,
+    /// COMMIT / END / PREPARE TRANSACTION — ends it; apply the deferred invalidation. `chain` (AND
+    /// CHAIN) immediately opens a new transaction, so the session stays in one.
+    Commit { chain: bool },
+    /// ROLLBACK / ABORT — ends it; discard the deferred invalidation. `chain` opens a new one.
+    Rollback { chain: bool },
+    /// SAVEPOINT / RELEASE / ROLLBACK TO / COMMIT PREPARED / ROLLBACK PREPARED — does NOT end the
+    /// current transaction; keep it open and keep the deferred set.
+    Nested,
+}
+
 /// Drives both query classification (QueryCounter/QueryTypeFilter) and read/write-split routing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SqlAnalysis {
@@ -1181,6 +1198,9 @@ pub struct SqlAnalysis {
     /// calls a function whose body the proxy cannot see (any user function) might write; PostgresReadCache
     /// uses this to refuse to cache such a read and to invalidate for it. Empty for a parse failure.
     pub functions: Vec<String>,
+    /// Present iff the statement is transaction control (BEGIN/COMMIT/…). Lets the cache track
+    /// transaction boundaries precisely and across the extended protocol. `None` for everything else.
+    pub txn: Option<TxnControl>,
 }
 
 /// True if a RangeVar names a temporary relation (relpersistence 't').
@@ -1255,6 +1275,7 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
                 // Unparseable and not provably a read: a cache must assume it could have written.
                 opaque_write: true,
                 functions: Vec::new(),
+                txn: None,
             };
         }
     };
@@ -1296,6 +1317,8 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
     // A positively-identified INSERT/UPDATE/DELETE/MERGE node; paired with the extracted write targets
     // below as a backstop — a DML node seen with no target surfaced falls back to evict-all.
     let mut saw_dml_node = false;
+    // Transaction control (BEGIN/COMMIT/…), for the cache's transaction tracking.
+    let mut txn_control: Option<TxnControl> = None;
 
     for stmt in &parsed.protobuf.stmts {
         let Some(node) = stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
@@ -1364,9 +1387,20 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
                     pins_session = true;
                 }
             }
-            NodeEnum::TransactionStmt(_) => {
+            NodeEnum::TransactionStmt(txn) => {
                 // Transaction control is routed to the primary/current node by the router.
                 replica_safe = false;
+                // Use the typed enum (the protobuf enum prepends an UNDEFINED=0 sentinel, so raw ints
+                // are +1 from PostgreSQL's C enum). PREPARE TRANSACTION is treated as a commit (apply
+                // deferred invalidation conservatively — the prepared txn will commit, maybe elsewhere);
+                // SAVEPOINT/RELEASE/ROLLBACK TO/COMMIT-or-ROLLBACK PREPARED do NOT end this transaction.
+                use pg_query::protobuf::TransactionStmtKind::*;
+                txn_control = Some(match txn.kind() {
+                    TransStmtBegin | TransStmtStart => TxnControl::Begin,
+                    TransStmtCommit | TransStmtPrepare => TxnControl::Commit { chain: txn.chain },
+                    TransStmtRollback => TxnControl::Rollback { chain: txn.chain },
+                    _ => TxnControl::Nested,
+                });
             }
             NodeEnum::InsertStmt(_)
             | NodeEnum::UpdateStmt(_)
@@ -1435,6 +1469,7 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
             .iter()
             .map(|f| f.rsplit('.').next().unwrap_or(f).to_ascii_lowercase())
             .collect(),
+        txn: txn_control,
     }
 }
 

@@ -671,12 +671,17 @@ answered from a now-stale entry. The write's targets come from the same grammar 
 `UPDATE`/`DELETE`/`MERGE`, including a write hidden in a CTE); a write whose targets cannot be enumerated
 — a stored-procedure `CALL`, a `DO` block, `COPY … FROM`, an unparseable statement, or a read calling an
 unproven function — evicts the WHOLE cache. Table names are matched by bare (schema-stripped, lowercased)
-name, so invalidation is over-eager across schemas rather than ever missing. Three subtler shapes are
+name, so invalidation is over-eager across schemas rather than ever missing. Several subtler shapes are
 covered: a **prepared write invalidates at `Execute`, not `Parse`** (a driver Parses once and
-Bind/Executes many, so invalidating only at Parse missed every write after the first); a write **inside
-an explicit transaction defers its invalidation to `COMMIT`** (`ROLLBACK` discards it), so a concurrent
-read cannot cache the not-yet-committed value; and a read whose request was issued at or before the most
-recent invalidation is not stored (the read-after-write race guard).
+Bind/Executes many, so invalidating only at Parse missed every write after the first); **transaction
+boundaries are tracked in both the simple and extended protocols** (a `BEGIN`/`COMMIT` sent by
+pgjdbc/npgsql/pgx as extended Parse/Bind/Execute is seen, and `ROLLBACK TO SAVEPOINT` is correctly not
+treated as a transaction end); a write **defers its invalidation to the commit point** — `COMMIT`/`END`
+for an explicit transaction (`ROLLBACK` discards it), or the `Sync` that commits an implicit extended
+transaction — so a concurrent read cannot cache the not-yet-committed value; and a read whose request was
+issued at or before the most recent invalidation is not stored (the read-after-write race guard). A read
+calling a function the proxy cannot prove pure is logged at debug level naming the function, so operators
+can populate `pure_functions` from evidence.
 
 Residuals remain, bounded by `ttl_ms`: eviction is at the write REQUEST, not the instant the backend
 commits (a window of the commit latency itself), and — because the proxy has no catalog connection to
@@ -688,8 +693,10 @@ enable it for untrusted clients, or any deployment that relies on per-role/invis
 customisation.** Because the proxy already buffers whole response trains in memory, keep `max_bytes`
 modest.
 
-Metrics: `shotover_postgres_read_cache_hits_count`, `shotover_postgres_read_cache_misses_count`, and
-`shotover_postgres_read_cache_evictions_count` (entries dropped by write invalidation).
+Metrics: `shotover_postgres_read_cache_hits_count`, `shotover_postgres_read_cache_misses_count`,
+`shotover_postgres_read_cache_evictions_count` (entries dropped by write invalidation), and
+`shotover_postgres_read_cache_untracked_execute_count` (an Execute of an untracked portal fell back to
+evict-all — normally zero; a non-zero rate suggests raising the prepared-statement cap).
 
 ```yaml
 - PostgresReadCache:

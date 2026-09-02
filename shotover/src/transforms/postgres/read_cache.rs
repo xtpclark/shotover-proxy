@@ -41,12 +41,18 @@
 //!     so such a read is never cached AND invalidates the whole cache. Known non-table side effects
 //!     (nextval/advisory/set_config) are excluded from the evict-all so they do not gut the cache.
 //!   - **Extended-protocol prepared writes invalidate at Execute, not Parse** (review F-INV-2). A driver
-//!     Parses once and Bind/Executes many; the write each statement performs is recorded at Parse
-//!     (bounded per connection) and applied at every Execute, so writes after the first are not missed.
-//!   - **In an explicit transaction, invalidation is deferred to COMMIT** (review F-INV-3). The write is
-//!     invisible to other connections until it commits, so its relations are accumulated while the txn
-//!     is open and evicted at `COMMIT`/`END` (discarded on `ROLLBACK`), closing the request-vs-commit
-//!     window to the backend's own commit latency.
+//!     Parses once and Bind/Executes many; each statement's effect is recorded at Parse (bounded, FIFO)
+//!     and COPIED into the portal at Bind (so a `Close(S)` cannot orphan it — F-INV-7), then applied at
+//!     every Execute. An Execute of an untracked portal evicts everything (counted).
+//!   - **Transaction boundaries are tracked in BOTH protocols** (review F-INV-4/5). BEGIN/COMMIT/ROLLBACK
+//!     are classified from the parse tree (`analyze_sql().txn`), so `BEGIN`/`COMMIT` sent as extended
+//!     Parse/Bind/Execute — how pgjdbc/npgsql/pgx work — are seen, and `ROLLBACK TO SAVEPOINT` / SAVEPOINT
+//!     / RELEASE are correctly NOT treated as transaction ends.
+//!   - **Invalidation is deferred to the commit point** (review F-INV-3/6). A write's relations are
+//!     accumulated and evicted at `COMMIT`/`END` inside an explicit transaction (discarded on `ROLLBACK`),
+//!     or at the `Sync` that commits an implicit (un-BEGUN) extended transaction — never before the
+//!     backend commits, so a concurrent read cannot cache a pre-commit value. A simple-protocol
+//!     autocommit write, which commits immediately, still evicts at once.
 //!
 //! A race guard bounds the classic read-after-write window: a read whose response is produced but whose
 //! request was issued at or before the most recent invalidation is NOT stored (it may pre-date the
@@ -72,7 +78,8 @@
 //!   memory regardless of the cache (a separate architectural limit), so keep `max_bytes` modest.
 
 use crate::frame::postgres::{
-    BackendMessage, FrontendMessage, PostgresFrame, SqlAnalysis, analyze_sql, is_writing_function,
+    BackendMessage, FrontendMessage, PostgresFrame, SqlAnalysis, TxnControl, analyze_sql,
+    is_writing_function,
 };
 use crate::frame::{Frame, MessageType};
 use crate::message::{Message, MessageIdMap, Messages};
@@ -149,6 +156,19 @@ const PURE_BUILTINS: &[&str] = &[
     "array_length", "array_upper", "array_lower", "array_ndims", "cardinality", "array_append",
     "array_prepend", "array_cat", "array_remove", "array_replace", "array_position", "array_positions",
     "unnest", "array_to_string", "string_to_array", "generate_series", "generate_subscripts",
+    "array_fill", "array_dims",
+    // Full-text search (review X5).
+    "to_tsvector", "to_tsquery", "plainto_tsquery", "phraseto_tsquery", "websearch_to_tsquery",
+    "ts_rank", "ts_rank_cd", "ts_headline",
+    // Set-returning / record JSON (review X5).
+    "jsonb_array_elements", "jsonb_array_elements_text", "json_array_elements", "json_array_elements_text",
+    "jsonb_each", "jsonb_each_text", "json_each", "json_each_text", "jsonb_path_query",
+    "jsonb_path_query_first", "jsonb_path_exists", "jsonb_to_record", "jsonb_to_recordset",
+    "json_to_record", "json_to_recordset", "jsonb_populate_record", "jsonb_populate_recordset",
+    "json_populate_record", "json_populate_recordset", "jsonb_object",
+    // Ordered-set aggregates and misc pure builtins (review X5).
+    "percentile_cont", "percentile_disc", "mode", "date_bin", "timezone", "num_nonnulls", "num_nulls",
+    "isfinite", "overlay", "convert_from", "convert_to", "version",
 ];
 
 /// True if a called function is safe to treat as pure — a known-pure builtin or one the operator listed.
@@ -236,7 +256,8 @@ impl TransformConfig for PostgresReadCacheConfig {
             cache: Arc::new(Mutex::new(CacheStore::default())),
             hits: counter!("shotover_postgres_read_cache_hits_count", "chain" => chain.clone(), "transform" => NAME),
             misses: counter!("shotover_postgres_read_cache_misses_count", "chain" => chain.clone(), "transform" => NAME),
-            evictions: counter!("shotover_postgres_read_cache_evictions_count", "chain" => chain, "transform" => NAME),
+            evictions: counter!("shotover_postgres_read_cache_evictions_count", "chain" => chain.clone(), "transform" => NAME),
+            untracked_execute: counter!("shotover_postgres_read_cache_untracked_execute_count", "chain" => chain, "transform" => NAME),
         }))
     }
 
@@ -345,6 +366,7 @@ pub struct PostgresReadCacheBuilder {
     hits: Counter,
     misses: Counter,
     evictions: Counter,
+    untracked_execute: Counter,
 }
 
 impl TransformBuilder for PostgresReadCacheBuilder {
@@ -359,13 +381,14 @@ impl TransformBuilder for PostgresReadCacheBuilder {
             hits: self.hits.clone(),
             misses: self.misses.clone(),
             evictions: self.evictions.clone(),
+            untracked_execute: self.untracked_execute.clone(),
             user: None,
             database: None,
             rendering_gucs: BTreeMap::new(),
             in_transaction: false,
             session_stateful: false,
-            prepared: HashMap::new(),
-            portals: HashMap::new(),
+            prepared: BoundedEffects::default(),
+            portals: BoundedEffects::default(),
             txn_dirty: std::collections::HashSet::new(),
             txn_opaque: false,
         })
@@ -380,14 +403,61 @@ impl TransformBuilder for PostgresReadCacheBuilder {
     }
 }
 
-/// The invalidation a prepared statement performs when executed: the relations to evict and whether it
-/// is opaque (evict everything). Recorded at Parse, applied at Execute (review F-INV-2 — drivers Parse
-/// once and Bind/Execute many, so invalidating only at Parse missed every write after the first).
+/// The relations a write evicts, and whether it is opaque (evict everything). Recorded at Parse, applied
+/// at Execute (review F-INV-2 — drivers Parse once and Bind/Execute many).
 type PreparedWrite = (Vec<Relation>, bool);
 
-/// Upper bound on the per-connection Parse/Bind tracking maps, so a client that Parses or Binds
-/// unbounded distinct names cannot grow them without limit (mirrors the redaction transform's cap).
-const MAX_PREPARED: usize = 1024;
+/// What an extended-protocol statement (or the portal bound from it) does, recorded at Parse and applied
+/// at Execute across the SAME transaction model as the simple protocol (review F-INV-4/5/6).
+#[derive(Clone)]
+enum StmtEffect {
+    /// A pure read, a `SET`, or anything with no data write and no transaction effect.
+    Neutral,
+    /// A data write: the relations to evict, and whether it is opaque (evict everything).
+    Write(Vec<Relation>, bool),
+    /// Transaction control (BEGIN/COMMIT/…).
+    Txn(TxnControl),
+    /// A statement/portal that could not be classified — capacity-evicted, or a Bind we never saw the
+    /// Parse for. Its Execute evicts everything (safe) and increments the untracked-execute counter.
+    Unknown,
+}
+
+/// Upper bound on the per-connection Parse/Bind tracking maps (review F-INV-8 — raised from 1024 so a
+/// driver's prepared-statement cache fits; pgjdbc defaults to 256).
+const MAX_PREPARED: usize = 4096;
+
+/// A bounded, FIFO-evicting map of extended-protocol statement/portal effects, so a client that Parses
+/// or Binds unbounded distinct names cannot grow it. The oldest entry is dropped; an Execute that then
+/// finds nothing falls back to `StmtEffect::Unknown` (evict-all, counted).
+#[derive(Default)]
+struct BoundedEffects {
+    map: HashMap<String, StmtEffect>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl BoundedEffects {
+    fn insert(&mut self, name: String, effect: StmtEffect) {
+        if !self.map.contains_key(&name) {
+            if self.map.len() >= MAX_PREPARED
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.map.remove(&oldest);
+            }
+            self.order.push_back(name.clone());
+        }
+        self.map.insert(name, effect);
+    }
+
+    fn get(&self, name: &str) -> Option<&StmtEffect> {
+        self.map.get(name)
+    }
+
+    fn remove(&mut self, name: &str) {
+        if self.map.remove(name).is_some() {
+            self.order.retain(|n| n != name);
+        }
+    }
+}
 
 pub struct PostgresReadCache {
     ttl: Duration,
@@ -399,6 +469,9 @@ pub struct PostgresReadCache {
     hits: Counter,
     misses: Counter,
     evictions: Counter,
+    /// Executes that hit the evict-all fallback because their statement/portal was untracked (review
+    /// F-INV-8 — makes the safe-but-blunt fallback visible to operators).
+    untracked_execute: Counter,
     // Per-connection state:
     user: Option<String>,
     database: Option<String>,
@@ -411,11 +484,11 @@ pub struct PostgresReadCache {
     /// Latched true once this connection issues a session-pinning statement; the cache is then off for
     /// this connection (its query results may depend on search_path/role the shared cache cannot know).
     session_stateful: bool,
-    /// statement name -> the write it performs (None for a pure read), recorded at Parse and applied at
-    /// Execute (review F-INV-2). Bounded by MAX_PREPARED.
-    prepared: HashMap<String, Option<PreparedWrite>>,
-    /// portal name -> the statement it was bound from, so an Execute can find the write to apply.
-    portals: HashMap<String, String>,
+    /// statement name -> its effect, recorded at Parse and applied at Execute (review F-INV-2/4).
+    prepared: BoundedEffects,
+    /// portal name -> the effect COPIED from its statement at Bind (review F-INV-7 — so a `Close(S)` of
+    /// the statement cannot orphan a still-live portal into an evict-all).
+    portals: BoundedEffects,
     /// Relations dirtied by writes inside the currently-open explicit transaction, plus whether any was
     /// opaque. Their invalidation is DEFERRED to COMMIT (review F-INV-3): evicting at the write request
     /// would let a concurrent read cache the not-yet-committed value; re-evicting at COMMIT closes the
@@ -443,6 +516,7 @@ enum Kind {
         kind: u8,
         name: String,
     },
+    Sync,
     Other,
 }
 
@@ -462,10 +536,11 @@ impl Transform for PostgresReadCache {
         let mut cache_on_response: MessageIdMap<(CacheKey, Vec<Relation>, Instant)> =
             MessageIdMap::default();
 
-        // Transaction state tracked across THIS batch from the request stream, seeded from the
-        // session's last-seen ReadyForQuery, so a pipelined [BEGIN, SELECT, COMMIT] is never treated as
-        // idle (review F7).
-        let mut in_txn = self.in_transaction;
+        // Are we inside an EXPLICIT transaction (BEGIN…COMMIT)? Tracked across THIS batch from the
+        // request stream, seeded from the session's last-seen ReadyForQuery, so a pipelined
+        // [BEGIN, SELECT, COMMIT] is never treated as idle (review F7). Updated by transaction control
+        // in BOTH the simple and extended protocols (review F-INV-4).
+        let mut explicit_txn = self.in_transaction;
         for request in &mut chain_state.requests {
             let rid = request.id();
             let kind = match request.frame() {
@@ -503,6 +578,7 @@ impl Transform for PostgresReadCache {
                     kind: *kind,
                     name: name.clone(),
                 },
+                Some(Frame::Postgres(PostgresFrame::Request(FrontendMessage::Sync))) => Kind::Sync,
                 _ => Kind::Other,
             };
             match kind {
@@ -537,57 +613,67 @@ impl Transform for PostgresReadCache {
                     if analysis.pins_session {
                         self.session_stateful = true;
                     }
-                    // Record the write this prepared statement performs so a LATER Execute — a driver
-                    // reuses one Parse across many Bind/Execute — can invalidate for it (review F-INV-2);
-                    // invalidating only here missed every write after the first.
+                    // Record the statement's effect (write / transaction control / neutral) so a LATER
+                    // Execute — a driver reuses one Parse across many Bind/Execute — applies it (review
+                    // F-INV-2/4).
                     if self.invalidate_on_write {
-                        let inv = self.statement_invalidation(&analysis);
-                        self.record_prepared(statement_name, inv);
+                        let effect = self.classify(&analysis);
+                        self.prepared.insert(statement_name, effect);
                     }
                 }
                 Kind::Bind {
                     portal_name,
                     statement_name,
                 } => {
-                    // Remember which statement a portal was bound from, so Execute can find its write.
-                    self.record_portal(portal_name, statement_name);
+                    // COPY the statement's effect into the portal, so a later Close(S) of the statement
+                    // cannot orphan this portal into an evict-all (review F-INV-7).
+                    if self.invalidate_on_write {
+                        let effect = self
+                            .prepared
+                            .get(&statement_name)
+                            .cloned()
+                            .unwrap_or(StmtEffect::Unknown);
+                        self.portals.insert(portal_name, effect);
+                    }
                 }
                 Kind::Execute(portal_name) => {
-                    // Apply the write recorded for the statement this portal was bound from (review
-                    // F-INV-2). An untracked portal/statement (capacity-evicted, or a Bind we never saw)
-                    // could be anything, so invalidate everything — safe over stale.
+                    // Apply the effect the portal was bound with (review F-INV-2/4/6). Extended writes
+                    // are deferred to the implicit-transaction Sync or the explicit COMMIT.
                     if self.invalidate_on_write {
-                        let inv = match self.portals.get(&portal_name) {
-                            Some(statement) => match self.prepared.get(statement) {
-                                Some(Some(write)) => Some(write.clone()),
-                                Some(None) => None, // recorded as a pure read: nothing to invalidate
-                                None => Some((Vec::new(), true)), // untracked statement: evict all
-                            },
-                            None => Some((Vec::new(), true)), // untracked portal: evict all
-                        };
-                        if let Some(inv) = inv {
-                            self.note_write(inv, in_txn);
-                        }
+                        let effect = self
+                            .portals
+                            .get(&portal_name)
+                            .cloned()
+                            .unwrap_or(StmtEffect::Unknown);
+                        self.apply_effect(&effect, &mut explicit_txn, true);
                     }
                 }
                 Kind::Close { kind, name } => match kind {
-                    b'S' => {
-                        self.prepared.remove(&name);
-                    }
-                    b'P' => {
-                        self.portals.remove(&name);
-                    }
+                    b'S' => self.prepared.remove(&name),
+                    b'P' => self.portals.remove(&name),
                     _ => {}
                 },
+                Kind::Sync => {
+                    // A Sync ends an IMPLICIT transaction (extended statements between Syncs commit here),
+                    // so flush the deferred invalidation — but NOT while an explicit transaction is open,
+                    // where only COMMIT commits (review F-INV-6).
+                    if self.invalidate_on_write && !explicit_txn {
+                        self.finish_transaction(true);
+                    }
+                }
                 Kind::Query(query) => {
                     let analysis = analyze_sql(&query);
-                    // Evict what this statement makes stale BEFORE it is forwarded, so a later read in
-                    // the same batch cannot be served a now-stale entry — but DEFER it to COMMIT if we
-                    // are inside an explicit transaction (review F-INV-3). A no-op for a pure read.
-                    if self.invalidate_on_write
-                        && let Some(inv) = self.statement_invalidation(&analysis)
-                    {
-                        self.note_write(inv, in_txn);
+                    // A simple Query also ends any open implicit transaction, so flush its deferred
+                    // writes before this statement (a no-op unless prior un-Synced extended writes are
+                    // pending; review F-INV-6).
+                    if self.invalidate_on_write && !explicit_txn {
+                        self.finish_transaction(true);
+                    }
+                    // Apply this statement's effect: a simple-protocol autocommit write commits
+                    // immediately (evict now), everything else follows the shared transaction model.
+                    if self.invalidate_on_write {
+                        let effect = self.classify(&analysis);
+                        self.apply_effect(&effect, &mut explicit_txn, false);
                     }
                     if analysis.pins_session {
                         // SET search_path/role, PREPARE, temp tables, …: turn the cache off for this
@@ -595,16 +681,8 @@ impl Transform for PostgresReadCache {
                         self.session_stateful = true;
                         continue;
                     }
-                    if is_txn_begin(&query) {
-                        in_txn = true;
-                    } else if is_txn_end(&query) {
-                        // Apply (COMMIT/END) or discard (ROLLBACK/ABORT) the transaction's deferred
-                        // invalidation, then leave the transaction.
-                        self.finish_transaction(is_commit(&query));
-                        in_txn = false;
-                    }
                     if self.session_stateful
-                        || in_txn
+                        || explicit_txn
                         || !analysis.replica_safe
                         || looks_volatile(&query)
                         || self.read_calls_impure(&analysis)
@@ -689,12 +767,22 @@ impl PostgresReadCache {
 
     /// True if a read calls a function the proxy cannot prove pure — any user function, which might
     /// write (review F-INV-1: caching `SELECT my_writing_proc()` silently loses the write). Such a read
-    /// must be neither served from nor stored in the cache.
+    /// must be neither served from nor stored in the cache. Names the first offending function at debug
+    /// level so an operator can decide whether to certify it via `pure_functions` (review X5).
     fn read_calls_impure(&self, analysis: &SqlAnalysis) -> bool {
-        analysis
+        if let Some(name) = analysis
             .functions
             .iter()
-            .any(|f| !is_pure_function(f, &self.pure_functions))
+            .find(|f| !is_pure_function(f, &self.pure_functions))
+        {
+            tracing::debug!(
+                function = %name,
+                "read not cached: function is not a known-pure builtin; add to pure_functions if it is read-only"
+            );
+            true
+        } else {
+            false
+        }
     }
 
     /// The invalidation a statement performs: the relations to evict and whether it is opaque (evict
@@ -719,12 +807,51 @@ impl PostgresReadCache {
         Some((relations, opaque))
     }
 
-    /// Apply a statement's invalidation — immediately if autocommit, or DEFER it to COMMIT when inside
-    /// an explicit transaction (review F-INV-3), since the write is not visible to other connections
-    /// until then and evicting early would let a concurrent read cache the pre-commit value.
-    fn note_write(&mut self, inv: PreparedWrite, in_txn: bool) {
+    /// Classify a statement into the effect the cache applies at its execution point.
+    fn classify(&self, analysis: &SqlAnalysis) -> StmtEffect {
+        if let Some(txn) = &analysis.txn {
+            return StmtEffect::Txn(txn.clone());
+        }
+        match self.statement_invalidation(analysis) {
+            Some((relations, opaque)) => StmtEffect::Write(relations, opaque),
+            None => StmtEffect::Neutral,
+        }
+    }
+
+    /// Apply a statement's effect at its execution point (a simple Query, or an extended Execute).
+    /// `deferred` is true when a write must wait for a later commit point rather than evict now — always
+    /// for the extended protocol (its implicit-transaction Sync), and for a simple Query only inside an
+    /// explicit transaction (review F-INV-3/4/6). Transaction control updates `explicit_txn` for both
+    /// protocols (review F-INV-4/5).
+    fn apply_effect(&mut self, effect: &StmtEffect, explicit_txn: &mut bool, deferred: bool) {
+        match effect {
+            StmtEffect::Neutral => {}
+            StmtEffect::Write(relations, opaque) => {
+                self.note_write((relations.clone(), *opaque), *explicit_txn || deferred);
+            }
+            StmtEffect::Unknown => {
+                self.untracked_execute.increment(1);
+                self.note_write((Vec::new(), true), *explicit_txn || deferred);
+            }
+            StmtEffect::Txn(TxnControl::Begin) => *explicit_txn = true,
+            StmtEffect::Txn(TxnControl::Commit { chain }) => {
+                self.finish_transaction(true);
+                *explicit_txn = *chain;
+            }
+            StmtEffect::Txn(TxnControl::Rollback { chain }) => {
+                self.finish_transaction(false);
+                *explicit_txn = *chain;
+            }
+            StmtEffect::Txn(TxnControl::Nested) => {}
+        }
+    }
+
+    /// Apply a write's invalidation — immediately if autocommit, or DEFER it to a commit point (COMMIT,
+    /// or the implicit-transaction Sync) since the write is not visible to other connections until then
+    /// and evicting early would let a concurrent read cache the pre-commit value (review F-INV-3/6).
+    fn note_write(&mut self, inv: PreparedWrite, defer: bool) {
         let (relations, opaque) = inv;
-        if in_txn {
+        if defer {
             if opaque {
                 self.txn_opaque = true;
             }
@@ -766,30 +893,6 @@ impl PostgresReadCache {
         if evicted > 0 {
             self.evictions.increment(evicted);
         }
-    }
-
-    /// Records a prepared statement's write for a later Execute, bounded so a client that Parses
-    /// unbounded distinct names cannot grow the map without limit; an evicted entry's next Execute falls
-    /// back to evict-all (safe).
-    fn record_prepared(&mut self, statement_name: String, inv: Option<PreparedWrite>) {
-        if self.prepared.len() >= MAX_PREPARED
-            && !self.prepared.contains_key(&statement_name)
-            && let Some(victim) = self.prepared.keys().next().cloned()
-        {
-            self.prepared.remove(&victim);
-        }
-        self.prepared.insert(statement_name, inv);
-    }
-
-    /// Records which statement a portal was bound from, bounded the same way as `record_prepared`.
-    fn record_portal(&mut self, portal_name: String, statement_name: String) {
-        if self.portals.len() >= MAX_PREPARED
-            && !self.portals.contains_key(&portal_name)
-            && let Some(victim) = self.portals.keys().next().cloned()
-        {
-            self.portals.remove(&victim);
-        }
-        self.portals.insert(portal_name, statement_name);
     }
 
     fn cache_get(&self, key: &CacheKey) -> Option<Message> {
@@ -862,24 +965,6 @@ fn rendering_fingerprint(gucs: &BTreeMap<String, String>) -> String {
         fingerprint.push(';');
     }
     fingerprint
-}
-
-/// True if a query begins a transaction.
-fn is_txn_begin(query: &str) -> bool {
-    let q = query.trim_start().to_ascii_lowercase();
-    q.starts_with("begin") || q.starts_with("start transaction")
-}
-
-/// True if a query ends a transaction.
-fn is_txn_end(query: &str) -> bool {
-    let q = query.trim_start().to_ascii_lowercase();
-    q.starts_with("commit") || q.starts_with("rollback") || q.starts_with("end") || q.starts_with("abort")
-}
-
-/// True if a transaction-ending query COMMITS (vs ROLLBACK/ABORT). Only meaningful when `is_txn_end`.
-fn is_commit(query: &str) -> bool {
-    let q = query.trim_start().to_ascii_lowercase();
-    q.starts_with("commit") || q.starts_with("end")
 }
 
 /// A response train may be cached only if it is a clean idle result: it contains NO ErrorResponse (a
@@ -971,17 +1056,16 @@ fn trailing_ready_status(response: &mut Message) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheEntry, CacheStore, Frame, Message, PostgresFrame, PostgresReadCache, Relation,
-        is_commit, is_pure_function, is_txn_begin, is_txn_end, looks_volatile, relation_name,
-        response_is_cacheable,
+        BoundedEffects, CacheEntry, CacheStore, Frame, Message, PostgresFrame, PostgresReadCache,
+        Relation, StmtEffect, is_pure_function, looks_volatile, relation_name, response_is_cacheable,
     };
     use crate::frame::postgres::{BackendMessage, analyze_sql};
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     /// A cache instance with no-op counters and a fresh store, for exercising the per-connection write
-    /// logic (statement_invalidation / note_write / finish_transaction) directly.
+    /// logic (classify / apply_effect / finish_transaction) directly.
     fn test_cache(pure_functions: &[&str]) -> PostgresReadCache {
         use metrics::counter;
         PostgresReadCache {
@@ -994,13 +1078,14 @@ mod tests {
             hits: counter!("test_hits"),
             misses: counter!("test_misses"),
             evictions: counter!("test_evictions"),
+            untracked_execute: counter!("test_untracked"),
             user: Some("u".to_owned()),
             database: Some("db".to_owned()),
             rendering_gucs: BTreeMap::new(),
             in_transaction: false,
             session_stateful: false,
-            prepared: HashMap::new(),
-            portals: HashMap::new(),
+            prepared: BoundedEffects::default(),
+            portals: BoundedEffects::default(),
             txn_dirty: HashSet::new(),
             txn_opaque: false,
         }
@@ -1035,15 +1120,20 @@ mod tests {
     }
 
     #[test]
-    fn transaction_boundaries() {
-        assert!(is_txn_begin("BEGIN"));
-        assert!(is_txn_begin("  begin transaction"));
-        assert!(is_txn_begin("START TRANSACTION"));
-        assert!(!is_txn_begin("SELECT 1"));
-        assert!(is_txn_end("COMMIT"));
-        assert!(is_txn_end("rollback"));
-        assert!(is_txn_end("END"));
-        assert!(!is_txn_end("SELECT 1"));
+    fn transaction_control_classification() {
+        use crate::frame::postgres::TxnControl;
+        assert_eq!(analyze_sql("BEGIN").txn, Some(TxnControl::Begin));
+        assert_eq!(analyze_sql("start transaction").txn, Some(TxnControl::Begin));
+        assert_eq!(analyze_sql("COMMIT").txn, Some(TxnControl::Commit { chain: false }));
+        assert_eq!(analyze_sql("END").txn, Some(TxnControl::Commit { chain: false }));
+        assert_eq!(analyze_sql("ROLLBACK").txn, Some(TxnControl::Rollback { chain: false }));
+        // The F-INV-5 hazard: ROLLBACK TO SAVEPOINT / SAVEPOINT / RELEASE do NOT end the transaction.
+        assert_eq!(analyze_sql("ROLLBACK TO SAVEPOINT sp").txn, Some(TxnControl::Nested));
+        assert_eq!(analyze_sql("SAVEPOINT sp").txn, Some(TxnControl::Nested));
+        assert_eq!(analyze_sql("RELEASE SAVEPOINT sp").txn, Some(TxnControl::Nested));
+        assert_eq!(analyze_sql("COMMIT AND CHAIN").txn, Some(TxnControl::Commit { chain: true }));
+        assert_eq!(analyze_sql("SELECT 1").txn, None);
+        assert_eq!(analyze_sql("UPDATE t SET v=1").txn, None);
     }
 
     fn response(messages: Vec<BackendMessage>) -> Message {
@@ -1144,14 +1234,16 @@ mod tests {
     }
 
     #[test]
-    fn pure_function_allowlist_and_commit_split() {
+    fn pure_function_allowlist() {
         let pf: HashSet<String> = ["my_pure"].iter().map(|s| s.to_string()).collect();
         assert!(is_pure_function("count", &pf));
         assert!(is_pure_function("upper", &pf));
+        assert!(is_pure_function("to_tsvector", &pf), "full-text builtin is pure (review X5)");
+        assert!(is_pure_function("jsonb_array_elements", &pf), "set-returning JSON is pure (X5)");
         assert!(is_pure_function("my_pure", &pf), "operator-listed function is pure");
         assert!(!is_pure_function("log_ev", &pf), "unknown function is not pure");
         assert!(!is_pure_function("nextval", &pf), "writing builtin is not pure");
-        assert!(is_commit("COMMIT") && is_commit("end") && !is_commit("ROLLBACK"));
+        assert!(!is_pure_function("current_setting", &pf), "session-dependent stays excluded (X5)");
     }
 
     #[test]
@@ -1178,39 +1270,116 @@ mod tests {
         assert_eq!(listed.statement_invalidation(&udf), None);
     }
 
-    #[test]
-    fn named_prepared_write_invalidates_at_execute() {
-        // F-INV-2: Parse records the write; the LATER Execute (reusing the statement) applies it, even
-        // though there is no Parse the second time.
-        let mut cache = test_cache(&[]);
-        prime(&cache, key("select v from t"), rel("t"));
-
-        // Parse s_upd "UPDATE t ..." — records, evicts nothing yet.
-        let upd = analyze_sql("UPDATE t SET v = 1 WHERE id = 2");
-        let inv = cache.statement_invalidation(&upd);
-        cache.record_prepared("s_upd".to_owned(), inv);
-        assert_eq!(entries(&cache), 1, "Parse alone evicts nothing");
-
-        // Bind ""/s_upd then Execute "" — now the write is applied.
-        cache.record_portal(String::new(), "s_upd".to_owned());
+    /// Drive one extended-protocol statement through the Parse -> Bind -> Execute path the transform
+    /// uses, so tests exercise the real recording/copying/apply flow (review F-INV-2/4/6/7).
+    fn parse_bind_execute(
+        cache: &mut PostgresReadCache,
+        stmt: &str,
+        portal: &str,
+        sql: &str,
+        explicit_txn: &mut bool,
+    ) {
+        let effect = cache.classify(&analyze_sql(sql));
+        cache.prepared.insert(stmt.to_owned(), effect);
         let bound = cache
+            .prepared
+            .get(stmt)
+            .cloned()
+            .unwrap_or(StmtEffect::Unknown);
+        cache.portals.insert(portal.to_owned(), bound);
+        let effect = cache
             .portals
-            .get("")
-            .and_then(|s| cache.prepared.get(s))
-            .and_then(|o| o.clone());
-        cache.note_write(bound.expect("statement recorded a write"), false);
-        assert_eq!(entries(&cache), 0, "Execute of the prepared write evicts t");
+            .get(portal)
+            .cloned()
+            .unwrap_or(StmtEffect::Unknown);
+        cache.apply_effect(&effect, explicit_txn, true);
     }
 
     #[test]
-    fn untracked_execute_evicts_everything() {
-        // An Execute of a portal we never saw Bound (capacity-evicted, or a Bind before we attached)
-        // could be anything -> evict all, never serve stale.
+    fn named_prepared_write_invalidates_at_execute() {
+        // F-INV-2: Parse records the write; the LATER Execute (reusing the statement) applies it.
         let mut cache = test_cache(&[]);
         prime(&cache, key("select v from t"), rel("t"));
-        // portals is empty -> the transform's Execute arm falls back to (Vec::new(), true).
-        cache.note_write((Vec::new(), true), false);
-        assert_eq!(entries(&cache), 0);
+        let mut explicit_txn = false;
+
+        // Parse s_upd records; Bind copies; Execute defers (extended); the Sync commits the implicit
+        // transaction and flushes the eviction.
+        parse_bind_execute(&mut cache, "s_upd", "", "UPDATE t SET v=1 WHERE id=2", &mut explicit_txn);
+        cache.finish_transaction(true); // Sync
+        assert_eq!(entries(&cache), 0, "the prepared write evicts t at Sync");
+    }
+
+    #[test]
+    fn close_statement_does_not_orphan_a_bound_portal() {
+        // F-INV-7: Close(S) drops the statement, but the portal keeps its copied effect, so its Execute
+        // applies the real write instead of falling back to evict-all.
+        let mut cache = test_cache(&[]);
+        prime(&cache, key("select a from other"), rel("other"));
+        prime(&cache, key("select v from t"), rel("t"));
+        let mut explicit_txn = false;
+
+        // Parse s9 (a write to t); Bind p9<-s9; Close S s9; Execute p9.
+        cache.prepared.insert("s9".to_owned(), cache.classify(&analyze_sql("UPDATE t SET v=1")));
+        let bound = cache.prepared.get("s9").cloned().unwrap();
+        cache.portals.insert("p9".to_owned(), bound);
+        cache.prepared.remove("s9"); // Close(S)
+        let effect = cache.portals.get("p9").cloned().unwrap_or(StmtEffect::Unknown);
+        cache.apply_effect(&effect, &mut explicit_txn, true);
+        cache.finish_transaction(true); // Sync
+
+        assert!(entries(&cache) == 1, "only t evicted (targeted), not everything");
+        assert!(
+            cache.cache.lock().unwrap().entries.contains_key(&key("select a from other")),
+            "the unrelated 'other' read survived — no evict-all orphan"
+        );
+    }
+
+    #[test]
+    fn extended_begin_commit_defers_then_flushes() {
+        // F-INV-4: BEGIN/COMMIT via the extended protocol are tracked, so the in-txn write defers and
+        // COMMIT flushes it. F-INV-6: an implicit (un-BEGUN) extended write flushes at Sync.
+        let mut cache = test_cache(&[]);
+        prime(&cache, key("select v from t"), rel("t"));
+        let mut explicit_txn = false;
+
+        parse_bind_execute(&mut cache, "s_begin", "", "BEGIN", &mut explicit_txn);
+        assert!(explicit_txn, "extended BEGIN opened the transaction");
+        parse_bind_execute(&mut cache, "s_upd", "", "UPDATE t SET v=1", &mut explicit_txn);
+        assert_eq!(entries(&cache), 1, "in-txn write deferred, not evicted");
+        parse_bind_execute(&mut cache, "s_commit", "", "COMMIT", &mut explicit_txn);
+        assert!(!explicit_txn, "extended COMMIT left the transaction");
+        assert_eq!(entries(&cache), 0, "COMMIT flushed the deferred eviction");
+
+        // Implicit transaction: an extended write with no BEGIN defers to the Sync.
+        prime(&cache, key("select v from t"), rel("t"));
+        parse_bind_execute(&mut cache, "s_imp", "", "UPDATE t SET v=2", &mut explicit_txn);
+        assert_eq!(entries(&cache), 1, "un-Synced extended write is not evicted yet (F-INV-6)");
+        // The Sync arm: !explicit_txn -> flush the implicit transaction.
+        cache.finish_transaction(true);
+        assert_eq!(entries(&cache), 0, "Sync flushed the implicit-transaction write");
+    }
+
+    #[test]
+    fn rollback_to_savepoint_keeps_the_deferred_set() {
+        // F-INV-5: ROLLBACK TO SAVEPOINT must NOT be treated as a transaction end; the pre-savepoint
+        // write stays deferred and is applied at the eventual COMMIT.
+        let mut cache = test_cache(&[]);
+        prime(&cache, key("select v from t"), rel("t"));
+        let mut explicit_txn = true; // already inside BEGIN
+
+        let upd = cache.classify(&analyze_sql("UPDATE t SET v=1"));
+        cache.apply_effect(&upd, &mut explicit_txn, false);
+        assert_eq!(cache.txn_dirty.len(), 1, "write deferred inside the txn");
+
+        // ROLLBACK TO SAVEPOINT -> Nested -> no flush, no discard, txn stays open.
+        let rb = cache.classify(&analyze_sql("ROLLBACK TO SAVEPOINT sp"));
+        cache.apply_effect(&rb, &mut explicit_txn, false);
+        assert!(explicit_txn, "still in the transaction");
+        assert_eq!(cache.txn_dirty.len(), 1, "the deferred set was NOT discarded (F-INV-5)");
+
+        let commit = cache.classify(&analyze_sql("COMMIT"));
+        cache.apply_effect(&commit, &mut explicit_txn, false);
+        assert_eq!(entries(&cache), 0, "COMMIT finally applies the eviction");
     }
 
     #[test]
@@ -1219,9 +1388,8 @@ mod tests {
         let mut cache = test_cache(&[]);
         prime(&cache, key("select v from t"), rel("t"));
 
-        let upd = analyze_sql("UPDATE t SET v = 1");
-        let inv = cache.statement_invalidation(&upd).unwrap();
-        cache.note_write(inv, true); // in_txn = true
+        let inv = cache.statement_invalidation(&analyze_sql("UPDATE t SET v = 1")).unwrap();
+        cache.note_write(inv, true); // deferred
         assert_eq!(entries(&cache), 1, "no eviction while the txn is open");
         assert_eq!(cache.txn_dirty.len(), 1, "the dirtied relation is remembered");
 
@@ -1231,7 +1399,7 @@ mod tests {
 
         // ROLLBACK path: a deferred write is discarded, the cached read survives.
         prime(&cache, key("select v from t"), rel("t"));
-        let inv = cache.statement_invalidation(&upd).unwrap();
+        let inv = cache.statement_invalidation(&analyze_sql("UPDATE t SET v = 1")).unwrap();
         cache.note_write(inv, true);
         cache.finish_transaction(false); // ROLLBACK
         assert_eq!(entries(&cache), 1, "ROLLBACK discards the deferred eviction");
