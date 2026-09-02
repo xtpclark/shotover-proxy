@@ -162,7 +162,8 @@ impl TransformConfig for PostgresSinkClusterConfig {
             primary_reprobe,
             replica_unhealthy,
             tls,
-            topology: Arc::new(Mutex::new(None)),
+            topology: Arc::new(Mutex::new(TopologyState::default())),
+            probe_lock: Arc::new(Mutex::new(())),
             round_robin: Arc::new(AtomicUsize::new(0)),
             replica_health: Arc::new(Mutex::new(HashMap::new())),
             cancel_registry: Arc::new(StdMutex::new(HashMap::new())),
@@ -196,6 +197,20 @@ struct Topology {
     replicas: Vec<String>,
 }
 
+/// The shared topology plus a generation counter. `generation` increments on every successful probe,
+/// so a session can remember which generation it routed against and refuse to invalidate a topology
+/// that has since been re-probed by someone else — the guard that stops a slow/concurrent failure from
+/// clearing fresh state or triggering a re-probe storm (review F4).
+#[derive(Default)]
+struct TopologyState {
+    topology: Option<Topology>,
+    generation: u64,
+    /// The last primary this cluster selected, PRESERVED across invalidation. On a re-probe that finds
+    /// more than one writable host (an un-fenced old primary that came back), the previously-selected
+    /// primary is preferred so writes are never silently flipped to a returning stale node (review F5).
+    last_primary: Option<String>,
+}
+
 pub struct PostgresSinkClusterBuilder {
     name: String,
     contact_points: Vec<String>,
@@ -207,7 +222,11 @@ pub struct PostgresSinkClusterBuilder {
     preferred_replicas: Vec<String>,
     replica_health_cooldown: Duration,
     tls: Option<TlsConnector>,
-    topology: Arc<Mutex<Option<Topology>>>,
+    topology: Arc<Mutex<TopologyState>>,
+    /// Single-flight guard: a burst of connections that all find the topology absent runs ONE probe,
+    /// held OUTSIDE the topology lock so the (potentially slow) probe never blocks a session that
+    /// already has a topology.
+    probe_lock: Arc<Mutex<()>>,
     /// pgbouncer-style userlist for replica origination (client username -> cleartext password).
     replica_users: Arc<HashMap<String, String>>,
     /// Rotates replica selection across client connections. Shared so it actually advances between
@@ -239,6 +258,8 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             replica_users: self.replica_users.clone(),
             tls: self.tls.clone(),
             topology: self.topology.clone(),
+            probe_lock: self.probe_lock.clone(),
+            primary_generation: 0,
             round_robin: self.round_robin.clone(),
             replica_health: self.replica_health.clone(),
             reads_to_replica: self.reads_to_replica.clone(),
@@ -293,7 +314,13 @@ pub struct PostgresSinkCluster {
     preferred_replicas: Vec<String>,
     replica_health_cooldown: Duration,
     tls: Option<TlsConnector>,
-    topology: Arc<Mutex<Option<Topology>>>,
+    topology: Arc<Mutex<TopologyState>>,
+    /// Single-flight guard for re-probing (see the builder field).
+    probe_lock: Arc<Mutex<()>>,
+    /// The topology generation the current `primary` connection was opened against. A failure only
+    /// invalidates the topology this session actually connected to — never one another session has
+    /// since re-probed (review F4; keyed to CONNECT, not reads, so a fresh topology is not cleared).
+    primary_generation: u64,
     /// pgbouncer-style userlist for replica origination (client username -> cleartext password).
     replica_users: Arc<HashMap<String, String>>,
     round_robin: Arc<AtomicUsize>,
@@ -361,6 +388,21 @@ impl Transform for PostgresSinkCluster {
         if requests_contain_cancel(&mut chain_state.requests) {
             return self.handle_cancel(chain_state).await;
         }
+        // If a failover re-probed the topology since this session opened its primary link, that link is
+        // to a since-replaced (likely dead) primary. Surface a clean error and close so the client
+        // reconnects onto the current primary with a fresh session, instead of writing to a dead node
+        // or silently losing session state (review F4/F5 re-verify).
+        if self.startup_complete && self.primary.is_some() {
+            let current_generation = { self.topology.lock().await.generation };
+            if self.primary_generation != current_generation {
+                self.primary = None;
+                self.outstanding_primary = 0;
+                self.unit_target = None;
+                chain_state.close_client_connection = true;
+                let first_id = chain_state.requests.first_mut().map(|r| r.id());
+                return Ok(vec![backend_link_lost_response(first_id)]);
+            }
+        }
         if let Err(err) = self.ensure_primary().await {
             return map_startup_error(err, chain_state);
         }
@@ -392,7 +434,14 @@ impl Transform for PostgresSinkCluster {
                 chain_state.close_client_connection = true;
                 Ok(vec![backend_read_timeout_response(first_id)])
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                // Any other route error is a broken backend link (a crash or a failover mid-batch).
+                // Surface a clean FATAL 08006 and close instead of the generic "internal shotover bug"
+                // text a bare Err produces (review F4/F10 family).
+                tracing::warn!("postgres cluster: backend link lost: {err}");
+                chain_state.close_client_connection = true;
+                Ok(vec![backend_link_lost_response(first_id)])
+            }
         }
     }
 }
@@ -498,17 +547,22 @@ impl PostgresSinkCluster {
                 {
                     Ok(responses) => responses,
                     Err(err) => {
-                        // The primary link is broken (a stall, a crash, or a failover). Drop it and
-                        // this unit so nothing reuses a desynced connection.
-                        if err.downcast_ref::<super::BackendReadTimeout>().is_some() {
+                        // Classify before reacting (review F4). A read timeout means the primary was
+                        // SLOW, not dead — the connection is desynced so drop it, but do NOT invalidate
+                        // shared topology (that would make one slow query re-probe for every session).
+                        // Only a transport error means the primary is gone.
+                        let is_timeout = err.downcast_ref::<super::BackendReadTimeout>().is_some();
+                        if is_timeout {
                             self.backend_read_timeout.increment(1);
                         }
                         self.primary = None;
                         self.outstanding_primary = 0;
                         self.unit_target = None;
-                        // Discard the cached topology so the NEXT connection re-probes and finds a
-                        // promoted replica, instead of pinning a dead primary until process restart.
-                        self.invalidate_topology().await;
+                        if !is_timeout {
+                            // A broken primary link (crash/failover): discard the cached topology so the
+                            // NEXT connection re-probes and finds a promoted replica.
+                            self.invalidate_topology().await;
+                        }
                         return Err(err);
                     }
                 }
@@ -524,17 +578,23 @@ impl PostgresSinkCluster {
                 {
                     Ok(responses) => responses,
                     Err(err) => {
-                        if err.downcast_ref::<super::BackendReadTimeout>().is_some() {
+                        // Classify before reacting (review F4). A read timeout means the replica was
+                        // SLOW, not unhealthy — drop the desynced connection but do NOT cool the host
+                        // (that would push every user off it for one slow read). Only a transport error
+                        // cools it down and forces reselection.
+                        let is_timeout = err.downcast_ref::<super::BackendReadTimeout>().is_some();
+                        if is_timeout {
                             self.backend_read_timeout.increment(1);
                         }
                         self.replica = None;
                         self.outstanding_replica = 0;
                         self.unit_target = None;
-                        // A broken replica link: cool it down so reads skip it, and reselect next time.
-                        if let Some(addr) = self.replica_addr.clone() {
-                            self.mark_replica_unhealthy(&addr).await;
+                        if !is_timeout {
+                            if let Some(addr) = self.replica_addr.clone() {
+                                self.mark_replica_unhealthy(&addr).await;
+                            }
+                            self.replica_addr = None;
                         }
-                        self.replica_addr = None;
                         return Err(err);
                     }
                 }
@@ -587,12 +647,14 @@ impl PostgresSinkCluster {
         {
             Ok(responses) => responses,
             Err(err) => {
-                // A backend that stalls or breaks during the client's own startup gets the same
-                // treatment as an unsupported-auth backend: drop it and surface a clean FATAL. Also
-                // discard the cached topology so the next connection re-probes for a new primary.
+                // A backend that breaks during the client's own startup gets a clean FATAL. Only a
+                // transport error (not a read timeout, which just means slow) invalidates the shared
+                // topology so the next connection re-probes for a new primary (review F4).
                 self.primary = None;
                 self.outstanding_primary = 0;
-                self.invalidate_topology().await;
+                if err.downcast_ref::<super::BackendReadTimeout>().is_none() {
+                    self.invalidate_topology().await;
+                }
                 return map_startup_error(err, chain_state);
             }
         };
@@ -626,27 +688,49 @@ impl PostgresSinkCluster {
         self.replica.is_some() || self.replica_addr.is_some()
     }
 
-    /// Probes topology once (shared across all client connections) if it is not already known.
+    /// Ensures a topology is known, probing if not. The probe is SINGLE-FLIGHT (a burst of connections
+    /// runs one probe) and runs OUTSIDE the topology lock, so a session that already has a topology is
+    /// never blocked by an unrelated re-probe — the shared lock is only held for the brief read/store,
+    /// never across the (possibly slow) probe of every contact point (review F4).
     async fn ensure_topology(&mut self) -> Result<()> {
-        // The probe runs while holding the shared lock so that a burst of connections at cold start
-        // does not each run a full probe of every host (a thundering herd against a backend that is
-        // least able to absorb it). Holding the lock is only safe because every probe is bounded by
-        // BACKEND_OP_TIMEOUT, so one stalled host delays the lock by at most that, once.
-        let topology = {
-            let mut guard = self.topology.lock().await;
-            if guard.is_none() {
-                let probed = self.probe_topology().await?;
-                tracing::info!(
-                    "postgres cluster topology: primary={} replicas={:?}",
-                    probed.primary,
-                    probed.replicas
-                );
-                *guard = Some(probed);
-            }
-            guard.as_ref().unwrap().clone()
-        };
-        self.select_replica_addr(&topology).await;
+        // Fast path: a topology is already known.
+        if let Some(topology) = self.current_topology().await {
+            self.select_replica_addr(&topology).await;
+            return Ok(());
+        }
+        // Slow path: cold start or just-invalidated. Serialize probers so only one runs. Lock a clone
+        // of the Arc, not self.probe_lock, so holding the guard does not borrow self (we still need
+        // &mut self below).
+        let probe_lock = self.probe_lock.clone();
+        let _probe_guard = probe_lock.lock().await;
+        // Another prober may have finished while we waited for the guard.
+        if let Some(topology) = self.current_topology().await {
+            self.select_replica_addr(&topology).await;
+            return Ok(());
+        }
+        let last_primary = { self.topology.lock().await.last_primary.clone() };
+        let probed = self.probe_topology(last_primary.as_deref()).await?;
+        tracing::info!(
+            "postgres cluster topology: primary={} replicas={:?}",
+            probed.primary,
+            probed.replicas
+        );
+        {
+            let mut state = self.topology.lock().await;
+            state.last_primary = Some(probed.primary.clone());
+            state.topology = Some(probed.clone());
+            state.generation += 1;
+        }
+        self.select_replica_addr(&probed).await;
         Ok(())
+    }
+
+    /// Returns the current topology if known. Does NOT touch `primary_generation` — that is keyed to
+    /// when this session CONNECTED its primary (see `connect_primary`), not to when it last read the
+    /// topology, or a session that reads a freshly re-probed topology and then fails on its OLD primary
+    /// link would wrongly clear the fresh one (review F4 re-verify).
+    async fn current_topology(&self) -> Option<Topology> {
+        self.topology.lock().await.topology.clone()
     }
 
     /// Chooses which replica this connection reads from, honouring health (B3) and locality (B2):
@@ -699,8 +783,8 @@ impl PostgresSinkCluster {
     }
 
     /// Connects to each contact point, runs `pg_is_in_recovery()`, and classifies primary vs replica.
-    async fn probe_topology(&self) -> Result<Topology> {
-        let mut primary = None;
+    async fn probe_topology(&self, last_primary: Option<&str>) -> Result<Topology> {
+        let mut primaries = vec![];
         let mut replicas = vec![];
         // If a contact point rejects the probe because it requires md5/SCRAM (which the cluster sink
         // cannot originate), keep that specific error so a "no primary" outcome surfaces it to the
@@ -709,15 +793,7 @@ impl PostgresSinkCluster {
         for host in &self.contact_points {
             match self.probe_host(host).await {
                 Ok(true) => replicas.push(host.clone()),
-                Ok(false) => {
-                    if primary.is_some() {
-                        tracing::warn!(
-                            "postgres cluster: more than one primary found, keeping the first"
-                        );
-                    } else {
-                        primary = Some(host.clone());
-                    }
-                }
+                Ok(false) => primaries.push(host.clone()),
                 Err(err) => {
                     if err.downcast_ref::<BackendAuthUnsupported>().is_some() {
                         auth_unsupported.get_or_insert(err);
@@ -727,7 +803,7 @@ impl PostgresSinkCluster {
                 }
             }
         }
-        match primary {
+        match self.choose_primary(&primaries, &replicas, last_primary).await {
             Some(primary) => Ok(Topology { primary, replicas }),
             None => match auth_unsupported {
                 Some(err) => Err(err),
@@ -737,6 +813,65 @@ impl PostgresSinkCluster {
                 ),
             },
         }
+    }
+
+    /// Fencing (review F5): never let contact-point ORDER decide the primary when more than one host
+    /// reports itself writable — that is an un-fenced old primary that came back, a split brain.
+    /// Preference order: keep the primary we were already using (do not flip writes to a returning
+    /// stale node), then the host the replicas actually stream from (the true current primary), then —
+    /// only if still ambiguous — the first, logged at ERROR.
+    async fn choose_primary(
+        &self,
+        primaries: &[String],
+        replicas: &[String],
+        last_primary: Option<&str>,
+    ) -> Option<String> {
+        if primaries.len() > 1 {
+            tracing::error!(
+                "postgres cluster: MORE THAN ONE host reports itself a primary ({primaries:?}) — \
+                 possible un-fenced old primary / split brain; fencing by last-known primary then \
+                 replication source"
+            );
+        }
+        match pick_primary_by_known(primaries, last_primary) {
+            PrimaryChoice::None => None,
+            PrimaryChoice::Chosen(primary) => Some(primary),
+            // Multiple primaries and the last-known one is gone: ask the replicas who they stream from.
+            PrimaryChoice::Ambiguous => {
+                if let Some(sender) = self.replication_source(replicas).await
+                    && let Some(primary) = primaries.iter().find(|p| host_matches(p, &sender))
+                {
+                    return Some(primary.clone());
+                }
+                Some(primaries[0].clone())
+            }
+        }
+    }
+
+    /// Best-effort: asks each replica which host it streams WAL from (`pg_stat_wal_receiver`) and
+    /// returns the first answer — that host is the true current primary. Only used to break a
+    /// multiple-primaries tie, so its cost falls only on that rare split-brain path.
+    async fn replication_source(&self, replicas: &[String]) -> Option<String> {
+        for replica in replicas {
+            let Ok(mut connection) = self.new_backend_connection(replica).await else {
+                continue;
+            };
+            let database = self.probe_database.clone();
+            let sql = "SELECT coalesce(sender_host,'') || ':' || coalesce(sender_port::text,'') \
+                       FROM pg_stat_wal_receiver LIMIT 1";
+            let result = tokio::time::timeout(BACKEND_OP_TIMEOUT, async {
+                authenticate_backend(&mut connection, &self.username, &database, &self.password)
+                    .await?;
+                query_scalar_string(&mut connection, sql).await
+            })
+            .await;
+            if let Ok(Ok(Some(sender))) = result
+                && !sender.trim_matches(':').is_empty()
+            {
+                return Some(sender);
+            }
+        }
+        None
     }
 
     async fn probe_host(&self, host: &str) -> Result<bool> {
@@ -783,12 +918,15 @@ impl PostgresSinkCluster {
     /// carries the client's own auth by passthrough.
     async fn connect_primary(&mut self) -> Result<()> {
         let primary_addr = {
-            let guard = self.topology.lock().await;
-            guard
+            let state = self.topology.lock().await;
+            let addr = state
+                .topology
                 .as_ref()
                 .ok_or_else(|| anyhow!("topology not resolved"))?
                 .primary
-                .clone()
+                .clone();
+            self.primary_generation = state.generation;
+            addr
         };
         self.primary = Some(self.new_backend_connection(&primary_addr).await?);
         Ok(())
@@ -799,8 +937,17 @@ impl PostgresSinkCluster {
     /// discover a promoted replica after a failover. Also clears THIS connection's replica choice,
     /// whose host role may have just changed, so the refreshed topology reselects it.
     async fn invalidate_topology(&mut self) {
-        self.primary_reprobe.increment(1);
-        *self.topology.lock().await = None;
+        {
+            let mut state = self.topology.lock().await;
+            // Only invalidate the topology this session actually failed against. If another session
+            // already re-probed (generation advanced) or already invalidated (topology None), this is
+            // a stale failure — leave the fresh state alone, so a slow or concurrent failure can neither
+            // clear a just-installed topology nor cause a re-probe storm (review F4).
+            if state.topology.is_some() && state.generation == self.primary_generation {
+                state.topology = None;
+                self.primary_reprobe.increment(1);
+            }
+        }
         self.replica_addr = None;
     }
 
@@ -898,8 +1045,8 @@ impl PostgresSinkCluster {
     /// server's behaviour after acting on a cancel.
     async fn handle_cancel(&mut self, chain_state: &mut ChainState<'_>) -> Result<Messages> {
         let primary_addr = {
-            let guard = self.topology.lock().await;
-            guard.as_ref().map(|t| t.primary.clone())
+            let state = self.topology.lock().await;
+            state.topology.as_ref().map(|t| t.primary.clone())
         };
         let mut responses = vec![];
         for request in chain_state.requests.iter_mut() {
@@ -1148,6 +1295,29 @@ fn backend_read_timeout_response(request_id: Option<MessageId>) -> Message {
     response
 }
 
+/// The ErrorResponse sent to the client when the backend link is lost (a crash, a failover, or a
+/// stale primary link after a re-probe). SQLSTATE 08006 (connection_failure); the caller closes the
+/// connection so the client reconnects onto the current primary with a fresh session.
+fn backend_link_lost_response(request_id: Option<MessageId>) -> Message {
+    let mut response = Message::from_frame(Frame::Postgres(PostgresFrame::Response(vec![
+        BackendMessage::ErrorResponse {
+            fields: vec![
+                (b'S', "FATAL".to_owned()),
+                (b'V', "FATAL".to_owned()),
+                (b'C', "08006".to_owned()),
+                (
+                    b'M',
+                    "connection to postgres backend lost, please reconnect".to_owned(),
+                ),
+            ],
+        },
+    ])));
+    if let Some(id) = request_id {
+        response.set_request_id(id);
+    }
+    response
+}
+
 /// Originates a backend startup/auth and returns the backend's BackendKeyData (process_id + secret),
 /// if the backend sent one, so a later CancelRequest can be re-issued to this backend.
 async fn authenticate_backend(
@@ -1216,6 +1386,81 @@ async fn authenticate_backend(
     }
 }
 
+/// The primary decision that can be made from host roles alone, before any replication-source probe.
+#[derive(Debug)]
+enum PrimaryChoice {
+    /// No host reports itself writable.
+    None,
+    /// A single primary, or a fenced choice among several.
+    Chosen(String),
+    /// Several hosts report themselves primary and the last-known one is not among them — the caller
+    /// must break the tie with the replication source.
+    Ambiguous,
+}
+
+/// The fencing decision that needs no I/O (review F5): one primary is taken as-is; among several, the
+/// last-known primary is KEPT if it is still one (never flip writes to a returning stale node by
+/// contact-point order); otherwise the caller must consult the replication source.
+fn pick_primary_by_known(primaries: &[String], last_primary: Option<&str>) -> PrimaryChoice {
+    match primaries.len() {
+        0 => PrimaryChoice::None,
+        1 => PrimaryChoice::Chosen(primaries[0].clone()),
+        _ => match last_primary {
+            Some(last) if primaries.iter().any(|p| p == last) => PrimaryChoice::Chosen(last.to_owned()),
+            _ => PrimaryChoice::Ambiguous,
+        },
+    }
+}
+
+/// True if a contact point and a `host:port` from pg_stat_wal_receiver name the same host. Loose by
+/// design: the replica's sender_host may be an alias/IP that differs from the configured contact
+/// point, so a host-part match (ignoring port) is the most that can be relied on.
+fn host_matches(contact_point: &str, sender: &str) -> bool {
+    let cp_host = contact_point.split(':').next().unwrap_or(contact_point);
+    let sender_host = sender.split(':').next().unwrap_or(sender);
+    !sender_host.is_empty() && cp_host == sender_host
+}
+
+/// Runs a query expected to return a single text value, returning None when the query yields no row
+/// (e.g. `pg_stat_wal_receiver` on a host that is not streaming). Unlike `query_scalar_bool` it
+/// completes at ReadyForQuery, so a zero-row result does not hang.
+async fn query_scalar_string(connection: &mut SinkConnection, sql: &str) -> Result<Option<String>> {
+    let query = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
+        FrontendMessage::Query {
+            query: sql.to_owned(),
+        },
+    )));
+    connection.send(vec![query])?;
+
+    let mut result = None;
+    loop {
+        let mut responses = vec![];
+        connection.recv_into(&mut responses).await?;
+        for response in &mut responses {
+            let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() else {
+                continue;
+            };
+            for message in messages.iter() {
+                match message {
+                    BackendMessage::DataRow { values } => {
+                        if let Some(Some(value)) = values.first() {
+                            result = Some(String::from_utf8_lossy(value.as_ref()).into_owned());
+                        }
+                    }
+                    BackendMessage::ErrorResponse { .. } => {
+                        bail!(
+                            "query {sql} failed: {}",
+                            message.error_message().unwrap_or("unknown error")
+                        );
+                    }
+                    BackendMessage::ReadyForQuery { .. } => return Ok(result),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 /// Runs a query expected to return a single boolean and returns it (used for `pg_is_in_recovery()`).
 async fn query_scalar_bool(connection: &mut SinkConnection, sql: &str) -> Result<bool> {
     let query = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
@@ -1257,6 +1502,45 @@ async fn query_scalar_bool(connection: &mut SinkConnection, sql: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fences_primary_selection() {
+        let s = |x: &str| x.to_owned();
+        // No writable host.
+        assert!(matches!(
+            pick_primary_by_known(&[], None),
+            PrimaryChoice::None
+        ));
+        // A single primary is taken as-is.
+        assert!(matches!(
+            pick_primary_by_known(&[s("a:5432")], None),
+            PrimaryChoice::Chosen(p) if p == "a:5432"
+        ));
+        // Two primaries (split brain), last-known among them: KEEP it, regardless of list order —
+        // this is the fence that stops writes flipping to a returning stale node.
+        assert!(matches!(
+            pick_primary_by_known(&[s("a:5432"), s("b:5432")], Some("b:5432")),
+            PrimaryChoice::Chosen(p) if p == "b:5432"
+        ));
+        // Two primaries, last-known NOT among them (or none): ambiguous -> caller consults the
+        // replication source, never contact-point order.
+        assert!(matches!(
+            pick_primary_by_known(&[s("a:5432"), s("b:5432")], Some("c:5432")),
+            PrimaryChoice::Ambiguous
+        ));
+        assert!(matches!(
+            pick_primary_by_known(&[s("a:5432"), s("b:5432")], None),
+            PrimaryChoice::Ambiguous
+        ));
+    }
+
+    #[test]
+    fn host_matches_by_host_part() {
+        assert!(host_matches("shotest-r1:5432", "shotest-r1:5432"));
+        assert!(host_matches("shotest-pg:5432", "shotest-pg:6000")); // port differs, host wins
+        assert!(!host_matches("shotest-pg:5432", "other:5432"));
+        assert!(!host_matches("shotest-pg:5432", ":5432")); // empty sender host never matches
+    }
 
     fn query(sql: &str) -> Message {
         Message::from_frame(Frame::Postgres(PostgresFrame::Request(
