@@ -5,6 +5,7 @@ pub mod redact_column;
 pub mod sink_cluster;
 pub mod sink_single;
 
+use crate::codec::postgres::is_partial_response;
 use crate::connection::SinkConnection;
 use crate::frame::Frame;
 use crate::frame::postgres::{FrontendMessage, PostgresFrame};
@@ -75,12 +76,43 @@ fn trailing_unanswerable(requests: &mut [Message]) -> Option<usize> {
 /// for this batch — everything up to and including its last flush point — and leaves any trailing
 /// partial pipeline outstanding for the batch that carries the next flush point. A batch with no
 /// flush point at all does not block: its responses arrive later.
+/// Waits for more of a backend's response, under the idle timeout the sink configured.
+///
+/// `read_timeout` is a true IDLE timeout: `recv_into_or_idle_timeout` resets the clock on every
+/// inbound socket chunk (`SinkConnection` stamps activity BELOW the frame layer, so a whole response
+/// train's progress is visible), so a large continuously-streaming result is never cut off — only a
+/// backend that produces nothing for the whole timeout trips it. Unset means wait forever, which is
+/// the documented default.
+pub(crate) async fn recv_under_idle_timeout(
+    connection: &mut SinkConnection,
+    responses: &mut Messages,
+    read_timeout: Option<Duration>,
+) -> Result<()> {
+    match read_timeout {
+        Some(timeout) => {
+            if !connection
+                .recv_into_or_idle_timeout(responses, timeout)
+                .await?
+            {
+                return Err(BackendReadTimeout.into());
+            }
+        }
+        None => connection.recv_into(responses).await?,
+    }
+    Ok(())
+}
+
+/// Returns the responses received, and whether a response train is STILL IN FLIGHT — that is,
+/// whether this returned early with chunks in hand rather than waiting for the train's last message.
+///
+/// A caller that gets `true` must keep draining the connection (see the sinks' empty-request arm)
+/// until an id-carrying response arrives, because after an early return nothing else is watching it.
 pub(crate) async fn exchange(
     connection: &mut SinkConnection,
     mut requests: Messages,
     outstanding: &mut usize,
     read_timeout: Option<Duration>,
-) -> Result<Messages> {
+) -> Result<(Messages, bool)> {
     let trailing = trailing_unanswerable(&mut requests);
     *outstanding += requests.len();
     connection.send(requests)?;
@@ -91,23 +123,16 @@ pub(crate) async fn exchange(
         Some(trailing) => {
             while *outstanding > trailing {
                 let before = responses.len();
-                // read_timeout is a true IDLE timeout: recv_into_or_idle_timeout resets the clock on
-                // every inbound socket chunk (SinkConnection stamps activity BELOW the frame layer, so
-                // a whole response train's progress is visible), meaning a large continuously-streaming
-                // result is never cut off — only a backend that produces nothing for the whole timeout
-                // trips it.
-                match read_timeout {
-                    Some(timeout) => {
-                        if !connection
-                            .recv_into_or_idle_timeout(&mut responses, timeout)
-                            .await?
-                        {
-                            return Err(BackendReadTimeout.into());
-                        }
-                    }
-                    None => connection.recv_into(&mut responses).await?,
-                }
+                recv_under_idle_timeout(connection, &mut responses, read_timeout).await?;
                 *outstanding = outstanding.saturating_sub(count_answered(&responses[before..]));
+
+                // Hand chunks up the chain as they arrive instead of holding the whole train here.
+                // The test is the LAST response rather than "any partial received": a train whose
+                // final message also arrived ends with that id-carrying message, and returning
+                // `true` for it would leave the caller draining a connection with nothing coming.
+                if responses.last().is_some_and(is_partial_response) {
+                    return Ok((responses, true));
+                }
             }
         }
         // No flush point: grab any responses already available (e.g. the dummy responses the
@@ -117,12 +142,12 @@ pub(crate) async fn exchange(
             *outstanding = outstanding.saturating_sub(count_answered(&responses));
         }
     }
-    Ok(responses)
+    Ok((responses, false))
 }
 
 /// The number of responses that answer a request (i.e. carry a request id). Unrequested responses
 /// (asynchronous notices, parameter-status changes, notifications) do not decrement `outstanding`.
-fn count_answered(responses: &[Message]) -> usize {
+pub(crate) fn count_answered(responses: &[Message]) -> usize {
     responses
         .iter()
         .filter(|r| r.request_id().is_some())
