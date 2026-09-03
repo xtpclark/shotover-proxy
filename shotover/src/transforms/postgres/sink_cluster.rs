@@ -492,6 +492,10 @@ impl Transform for PostgresSinkCluster {
             if !self.streaming {
                 // Drain any unrequested async messages from whichever connections exist.
                 let before = responses.len();
+                // Order matters for the tail test below: the primary is drained first so that
+                // an idle primary's unrequested traffic cannot land AFTER a replica's chunks and
+                // be read as "the train ended". Reaching here means no train is in flight at all,
+                // so nothing partial should arrive either way — but do not reverse these.
                 if let Some(primary) = self.primary.as_mut() {
                     let _ = primary.try_recv_into(&mut responses);
                 }
@@ -505,6 +509,16 @@ impl Transform for PostgresSinkCluster {
             if !responses.is_empty() {
                 self.streaming = super::train_in_flight(&responses);
             }
+            // A train still arriving needs another chain run to collect it, and nothing else will
+            // ask for one. The reader notifies on every push, but `Notify` holds at most ONE
+            // permit, so a backend that sends a burst and goes quiet leaves a single permit this
+            // run has just consumed. The source then waits in its select, nobody is inside a
+            // receive, and no idle timeout is armed — the client waits forever on a train that has
+            // stopped. Asking for the next run ourselves guarantees a receive that either takes
+            // more chunks or times out.
+            if self.streaming {
+                self.force_run_chain.notify_one();
+            }
             return Ok(responses);
         }
 
@@ -517,6 +531,11 @@ impl Transform for PostgresSinkCluster {
                 // The batch being forwarded decides whether more of a train is coming.
                 if !responses.is_empty() {
                     self.streaming = super::train_in_flight(&responses);
+                }
+                // See the note in the empty-request arm: a train still arriving must ask for the
+                // run that will collect it, or nothing arms an idle timeout on this connection.
+                if self.streaming {
+                    self.force_run_chain.notify_one();
                 }
                 Ok(responses)
             }
