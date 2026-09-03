@@ -468,34 +468,17 @@ impl Transform for PostgresSinkCluster {
             // arrived and let the next notify continue. Either way this is the only timeout
             // watching that connection now.
             let to_completion = !chain_state.requests.is_empty();
+            let target = self.unit_target.unwrap_or(Target::Primary);
             if let Err(err) = self
                 .drain_streaming_unit(&mut responses, to_completion)
                 .await
             {
-                let is_timeout = err.downcast_ref::<super::BackendReadTimeout>().is_some();
-                if is_timeout {
-                    self.backend_read_timeout.increment(1);
-                }
-                // Either way the connection is desynced mid-train, so it goes; a transport error
-                // also means this node may be gone, which the topology has to learn exactly as
-                // `route` makes it learn (a slow node must NOT invalidate it).
-                let was_primary = !matches!(self.unit_target, Some(Target::Replica));
-                self.abandon_streaming_unit();
-                if !is_timeout {
-                    if was_primary {
-                        if !self.cached_primary_is_still_primary().await {
-                            self.invalidate_topology().await;
-                        }
-                    } else if let Some(addr) = self.replica_addr.clone() {
-                        self.mark_replica_unhealthy(&addr).await;
-                        self.replica_addr = None;
-                    }
-                }
+                let is_timeout = self.handle_backend_failure(target, &err).await;
                 chain_state.close_client_connection = true;
-                // Unpaired deliberately: the stalled train's request is not necessarily the one
-                // this id would name, and a second response for an already-answered request is
-                // reported by the source as a violated invariant. Chunks already received are kept
-                // so the client sees the rows that did arrive before the error.
+                // Unpaired deliberately: the stalled train's request is not necessarily the one an
+                // id would name, and a second response for an already-answered request is reported
+                // by the source as a violated invariant. The chunks already received are kept, so
+                // the client sees the rows that did arrive before the error.
                 responses.push(if is_timeout {
                     backend_read_timeout_response(None)
                 } else {
@@ -670,25 +653,7 @@ impl PostgresSinkCluster {
                 {
                     Ok(responses) => responses,
                     Err(err) => {
-                        // Classify before reacting (review F4). A read timeout means the primary was
-                        // SLOW, not dead — the connection is desynced so drop it, but do NOT invalidate
-                        // shared topology (that would make one slow query re-probe for every session).
-                        // Only a transport error means the primary is gone.
-                        let is_timeout = err.downcast_ref::<super::BackendReadTimeout>().is_some();
-                        if is_timeout {
-                            self.backend_read_timeout.increment(1);
-                        }
-                        self.primary = None;
-                        self.outstanding_primary = 0;
-                        self.unit_target = None;
-                        // A closed socket does not by itself mean the primary is dead (a single
-                        // pg_terminate_backend, an idle-txn timeout, or one crashed backend). Only
-                        // invalidate when the cached primary really is gone or demoted, so a single
-                        // terminated backend does not re-probe and evict every other session (review F6
-                        // re-verify).
-                        if !is_timeout && !self.cached_primary_is_still_primary().await {
-                            self.invalidate_topology().await;
-                        }
+                        self.handle_backend_failure(Target::Primary, &err).await;
                         return Err(err);
                     }
                 }
@@ -704,23 +669,7 @@ impl PostgresSinkCluster {
                 {
                     Ok(responses) => responses,
                     Err(err) => {
-                        // Classify before reacting (review F4). A read timeout means the replica was
-                        // SLOW, not unhealthy — drop the desynced connection but do NOT cool the host
-                        // (that would push every user off it for one slow read). Only a transport error
-                        // cools it down and forces reselection.
-                        let is_timeout = err.downcast_ref::<super::BackendReadTimeout>().is_some();
-                        if is_timeout {
-                            self.backend_read_timeout.increment(1);
-                        }
-                        self.replica = None;
-                        self.outstanding_replica = 0;
-                        self.unit_target = None;
-                        if !is_timeout {
-                            if let Some(addr) = self.replica_addr.clone() {
-                                self.mark_replica_unhealthy(&addr).await;
-                            }
-                            self.replica_addr = None;
-                        }
+                        self.handle_backend_failure(Target::Replica, &err).await;
                         return Err(err);
                     }
                 }
@@ -761,8 +710,7 @@ impl PostgresSinkCluster {
                 self.streaming = false;
                 return Ok(());
             };
-            super::recv_under_idle_timeout(connection, responses, self.read_timeout).await?;
-            *outstanding = outstanding.saturating_sub(super::count_answered(&responses[before..]));
+            super::recv_and_account(connection, responses, outstanding, self.read_timeout).await?;
             self.note_unit_boundary(&mut responses[before..]);
             if !to_completion || !super::train_in_flight(responses) {
                 return Ok(());
@@ -770,20 +718,44 @@ impl PostgresSinkCluster {
         }
     }
 
-    /// Drops the streaming connection after a stall and reports it, mirroring `route`'s handling.
-    fn abandon_streaming_unit(&mut self) {
-        match self.unit_target {
-            Some(Target::Replica) => {
-                self.replica = None;
-                self.outstanding_replica = 0;
-            }
-            _ => {
+    /// Reacts to a backend failing mid-exchange, wherever it was noticed.
+    ///
+    /// Classify before reacting (review F4): a read timeout means the node was SLOW, not gone. The
+    /// connection is desynced either way and goes, but only a transport error may invalidate shared
+    /// topology or cool a replica — doing that for one slow query would re-probe for every session,
+    /// or push every user off a healthy host. Returns whether it was a timeout, which decides what
+    /// the client is told.
+    async fn handle_backend_failure(&mut self, target: Target, err: &anyhow::Error) -> bool {
+        let is_timeout = err.downcast_ref::<super::BackendReadTimeout>().is_some();
+        if is_timeout {
+            self.backend_read_timeout.increment(1);
+        }
+        match target {
+            Target::Primary => {
                 self.primary = None;
                 self.outstanding_primary = 0;
+                // A closed socket does not by itself mean the primary is dead (a single
+                // pg_terminate_backend, an idle-txn timeout, or one crashed backend). Only
+                // invalidate when the cached primary really is gone or demoted, so a single
+                // terminated backend does not re-probe and evict every other session (review F6).
+                if !is_timeout && !self.cached_primary_is_still_primary().await {
+                    self.invalidate_topology().await;
+                }
+            }
+            Target::Replica => {
+                self.replica = None;
+                self.outstanding_replica = 0;
+                if !is_timeout {
+                    if let Some(addr) = self.replica_addr.clone() {
+                        self.mark_replica_unhealthy(&addr).await;
+                    }
+                    self.replica_addr = None;
+                }
             }
         }
         self.streaming = false;
         self.unit_target = None;
+        is_timeout
     }
 
     /// Updates transaction/unit state from the trailing ReadyForQuery of a response batch.
