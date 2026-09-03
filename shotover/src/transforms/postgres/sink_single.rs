@@ -239,13 +239,14 @@ impl Transform for PostgresSinkSingle {
             let codec = PostgresCodecBuilder::new(Direction::Sink, "PostgresSinkSingle".to_owned())
                 .with_stream_threshold(self.stream_threshold_bytes);
             self.connection = Some(
-                SinkConnection::new(
+                SinkConnection::new_with_response_buffer(
                     &self.address,
                     codec,
                     &self.tls,
                     self.connect_timeout,
                     self.force_run_chain.clone(),
                     None,
+                    self.response_buffer_batches(),
                 )
                 .await?,
             );
@@ -361,6 +362,20 @@ impl Transform for PostgresSinkSingle {
 }
 
 impl PostgresSinkSingle {
+    /// How many response batches the backend may run ahead of the chain.
+    ///
+    /// While streaming a batch is one chunk, so this is a byte bound in disguise — a few chunks,
+    /// after which the reader parks and TCP stalls the backend. Without it, bounding the client
+    /// channel only moves a slow client's backlog from there into here. Unstreamed, a batch is one
+    /// whole small response and the historic bound applies.
+    fn response_buffer_batches(&self) -> usize {
+        if self.stream_threshold_bytes > 0 {
+            super::STREAMING_RESPONSE_BUFFER_BATCHES
+        } else {
+            crate::connection::DEFAULT_RESPONSE_BUFFER_BATCHES
+        }
+    }
+
     /// Strips SCRAM-SHA-256-PLUS from a backend AuthenticationSASL offer when the client link is
     /// plaintext (see the note above), and records when startup finishes so later responses are left
     /// untouched. A plaintext client never attempts channel binding, so removing -PLUS leaves plain

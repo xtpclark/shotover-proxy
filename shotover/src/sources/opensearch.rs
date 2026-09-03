@@ -43,6 +43,9 @@ impl OpenSearchSourceConfig {
             Arc::new(Semaphore::new(self.connection_limit.unwrap_or(512))),
             None,
             self.timeout.map(Duration::from_secs),
+            // Response buffering: unbounded, as this source has always been. Only the postgres
+            // source exposes a bound, because only it streams a response in pieces.
+            None,
             Transport::Tcp,
             hot_reload_rx,
             hot_reload_listeners,

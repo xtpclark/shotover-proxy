@@ -23,6 +23,20 @@ pub struct PostgresSourceConfig {
     pub hard_connection_limit: Option<bool>,
     pub tls: Option<TlsAcceptorConfig>,
     pub timeout: Option<u64>,
+    /// How many response batches may queue for the client before the transform chain has to wait
+    /// for it to catch up. Unset leaves that queue unbounded, which is the behaviour of every other
+    /// source and of this one before streaming existed.
+    ///
+    /// Set it alongside `stream_threshold_bytes` on the sink: with streaming on, a client that
+    /// reads slowly otherwise accumulates the whole result here, because the chain hands responses
+    /// to the writer task and returns rather than waiting for the socket. Bounding it makes the
+    /// chain wait, which stops it draining the backend, which lets TCP stall the backend — so a
+    /// slow client costs roughly this many chunks of memory instead of the whole result.
+    ///
+    /// The cost of setting it is that a client which stops reading entirely stalls its own
+    /// requests, exactly as it would talking to PostgreSQL directly.
+    #[serde(default)]
+    pub response_buffer_batches: Option<usize>,
     pub chain: TransformChainConfig,
 }
 
@@ -47,6 +61,7 @@ impl PostgresSourceConfig {
             Arc::new(Semaphore::new(self.connection_limit.unwrap_or(512))),
             self.tls.as_ref().map(TlsAcceptor::new).transpose()?,
             self.timeout.map(Duration::from_secs),
+            self.response_buffer_batches,
             Transport::Tcp,
             hot_reload_rx,
             hot_reload_listeners,
