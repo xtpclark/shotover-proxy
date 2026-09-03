@@ -334,6 +334,16 @@ impl Transform for PostgresSinkSingle {
             self.streaming = super::train_in_flight(&responses);
         }
 
+        // A train still arriving needs another chain run to collect it, and nothing else will ask
+        // for one. The reader notifies on every push, but `Notify` holds at most ONE permit, so a
+        // backend that sends a burst and goes quiet leaves a single permit that this run has just
+        // consumed. The source then waits in its select, nobody is inside a receive, and no idle
+        // timeout is armed — the client waits forever on a train that has stopped. Asking for the
+        // next run ourselves guarantees a receive that either takes more chunks or times out.
+        if self.streaming {
+            self.force_run_chain.notify_one();
+        }
+
         // A plaintext client cannot use SCRAM channel binding, so strip SCRAM-SHA-256-PLUS from the
         // backend's SASL offer before it reaches the client. A TLS sink to a channel-binding-capable
         // backend otherwise offers -PLUS to a plaintext client, which aborts the handshake
@@ -509,6 +519,16 @@ mod tests {
     /// until the stalled backend is timed out. Returns how many requests were answered on the way.
     async fn drive_until_close(sink: &mut PostgresSinkSingle) -> usize {
         for _ in 0..500 {
+            // The source runs the chain only when something notifies it, and `Notify` keeps at
+            // most one permit. A sink that leaves a train in flight without asking for another run
+            // is never run again — so waiting here is what makes this test model the real loop
+            // rather than politely re-entering the receive that arms the timeout.
+            tokio::time::timeout(Duration::from_secs(2), sink.force_run_chain.notified())
+                .await
+                .expect(
+                    "nothing asked for another chain run while a train was still in flight; \
+                     the source would never run again and the client would hang",
+                );
             let mut chain_state = ChainState::new_test(vec![]);
             let responses =
                 tokio::time::timeout(Duration::from_secs(5), sink.transform(&mut chain_state))
