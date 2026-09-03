@@ -761,7 +761,18 @@ impl Transform for PostgresReadCache {
                     // A cache miss just answered by the backend: remember it ONLY if it is a clean,
                     // self-contained, idle result — no ErrorResponse (F8) and a trailing
                     // ReadyForQuery('I'), never an in-transaction train ending in 'T' (F7).
-                    if response_is_cacheable(response) {
+                    //
+                    // Reject an over-budget result by its RAW wire length FIRST, before the work of
+                    // response_is_cacheable / estimate_response_size (which walk the parse) and the
+                    // response.clone() that cache_put takes. Without this, a large result — say a
+                    // 442 MB SELECT, ~27x a 16 MiB budget — is fully parsed AND deep-cloned only for
+                    // cache_put to discard it for exceeding max_bytes; the clone alone is a second
+                    // multi-GB spike. raw_size_hint is the wire length, and estimate_response_size runs
+                    // slightly ABOVE it (per-message header overhead), so raw > max_bytes implies the
+                    // estimate exceeds it too — this never rejects a result cache_put would have kept.
+                    let over_budget =
+                        matches!(response.raw_size_hint(), Some(len) if len > self.max_bytes);
+                    if !over_budget && response_is_cacheable(response) {
                         let size = estimate_response_size(response);
                         self.cache_put(key, response.clone(), size, relations, issued_at);
                     }
@@ -1176,6 +1187,26 @@ mod tests {
 
     fn response(messages: Vec<BackendMessage>) -> Message {
         Message::from_frame(Frame::Postgres(PostgresFrame::Response(messages)))
+    }
+
+    #[test]
+    fn raw_size_hint_gives_wire_length_cheaply_and_none_when_modified() {
+        // Candidate C's gate keys off this: a DECODED response reports its raw wire length with no
+        // parse, so an oversized result is rejected before it is parsed or cloned.
+        use crate::codec::CodecState;
+        use crate::codec::postgres::PostgresCodecState;
+        let raw = Message::from_bytes(
+            bytes::Bytes::from(vec![0u8; 4096]),
+            CodecState::Postgres(PostgresCodecState {
+                is_request: false,
+                startup: false,
+            }),
+        );
+        assert_eq!(raw.raw_size_hint(), Some(4096));
+        // A message a transform built from a frame has no raw bytes -> None; the cache then falls back
+        // to estimate_response_size rather than wrongly treating it as zero-length.
+        let modified = response(vec![BackendMessage::ReadyForQuery { status: b'I' }]);
+        assert_eq!(modified.raw_size_hint(), None);
     }
 
     #[test]
