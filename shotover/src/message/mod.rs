@@ -351,20 +351,6 @@ impl Message {
         }
     }
 
-    /// The size in bytes of this message's raw wire form, when it is available without work: a decoded
-    /// message keeps its bytes even after it has been parsed. `None` only for a message a transform has
-    /// MODIFIED in place, whose original bytes were dropped in favour of the frame. This lets a caller
-    /// reject an oversized message (e.g. a cache deciding it is too big to keep) before paying to parse
-    /// or clone it.
-    pub fn raw_size_hint(&self) -> Option<usize> {
-        match self.inner.as_ref().unwrap() {
-            MessageInner::RawBytes { bytes, .. } | MessageInner::Parsed { bytes, .. } => {
-                Some(bytes.len())
-            }
-            MessageInner::Modified { .. } => None,
-        }
-    }
-
     pub fn ensure_message_type(&self, expected_message_type: MessageType) -> Result<()> {
         match self.inner.as_ref().unwrap() {
             MessageInner::RawBytes { message_type, .. } => {

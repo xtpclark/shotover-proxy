@@ -763,25 +763,16 @@ impl Transform for PostgresReadCache {
                     // ReadyForQuery('I'), never an in-transaction train ending in 'T' (F7) — AND it
                     // fits the byte budget.
                     //
-                    // The budget must gate the response.clone() itself. cache_put rejects an
-                    // over-budget result, but only AFTER it receives the clone as an argument, and for
-                    // a large result — say a 442 MB SELECT, ~27x a 16 MiB budget — that clone is a
-                    // second multi-GB spike on top of the sink's train assembly. estimate_response_size
-                    // walks the frame (already parsed above by capture_rendering_gucs, so this is not a
-                    // second parse); the clone is what deep-copies the train, so gating it on `size` is
-                    // what removes the spike. This covers a transform-MODIFIED train (e.g. one
-                    // PostgresRedactColumn rewrote in place) too — such a train has no raw wire form,
-                    // so raw_size_hint is None and the wire check below cannot see it.
-                    //
-                    // raw_size_hint (the wire length, free for an unmodified decoded train) is a cheap
-                    // PRE-FILTER: it answers over-budget for the common non-modified case without
-                    // walking the train at all. It can be marginally stricter than the estimate for a
-                    // wide, RowDescription-heavy train (the estimate scores each non-DataRow message a
-                    // flat 64), but only in the safe direction — it never keeps what the size gate
-                    // would reject.
-                    let over_budget =
-                        matches!(response.raw_size_hint(), Some(len) if len > self.max_bytes);
-                    if !over_budget && response_is_cacheable(response) {
+                    // The budget MUST gate the response.clone() here. cache_put refuses an over-budget
+                    // result, but only after it receives the clone as an argument, and for a large
+                    // result — say a 442 MB SELECT, ~27x a 16 MiB budget — that clone is a second
+                    // multi-GB spike on top of the sink's train assembly (measured: 4681 -> 2583 MB
+                    // peak once the clone is skipped). estimate_response_size only walks the frame,
+                    // already parsed above by capture_rendering_gucs / trailing_ready_status; the clone
+                    // is the cost, so gating it on `size` is the whole win — and it holds for a
+                    // transform-MODIFIED train (e.g. one PostgresRedactColumn rewrote in place), whose
+                    // raw wire form is gone but whose frame still measures.
+                    if response_is_cacheable(response) {
                         let size = estimate_response_size(response);
                         if size != 0 && size <= self.max_bytes {
                             self.cache_put(key, response.clone(), size, relations, issued_at);
@@ -1202,41 +1193,18 @@ mod tests {
     }
 
     #[test]
-    fn raw_size_hint_gives_wire_length_cheaply_and_none_when_modified() {
-        // Candidate C's gate keys off this: a DECODED response reports its raw wire length with no
-        // parse, so an oversized result is rejected before it is parsed or cloned.
-        use crate::codec::CodecState;
-        use crate::codec::postgres::PostgresCodecState;
-        let raw = Message::from_bytes(
-            bytes::Bytes::from(vec![0u8; 4096]),
-            CodecState::Postgres(PostgresCodecState {
-                is_request: false,
-                startup: false,
-            }),
-        );
-        assert_eq!(raw.raw_size_hint(), Some(4096));
-        // A message a transform built from a frame has no raw bytes -> None; the cache then falls back
-        // to estimate_response_size rather than wrongly treating it as zero-length.
-        let modified = response(vec![BackendMessage::ReadyForQuery { status: b'I' }]);
-        assert_eq!(modified.raw_size_hint(), None);
-    }
-
-    #[test]
-    fn size_gate_catches_a_modified_over_budget_train_the_wire_gate_misses() {
-        // A train a transform rewrote in place (e.g. PostgresRedactColumn redacting a value) is
-        // Modified: its raw wire form is gone, so raw_size_hint() is None and the wire pre-filter
-        // cannot tell it is oversized. The budget is therefore enforced on estimate_response_size,
-        // which walks the frame and still reports the real weight — this is why the clone is gated on
-        // `size`, not on raw_size_hint alone.
+    fn size_gate_measures_a_modified_train_that_has_no_wire_form() {
+        // The budget is enforced on estimate_response_size so it holds for a train a transform rewrote
+        // in place (e.g. PostgresRedactColumn redacting a value): such a train is built from its frame
+        // with no raw wire bytes, yet estimate_response_size walks the frame and still reports the real
+        // weight — a raw-wire-length check could not see it at all.
         let mut modified = response(vec![
             BackendMessage::DataRow {
                 values: vec![Some(bytes::Bytes::from(vec![0u8; 1000]))],
             },
             BackendMessage::ReadyForQuery { status: b'I' },
         ]);
-        // Built from a frame -> no wire form: the cheap wire gate is blind to it.
-        assert_eq!(modified.raw_size_hint(), None);
-        // The size gate still sees the weight: DataRow (1000 + 4) + 8, RowDescription-less; RFQ 64.
+        // DataRow (1000 + 4) + 8; trailing ReadyForQuery a flat 64.
         assert_eq!(estimate_response_size(&mut modified), 1000 + 4 + 8 + 64);
     }
 
