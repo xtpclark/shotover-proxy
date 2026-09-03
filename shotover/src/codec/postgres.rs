@@ -319,9 +319,10 @@ impl CodecBuilder for PostgresCodecBuilder {
 ///
 /// Sizing, and it is NOT one chunk per batch downstream: `SinkConnection::recv_into` exhausts this
 /// queue before returning, so one chain run coalesces everything queued here into a SINGLE batch
-/// for the client channel. A client-channel slot therefore holds up to this many chunks, and the
-/// ceiling for a streaming connection is about `(response_buffer_batches * this + this) *
-/// stream_threshold_bytes` — not the sum of the two bounds.
+/// for the client channel. A client-channel slot therefore holds up to this many chunks — the
+/// ceiling is roughly `(response_buffer_batches + 2) * this * stream_threshold_bytes`, not the sum
+/// of the two bounds. The `+ 2` is the batch the writer task holds in flight as well as the one the
+/// chain is producing.
 const STREAMING_RESPONSE_BUFFER_BATCHES: usize = 8;
 
 /// What kind of request was sent to the server, used by the sink decoder to

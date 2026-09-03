@@ -63,7 +63,7 @@ async fn send_to_client(
         }
         _ = shutdown.recv() => Some(CloseReason::ShotoverShutdown),
         _ = sleep_for_duration_or_forever(timeout) => {
-            debug!("client did not read its responses within the configured timeout, closing");
+            info!("client did not read its responses within the configured timeout, closing");
             Some(CloseReason::ClientClosed)
         }
     }

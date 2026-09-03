@@ -82,8 +82,11 @@ Postgres:
   # the chain wait, which stops it draining the backend, which lets TCP stall the backend — so a
   # slow client costs a bounded amount of memory instead of the whole result.
   #
-  # Sizing: a queued batch can hold a whole sink queue's worth of chunks, so budget roughly
-  # (response_buffer_batches + 1) * 8 * stream_threshold_bytes per streaming connection.
+  # Sizing: a queued batch can hold a whole sink queue's worth of chunks (8), and two more are in
+  # flight in the writer task and the chain, so the buffers come to about
+  # (response_buffer_batches + 2) * 8 * stream_threshold_bytes. Add the client socket buffer and
+  # allocator slack and budget roughly double: measured peak RSS with 4 and a 1 MiB threshold is
+  # 95 MB for a 442 MB result, against 458 MB unbounded.
   #
   # Cost: a client that stops reading entirely stalls its own requests, exactly as it would talking
   # to postgres directly. Such a connection parks the chain outside the loop that re-arms the idle
@@ -107,6 +110,9 @@ Postgres:
   # Timeout in seconds after which to terminate an idle connection. This field is optional, if not provided, idle connections will never be terminated.
   # With response_buffer_batches set it also bounds how long the chain waits for a slow client, and
   # is required, because a connection parked on the full response queue cannot re-arm this timeout.
+  # That implies a minimum read rate, because it bounds the wait for ONE batch of up to
+  # 8 * stream_threshold_bytes: at a 1 MiB threshold and timeout 30 a client must sustain roughly
+  # 280 KB/s or be disconnected mid-result. Raise it for slower consumers.
   # timeout: 60
 
   chain:

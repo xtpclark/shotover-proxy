@@ -37,9 +37,15 @@ pub struct PostgresSourceConfig {
     /// to the writer task and returns rather than waiting for the socket. Bounding it makes the
     /// chain wait, which stops it draining the backend, which lets TCP stall the backend.
     ///
-    /// Sizing: a batch queued here can hold a whole sink queue's worth of chunks, so budget about
-    /// `(this + 1) * 8 * stream_threshold_bytes` per streaming connection — with 4 and a 1 MiB
-    /// threshold, roughly 40 MB, not 5.
+    /// Sizing: a batch queued here can hold a whole sink queue's worth of chunks (8), and two more
+    /// are in flight in the writer task and the chain, so the buffers come to about
+    /// `(this + 2) * 8 * stream_threshold_bytes`. Add the client socket buffer and allocator slack
+    /// and budget roughly double that: measured peak RSS with 4 and a 1 MiB threshold is 95 MB for a
+    /// 442 MB result, against 458 MB unbounded.
+    ///
+    /// `timeout` then implies a minimum read rate, because it bounds the wait for ONE batch of up to
+    /// `8 * stream_threshold_bytes`: at a 1 MiB threshold and `timeout: 30` a client must sustain
+    /// roughly 280 KB/s or be disconnected mid-result. Raise `timeout` for slower consumers.
     ///
     /// The cost is that a client which stops reading entirely stalls its own requests, exactly as it
     /// would talking to PostgreSQL directly. Because such a connection parks the chain outside the
