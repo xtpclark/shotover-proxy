@@ -102,17 +102,16 @@ pub(crate) async fn recv_under_idle_timeout(
     Ok(())
 }
 
-/// Returns the responses received, and whether a response train is STILL IN FLIGHT — that is,
-/// whether this returned early with chunks in hand rather than waiting for the train's last message.
+/// Sends one batch and returns what the backend has answered so far.
 ///
-/// A caller that gets `true` must keep draining the connection (see the sinks' empty-request arm)
-/// until an id-carrying response arrives, because after an early return nothing else is watching it.
+/// It may return with a response train still arriving — see [`train_in_flight`], which is how a
+/// caller must decide that, not by which path this took.
 pub(crate) async fn exchange(
     connection: &mut SinkConnection,
     mut requests: Messages,
     outstanding: &mut usize,
     read_timeout: Option<Duration>,
-) -> Result<(Messages, bool)> {
+) -> Result<Messages> {
     let trailing = trailing_unanswerable(&mut requests);
     *outstanding += requests.len();
     connection.send(requests)?;
@@ -130,8 +129,8 @@ pub(crate) async fn exchange(
                 // The test is the LAST response rather than "any partial received": a train whose
                 // final message also arrived ends with that id-carrying message, and returning
                 // `true` for it would leave the caller draining a connection with nothing coming.
-                if responses.last().is_some_and(is_partial_response) {
-                    return Ok((responses, true));
+                if train_in_flight(&responses) {
+                    return Ok(responses);
                 }
             }
         }
@@ -142,7 +141,19 @@ pub(crate) async fn exchange(
             *outstanding = outstanding.saturating_sub(count_answered(&responses));
         }
     }
-    Ok((responses, false))
+    Ok(responses)
+}
+
+/// Whether a response train is still arriving, judged from what was actually received: the last
+/// message in hand is one of its chunks.
+///
+/// This is the ONLY safe test. A train's chunks carry no request id and only its final message
+/// does, so "the last message is a partial" is exactly "more of this train is coming". Deriving it
+/// any other way has been wrong every time it was tried: counting id-carrying responses breaks when
+/// one receive delivers the end of one train and the start of the next, and asking which code path
+/// ran breaks when a batch with no flush point is sent while a train is still arriving.
+pub(crate) fn train_in_flight(responses: &[Message]) -> bool {
+    responses.last().is_some_and(is_partial_response)
 }
 
 /// The number of responses that answer a request (i.e. carry a request id). Unrequested responses
