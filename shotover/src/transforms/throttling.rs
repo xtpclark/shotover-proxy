@@ -150,15 +150,10 @@ impl Transform for RequestThrottling {
         // replace dummy responses with throttle messages
         for response in responses.iter_mut() {
             // Track the transaction state from real responses' ReadyForQuery (postgres only), so a
-            // later throttle rejection can mirror it (review F9). The message_type() check is cheap and
-            // avoids parsing non-postgres responses.
-            // Partials are skipped before the lookup, not by it: a partial carries no record of
-            // a ReadyForQuery, so asking would fall back to parsing the chunk — the cost streaming
-            // exists to avoid (see `TransformConfig::accepts_partial_responses`).
+            // later throttle rejection can mirror it (review F9). Non-postgres responses, dummies
+            // and partial chunks all answer None without being parsed.
             #[cfg(feature = "postgres")]
-            if !crate::codec::postgres::is_partial_response(response)
-                && let Some(status) = crate::codec::postgres::trailing_ready_status(response)
-            {
+            if let Some(status) = crate::codec::postgres::trailing_ready_status(response) {
                 self.last_rfq_status = status;
             }
             if let Some(request_id) = response.request_id()

@@ -467,13 +467,7 @@ impl Message {
     /// * Clears caches used by getter methods
     /// * If `Message::frame()` has been called the message bytes must be regenerated from the `Frame` when sent to the DB
     pub fn invalidate_cache(&mut self) {
-        // The frame is now the source of truth, so anything the decoder recorded about the original
-        // bytes is stale — a transform that rewrites a ReadyForQuery status must not leave the old
-        // one readable.
-        #[cfg(feature = "postgres")]
-        if let CodecState::Postgres(state) = &mut self.codec_state {
-            state.trailing_ready_status = crate::codec::postgres::TrailingReadyStatus::Unknown;
-        }
+        // TODO: clear message details cache fields if we ever add any
 
         self.inner = self.inner.take().map(|x| x.invalidate_cache());
     }
@@ -612,6 +606,17 @@ impl Message {
             }
             MessageType::Dummy => true,
         }
+    }
+
+    /// Whether this message's frame has been modified, making it — not the bytes it was decoded
+    /// from — the source of truth.
+    ///
+    /// Anything a codec recorded while decoding describes the ORIGINAL bytes, so it is stale once
+    /// this is true. Deliberately protocol-agnostic: the staleness condition is a property of
+    /// `Message`, not of any one protocol's recorded facts, so a codec that starts recording
+    /// something gets the answer without teaching this module about its fields.
+    pub fn frame_modified(&self) -> bool {
+        matches!(self.inner, Some(MessageInner::Modified { .. }))
     }
 
     pub fn is_dummy(&self) -> bool {

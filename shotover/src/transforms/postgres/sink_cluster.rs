@@ -24,7 +24,7 @@
 
 use crate::codec::{
     CodecBuilder, Direction,
-    postgres::{PostgresCodecBuilder, is_partial_response, trailing_ready_status},
+    postgres::{PostgresCodecBuilder, trailing_ready_status},
 };
 use crate::connection::SinkConnection;
 use crate::frame::postgres::{
@@ -666,12 +666,6 @@ impl PostgresSinkCluster {
     /// Updates transaction/unit state from the trailing ReadyForQuery of a response batch.
     fn note_unit_boundary(&mut self, responses: &mut [Message]) {
         for response in responses.iter_mut() {
-            // Skipped before `trailing_ready_status`, not by it: it parses, and the parse is
-            // retained (see `TransformConfig::accepts_partial_responses`). A ReadyForQuery only
-            // ever completes a train, so no partial can hold one anyway.
-            if is_partial_response(response) {
-                continue;
-            }
             if let Some(status) = trailing_ready_status(response) {
                 // A ReadyForQuery ends the current unit and reports transaction state.
                 self.in_transaction = status != b'I';

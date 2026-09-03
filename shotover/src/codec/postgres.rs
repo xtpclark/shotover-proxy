@@ -174,13 +174,8 @@ pub async fn sink_tls_prologue(stream: &mut TcpStream) -> Result<()> {
 /// silently mis-report a transaction as idle.
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum TrailingReadyStatus {
-    /// Not recorded, so the answer has to be parsed out. Three ways to get here: a transform built
-    /// the message from a frame, its frame has been modified since decoding, or it is a PARTIAL
-    /// chunk — which is deliberately left unrecorded because a ReadyForQuery always completes a
-    /// train and so is never inside one.
-    ///
-    /// The first two are cheap to parse; the third is not, and is the reason
-    /// [`trailing_ready_status`] must not be called on a partial. See its doc.
+    /// Not recorded, so the answer has to be parsed out — a transform built the message from a
+    /// frame, or it is a partial chunk, which [`trailing_ready_status`] answers without parsing.
     Unknown,
     /// The decoder read every message and none of them was a ReadyForQuery.
     Absent,
@@ -188,7 +183,24 @@ pub enum TrailingReadyStatus {
     Present(u8),
 }
 
-/// Per message connection level state needed to parse and reencode postgres messages.
+impl From<Option<u8>> for TrailingReadyStatus {
+    /// Converts what the decoder read off the wire — a status byte, or nothing because the train
+    /// held no ReadyForQuery. Never produces `Unknown`: the decoder read every message, so it
+    /// always knows which of the two it is.
+    fn from(status: Option<u8>) -> Self {
+        status.map_or(Self::Absent, Self::Present)
+    }
+}
+
+/// What the codec stamps on a postgres message: some of it needed to parse and reencode the
+/// message, the rest observations the decoder made in the pass it was already making and no later
+/// layer can recover cheaply.
+///
+/// The test for admitting a field is both halves of that: the decoder must be able to note it
+/// without extra work, AND recovering it upstream must be expensive — `partial`, `chunked_tail` and
+/// `trailing_ready_status` all qualify, because the alternative is parsing a whole response train.
+/// Note that `Frame::as_codec_state` cannot reproduce the observations, and that this struct
+/// participates in `Message`'s `PartialEq`.
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub struct PostgresCodecState {
     /// Tag parsing is direction aware: several tag bytes mean different messages
@@ -250,9 +262,6 @@ impl PostgresCodecState {
             startup: false,
             partial: true,
             chunked_tail: false,
-            // A ReadyForQuery always completes a train, so it is never inside a partial. Left
-            // Unknown rather than Absent because every caller skips partials before asking, so
-            // claiming knowledge here would buy nothing and could only ever be wrong.
             trailing_ready_status: TrailingReadyStatus::Unknown,
         }
     }
@@ -569,12 +578,8 @@ impl PostgresDecoder {
                     messages.push(Message::from_bytes_at_instant(
                         bytes.freeze(),
                         CodecState::Postgres(
-                            PostgresCodecState::response().with_trailing_ready_status(
-                                match ready_status {
-                                    Some(status) => TrailingReadyStatus::Present(status),
-                                    None => TrailingReadyStatus::Absent,
-                                },
-                            ),
+                            PostgresCodecState::response()
+                                .with_trailing_ready_status(ready_status.into()),
                         ),
                         Some(received_at),
                     ));
@@ -640,10 +645,7 @@ impl PostgresDecoder {
                     // Stamped on EVERY train completion, including the CompleteAndDiscard 'E'
                     // tail: a decoded train that reached a transform without its status recorded
                     // would send that transform back to parsing the whole result.
-                    let status = match self.train_ready_status.take() {
-                        Some(status) => TrailingReadyStatus::Present(status),
-                        None => TrailingReadyStatus::Absent,
-                    };
+                    let status: TrailingReadyStatus = self.train_ready_status.take().into();
                     let state = if std::mem::take(&mut self.train_chunked) {
                         PostgresCodecState::chunked_response_tail()
                     } else {
@@ -759,31 +761,30 @@ pub fn is_partial_response(message: &Message) -> bool {
 /// that `Message::frame` then retains alongside the raw bytes — to learn one byte. Non-postgres
 /// messages and dummies answer `None` without being touched.
 ///
-/// # Do not call this on a partial chunk
-///
-/// A partial is recorded [`TrailingReadyStatus::Unknown`] — a ReadyForQuery completes a train, so
-/// one is never inside a chunk — which means asking would fall back to PARSING a chunk that may be
-/// as large as `stream_threshold_bytes`. Guard with [`is_partial_response`] first, as the three
-/// call sites do. Everything else that lands in the fallback is small: a message a transform built
-/// from a frame is already parsed, so reading the status off it is free, and one modified since
-/// decoding is the same. A large decoded train always carries its record.
-///
-/// # It does not remove every parse from every caller
-///
-/// It removes the parse this question used to require. A caller that parses the same response for
-/// another reason still pays for that: `PostgresReadCache` scans for ParameterStatus via
-/// `capture_rendering_gucs` before asking, so in a chain containing the cache the train is parsed
-/// regardless and only `RequestThrottling` and `PostgresSinkCluster` realise the saving.
+/// It removes the parse THIS question used to require, which is not the same as removing every
+/// parse: a caller that parses the same response for another reason still pays for that.
 pub fn trailing_ready_status(response: &mut Message) -> Option<u8> {
-    if let CodecState::Postgres(state) = response.codec_state {
+    // A dummy, or another protocol entirely: never parse it looking for postgres messages.
+    let CodecState::Postgres(state) = response.codec_state else {
+        return None;
+    };
+
+    // A partial chunk holds no ReadyForQuery: `train_action` completes a train on every `b'Z'`, so
+    // one can never sit mid-train. Answered here rather than left to the fallback because parsing a
+    // chunk — up to `stream_threshold_bytes` of it — is the exact cost this function exists to
+    // avoid, and a caller should not have to know that to use it safely.
+    if state.partial {
+        return None;
+    }
+
+    // Skipped when the frame has been modified: the record describes the bytes it was decoded from,
+    // and those are no longer what this message means.
+    if !response.frame_modified() {
         match state.trailing_ready_status {
             TrailingReadyStatus::Present(status) => return Some(status),
             TrailingReadyStatus::Absent => return None,
             TrailingReadyStatus::Unknown => {}
         }
-    } else {
-        // A dummy, or another protocol entirely: never parse it looking for postgres messages.
-        return None;
     }
 
     if let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() {
@@ -1720,6 +1721,27 @@ mod postgres_tests {
             TrailingReadyStatus::Absent
         );
         assert_eq!(trailing_ready_status(&mut messages[0]), None);
+    }
+
+    /// A partial chunk is answered without parsing it: a ReadyForQuery always completes a train, so
+    /// one is never inside a chunk, and parsing a chunk that may be `stream_threshold_bytes` large
+    /// is the exact cost this function exists to avoid. Owned by the accessor so a caller cannot
+    /// get it wrong.
+    #[test]
+    fn test_trailing_ready_status_of_a_partial_is_none() {
+        let (mut decoder, mut encoder) = sink_codec_with_threshold(64);
+        let mut sent = BytesMut::new();
+        encoder
+            .encode(vec![query_message("SELECT n FROM t")], &mut sent)
+            .unwrap();
+
+        let mut response = row_stream_train(20);
+        let mut messages = decoder.decode(&mut response).unwrap().unwrap();
+        assert!(messages.len() > 1);
+
+        let partial = &mut messages[0];
+        assert!(is_partial_response(partial));
+        assert_eq!(trailing_ready_status(partial), None);
     }
 
     /// THE safety property: a transform that rewrites a ReadyForQuery must not leave the decoder's
