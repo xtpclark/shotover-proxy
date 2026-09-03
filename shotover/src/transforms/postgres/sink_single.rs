@@ -130,6 +130,7 @@ impl TransformBuilder for PostgresSinkSingleBuilder {
             connect_timeout: self.connect_timeout,
             read_timeout: self.read_timeout,
             stream_threshold_bytes: self.stream_threshold_bytes,
+            streaming_unit: None,
             force_run_chain: transform_context.force_run_chain,
             outstanding: 0,
             source_is_tls: transform_context.source_is_tls,
@@ -159,6 +160,14 @@ pub struct PostgresSinkSingle {
     read_timeout: Option<Duration>,
     stream_threshold_bytes: usize,
     force_run_chain: Arc<Notify>,
+    /// Set while a response train is still arriving, to the id of the request that batch was sent
+    /// for. `exchange` returns early with chunks in hand rather than holding a whole large result,
+    /// so the rest of the train is collected by the empty-request arm below — and until it is, this
+    /// connection is not being watched by anything else.
+    ///
+    /// The id is the same approximation `exchange`'s own error path makes (the batch's first
+    /// request), and it exists so a stall mid-train can answer the client with a paired error.
+    streaming_unit: Option<MessageId>,
     /// Requests sent to the server that have not yet been answered — see [`super::exchange`].
     /// Carried across batches because an extended-query pipeline's responses arrive on the batch
     /// that carries the Flush/Sync, which may be a later one than the batch that sent the requests.
@@ -248,15 +257,55 @@ impl Transform for PostgresSinkSingle {
         }
 
         let mut responses = vec![];
+        if let Some(streaming_id) = self.streaming_unit {
+            // A train is still arriving. Block for more of it rather than polling: this run was
+            // triggered by the connection's notify, so either data or a stall is coming, and after
+            // `exchange` returned early nothing else applies a timeout to this connection — without
+            // one here a backend that stops mid-train hangs the client forever.
+            //
+            // Any client requests that arrived meanwhile stay in `chain_state.requests` and are sent
+            // below, exactly as they would be without streaming: the server runs them after the
+            // in-flight query and answers them on the same ordered connection, so `outstanding`
+            // accounts for them as it always has. Declining to send them would drop them — the chain
+            // never re-queues what a transform leaves behind.
+            let before = responses.len();
+            match super::recv_under_idle_timeout(
+                self.connection.as_mut().unwrap(),
+                &mut responses,
+                self.read_timeout,
+            )
+            .await
+            {
+                Ok(()) => {
+                    let answered = super::count_answered(&responses[before..]);
+                    self.outstanding = self.outstanding.saturating_sub(answered);
+                    // An id-carrying response ends the train: only its last message carries one.
+                    if answered > 0 {
+                        self.streaming_unit = None;
+                    }
+                }
+                Err(err) if err.downcast_ref::<super::BackendReadTimeout>().is_some() => {
+                    self.connection = None;
+                    self.outstanding = 0;
+                    self.streaming_unit = None;
+                    chain_state.close_client_connection = true;
+                    responses.push(read_timeout_error_response(Some(streaming_id)));
+                    return Ok(responses);
+                }
+                Err(err) => return Err(err),
+            }
+        }
         if chain_state.requests.is_empty() {
-            // No requests, but check for unrequested responses (notifications, notices)
-            // without awaiting.
-            // TODO: handle errors here
-            let _ = self
-                .connection
-                .as_mut()
-                .unwrap()
-                .try_recv_into(&mut responses);
+            if self.streaming_unit.is_none() {
+                // No requests and no train in flight: check for unrequested responses
+                // (notifications, notices) without awaiting.
+                // TODO: handle errors here
+                let _ = self
+                    .connection
+                    .as_mut()
+                    .unwrap()
+                    .try_recv_into(&mut responses);
+            }
         } else {
             let mut requests = std::mem::take(&mut chain_state.requests);
             let first_id = requests.first_mut().map(|r| r.id());
@@ -268,14 +317,18 @@ impl Transform for PostgresSinkSingle {
             )
             .await
             {
-                Ok(r) => responses = r,
+                Ok((r, streaming)) => {
+                    responses.extend(r);
+                    self.streaming_unit = streaming.then_some(first_id).flatten();
+                }
                 Err(err) if err.downcast_ref::<super::BackendReadTimeout>().is_some() => {
                     // The backend stalled mid-answer: the connection is now desynced, so drop it, tell
                     // the client, and close — never hang the client on a response that will not come.
                     self.connection = None;
                     self.outstanding = 0;
+                    self.streaming_unit = None;
                     chain_state.close_client_connection = true;
-                    responses = vec![read_timeout_error_response(first_id)];
+                    responses.push(read_timeout_error_response(first_id));
                 }
                 Err(err) => return Err(err),
             }
@@ -390,6 +443,8 @@ fn read_timeout_error_response(request_id: Option<MessageId>) -> Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::postgres::FieldDescription;
+    use bytes::Bytes;
 
     fn sink() -> PostgresSinkSingle {
         PostgresSinkSingle {
@@ -399,10 +454,128 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             read_timeout: None,
             stream_threshold_bytes: 0,
+            streaming_unit: None,
             force_run_chain: Arc::new(Notify::new()),
             outstanding: 0,
             source_is_tls: false,
             startup_complete: false,
+        }
+    }
+
+    /// THE regression gate for incremental forwarding. Once `exchange` returns early with chunks,
+    /// nothing else applies a timeout to that backend connection — so a backend that goes silent
+    /// mid-train must be caught by the drain arm's own idle timeout, or the client hangs forever.
+    ///
+    /// Drives a real socket: a fake backend writes enough of a row stream to cross the threshold,
+    /// then stops without ever sending the ReadyForQuery that would end the train.
+    #[tokio::test]
+    async fn stalled_mid_train_backend_is_timed_out_by_the_drain_arm() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // A backend that answers with chunks and then falls silent, holding the socket open.
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut train = BytesMut::new();
+            row_description().encode(&mut train).unwrap();
+            for i in 0..200 {
+                BackendMessage::DataRow {
+                    values: vec![Some(Bytes::from(format!("{i:0>60}")))],
+                }
+                .encode(&mut train)
+                .unwrap();
+            }
+            // No CommandComplete, no ReadyForQuery: the train never ends.
+            stream.write_all(&train).await.unwrap();
+            // Hold the connection open and silent until the test drops us.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut sink = sink();
+        sink.address = format!("127.0.0.1:{port}");
+        sink.stream_threshold_bytes = 256;
+        sink.read_timeout = Some(Duration::from_millis(300));
+
+        // First run: the query goes out and `exchange` comes back early with partial chunks.
+        let query = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
+            FrontendMessage::Query {
+                query: "SELECT n FROM t".to_owned(),
+            },
+        )));
+        let mut chain_state = ChainState::new_test(vec![query]);
+        let responses = sink.transform(&mut chain_state).await.unwrap();
+        assert!(
+            !responses.is_empty(),
+            "expected chunks to be forwarded before the train completed"
+        );
+        assert!(
+            responses.iter().all(|r| r.request_id().is_none()),
+            "a partial chunk must not carry a request id"
+        );
+        assert!(
+            sink.streaming_unit.is_some(),
+            "the sink must know a train is still in flight"
+        );
+
+        // Later runs carry no client requests, exactly as the source's notify-triggered runs do.
+        // The drain arm forwards whatever has arrived; once the backend falls silent it must trip
+        // the idle timeout rather than wait forever for a train that will never end.
+        let mut forwarded = responses.len();
+        let mut timed_out = None;
+        for _ in 0..500 {
+            let mut chain_state = ChainState::new_test(vec![]);
+            let responses =
+                tokio::time::timeout(Duration::from_secs(5), sink.transform(&mut chain_state))
+                    .await
+                    .expect("the drain arm hung instead of timing out")
+                    .unwrap();
+            forwarded += responses.len();
+            if chain_state.close_client_connection {
+                timed_out = Some(responses);
+                break;
+            }
+        }
+        let responses = timed_out.expect("the drain arm never timed the stalled backend out");
+        assert!(
+            forwarded > 1,
+            "the chunks should have been forwarded as they arrived, not held"
+        );
+
+        assert_eq!(responses.len(), 1);
+        match responses[0].clone().frame().unwrap() {
+            Frame::Postgres(PostgresFrame::Response(train)) => {
+                assert!(
+                    train[0]
+                        .error_message()
+                        .unwrap()
+                        .contains("did not respond within read_timeout")
+                );
+            }
+            other => panic!("expected an error response, got {other:?}"),
+        }
+        assert!(sink.streaming_unit.is_none());
+        assert!(
+            sink.connection.is_none(),
+            "the desynced connection is dropped"
+        );
+
+        backend.abort();
+    }
+
+    /// A one column int4 RowDescription, for building a fake backend's row stream.
+    fn row_description() -> BackendMessage {
+        BackendMessage::RowDescription {
+            fields: vec![FieldDescription {
+                name: "n".to_owned(),
+                table_oid: 0,
+                column_attribute_number: 1,
+                data_type_oid: 23,
+                data_type_size: 4,
+                type_modifier: -1,
+                format_code: 0,
+            }],
         }
     }
 

@@ -306,6 +306,7 @@ impl TransformBuilder for PostgresSinkClusterBuilder {
             in_transaction: false,
             session_pinned: false,
             unit_target: None,
+            streaming_unit: None,
             outstanding_primary: 0,
             outstanding_replica: 0,
         })
@@ -386,6 +387,11 @@ pub struct PostgresSinkCluster {
     /// The backend the current request unit is pinned to until a ReadyForQuery 'I' ends the unit.
     /// Keeps a split extended-query pipeline (Parse in one batch, Execute in the next) on one node.
     unit_target: Option<Target>,
+    /// Set while a response train is still arriving on `unit_target`'s connection, to the id of
+    /// the request its batch was sent for. `exchange` returns early with chunks in hand rather than
+    /// holding a whole large result, so the rest is collected by the empty-request arm — and until
+    /// it is, nothing else applies a timeout to that connection.
+    streaming_unit: Option<MessageId>,
     /// Per-node counts of requests still awaiting a response (see [`super::exchange`]). Tracked
     /// separately because each backend has its own independent pipeline.
     outstanding_primary: usize,
@@ -453,14 +459,37 @@ impl Transform for PostgresSinkCluster {
             return self.run_startup(chain_state).await;
         }
 
-        if chain_state.requests.is_empty() {
-            // Drain any unrequested async messages from whichever connections exist.
-            let mut responses = vec![];
-            if let Some(primary) = self.primary.as_mut() {
-                let _ = primary.try_recv_into(&mut responses);
+        let mut responses = vec![];
+        if self.streaming_unit.is_some() {
+            // A train is still arriving. Finish it to completion when a client batch is waiting,
+            // because that batch cannot be routed until the unit closes; otherwise take what has
+            // arrived and let the next notify continue. Either way this is the only timeout
+            // watching that connection now.
+            let to_completion = !chain_state.requests.is_empty();
+            let streaming_id = self.streaming_unit;
+            if let Err(err) = self
+                .drain_streaming_unit(&mut responses, to_completion)
+                .await
+            {
+                if err.downcast_ref::<super::BackendReadTimeout>().is_some() {
+                    self.abandon_streaming_unit();
+                    chain_state.close_client_connection = true;
+                    responses.push(backend_read_timeout_response(streaming_id));
+                    return Ok(responses);
+                }
+                return Err(err);
             }
-            if let Some(replica) = self.replica.as_mut() {
-                let _ = replica.try_recv_into(&mut responses);
+        }
+
+        if chain_state.requests.is_empty() {
+            if self.streaming_unit.is_none() {
+                // Drain any unrequested async messages from whichever connections exist.
+                if let Some(primary) = self.primary.as_mut() {
+                    let _ = primary.try_recv_into(&mut responses);
+                }
+                if let Some(replica) = self.replica.as_mut() {
+                    let _ = replica.try_recv_into(&mut responses);
+                }
             }
             return Ok(responses);
         }
@@ -469,7 +498,10 @@ impl Transform for PostgresSinkCluster {
         let mut requests = std::mem::take(&mut chain_state.requests);
         let first_id = requests.first_mut().map(|r| r.id());
         match self.route(target, requests).await {
-            Ok(responses) => Ok(responses),
+            Ok(routed) => {
+                responses.extend(routed);
+                Ok(responses)
+            }
             Err(err) if err.downcast_ref::<super::BackendReadTimeout>().is_some() => {
                 // route() already dropped the stalled backend connection. Tell the client and close
                 // so it never hangs on a response the backend will not produce.
@@ -551,6 +583,7 @@ impl PostgresSinkCluster {
     /// Sends a batch to the chosen backend, collects its responses, and updates unit/transaction
     /// state from the trailing ReadyForQuery.
     async fn route(&mut self, target: Target, mut requests: Messages) -> Result<Messages> {
+        let first_id = requests.first_mut().map(|r| r.id());
         // A batch of only suppressed (dummy) requests produces dummy responses without touching a
         // backend, so it must not overwrite the session's unit_target — otherwise a throttle/cache hit
         // would pin every following read to the primary, since a dummy response carries no
@@ -601,7 +634,10 @@ impl PostgresSinkCluster {
                 )
                 .await
                 {
-                    Ok(responses) => responses,
+                    Ok((responses, streaming)) => {
+                        self.streaming_unit = streaming.then_some(first_id).flatten();
+                        responses
+                    }
                     Err(err) => {
                         // Classify before reacting (review F4). A read timeout means the primary was
                         // SLOW, not dead — the connection is desynced so drop it, but do NOT invalidate
@@ -635,7 +671,10 @@ impl PostgresSinkCluster {
                 )
                 .await
                 {
-                    Ok(responses) => responses,
+                    Ok((responses, streaming)) => {
+                        self.streaming_unit = streaming.then_some(first_id).flatten();
+                        responses
+                    }
                     Err(err) => {
                         // Classify before reacting (review F4). A read timeout means the replica was
                         // SLOW, not unhealthy — drop the desynced connection but do NOT cool the host
@@ -661,6 +700,68 @@ impl PostgresSinkCluster {
         };
         self.note_unit_boundary(&mut responses);
         Ok(responses)
+    }
+
+    /// Receives more of the train still arriving on the open unit's connection.
+    ///
+    /// `to_completion` keeps going until the train's id-carrying final message arrives. A new client
+    /// batch needs that before it can be routed: `decide_target` pins any batch arriving while a
+    /// unit is open to that unit's node, so a write pipelined behind a streaming REPLICA read would
+    /// otherwise be sent to the replica. Early return is what makes that reachable — until now the
+    /// unit was always closed by `note_unit_boundary` before a second batch could be processed.
+    ///
+    /// Otherwise one receive is enough: the reader notifies after every push, so the next chain run
+    /// continues the drain, and returning between chunks is the point of the exercise.
+    async fn drain_streaming_unit(
+        &mut self,
+        responses: &mut Messages,
+        to_completion: bool,
+    ) -> Result<()> {
+        let Some(target) = self.unit_target else {
+            // No open unit to drain against; nothing to finish.
+            self.streaming_unit = None;
+            return Ok(());
+        };
+        loop {
+            let before = responses.len();
+            let (connection, outstanding) = match target {
+                Target::Primary => (self.primary.as_mut(), &mut self.outstanding_primary),
+                Target::Replica => (self.replica.as_mut(), &mut self.outstanding_replica),
+            };
+            let Some(connection) = connection else {
+                self.streaming_unit = None;
+                return Ok(());
+            };
+            super::recv_under_idle_timeout(connection, responses, self.read_timeout).await?;
+            let answered = super::count_answered(&responses[before..]);
+            *outstanding = outstanding.saturating_sub(answered);
+            if answered > 0 {
+                // Only a train's last message carries an id, so the train is complete.
+                self.streaming_unit = None;
+                self.note_unit_boundary(&mut responses[before..]);
+                return Ok(());
+            }
+            if !to_completion {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Drops the streaming connection after a stall and reports it, mirroring `route`'s handling.
+    fn abandon_streaming_unit(&mut self) {
+        self.backend_read_timeout.increment(1);
+        match self.unit_target {
+            Some(Target::Replica) => {
+                self.replica = None;
+                self.outstanding_replica = 0;
+            }
+            _ => {
+                self.primary = None;
+                self.outstanding_primary = 0;
+            }
+        }
+        self.streaming_unit = None;
+        self.unit_target = None;
     }
 
     /// Updates transaction/unit state from the trailing ReadyForQuery of a response batch.
@@ -702,7 +803,7 @@ impl PostgresSinkCluster {
         }
 
         let requests = std::mem::take(&mut chain_state.requests);
-        let mut responses = match super::exchange(
+        let (mut responses, _startup_never_streams) = match super::exchange(
             self.primary.as_mut().unwrap(),
             requests,
             &mut self.outstanding_primary,
