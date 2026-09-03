@@ -63,19 +63,20 @@ impl ResponseSender {
         }
     }
 
-    /// Sends a terminal message — one delivered immediately before the connection closes — without
-    /// ever waiting for room.
+    /// Sends without ever waiting for room, logging and dropping the message if there is none.
     ///
-    /// Used from the client reader task, whose job at that point is to report a failure. Blocking it
-    /// on a full channel would deadlock the very path that reports the problem, so an unsendable
-    /// terminal message is logged and dropped; the connection is closing regardless.
-    fn send_terminal(&self, messages: Messages) {
+    /// ONLY for the client reader task, which cannot afford to wait: it is the task that reports a
+    /// decode failure, and parking it on a full channel would stall the very path that reports the
+    /// problem. Everything on the main task should use [`ResponseSender::send`] instead — dropping
+    /// a response there loses an answer the client is waiting for, and under a slow client (the
+    /// only reason to bound this channel) a full channel is the steady state, not an anomaly.
+    fn send_without_waiting(&self, messages: Messages, description: &str) {
         let failed = match self {
             Self::Unbounded(tx) => tx.send(messages).is_err(),
             Self::Bounded(tx) => tx.try_send(messages).is_err(),
         };
         if failed {
-            error!("Failed to send RespondAndThenCloseConnection message to the client");
+            error!("Failed to send {description} to the client");
         }
     }
 }
@@ -92,6 +93,54 @@ impl ResponseReceiver {
             Self::Unbounded(rx) => rx.recv().await,
             Self::Bounded(rx) => rx.recv().await,
         }
+    }
+}
+
+/// Hands a batch of responses to the writer task.
+///
+/// Awaiting a permit here is what makes a slow client slow the backend down (see
+/// [`ResponseSender`]), so this can block for as long as the client takes to read. Two things
+/// must still be able to end that wait:
+///
+/// * shutdown — nothing aborts a connection task, it is only signalled, and a task parked here
+///   is not in `run_loop`'s select to notice. The send is polled FIRST (`biased`) so a channel
+///   with room still delivers the answer it already has: a graceful shutdown is meant to let
+///   in-flight work reach a safe state, and an unbiased select would discard it on a coin flip
+///   whenever the signal arrived while the chain was running.
+/// * the source's idle `timeout`, if the operator set one — otherwise a client that sends a
+///   query and then never reads holds its connection permit, its backend connection and its
+///   buffered chunks forever, and enough of them stop the source accepting anyone. That is the
+///   one thing a bounded channel takes away from the old behaviour, where the send returned
+///   immediately and `run_loop` re-armed the timeout on the next pass.
+///
+/// A free function rather than a method: both call sites still hold a `ChainState` borrowing
+/// `self.chain`, so it can only take the two fields it actually needs.
+async fn send_to_client(
+    shutdown: &mut Shutdown,
+    timeout: Option<Duration>,
+    out_tx: &ResponseSender,
+    responses: Messages,
+) -> Option<CloseReason> {
+    tokio::select! {
+        biased;
+        result = out_tx.send(responses) => {
+            // the client has disconnected so we should terminate this connection
+            result.err().map(|()| CloseReason::ClientClosed)
+        }
+        _ = shutdown.recv() => Some(CloseReason::ShotoverShutdown),
+        _ = sleep_for_duration_or_forever(timeout) => {
+            debug!("client did not read its responses within the configured timeout, closing");
+            Some(CloseReason::ClientClosed)
+        }
+    }
+}
+
+/// Sleeps for `duration`, or forever when there is none — so a `select!` arm can be disabled by
+/// configuration without changing its shape.
+async fn sleep_for_duration_or_forever(duration: Option<Duration>) {
+    match duration {
+        Some(duration) => tokio::time::sleep(duration).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -683,7 +732,10 @@ pub fn spawn_read_write_tasks<
                         }
                         Ok(None) => break,
                         Err(CodecReadError::RespondAndThenCloseConnection(messages)) => {
-                            out_tx.send_terminal(messages);
+                            out_tx.send_without_waiting(
+                                messages,
+                                "RespondAndThenCloseConnection message",
+                            );
                             return;
                         }
                         Err(err) => {
@@ -706,7 +758,10 @@ pub fn spawn_read_write_tasks<
                                     }
                                 }
                                 Err(CodecReadError::RespondAndThenCloseConnection(messages)) => {
-                                    out_tx.send_terminal(messages);
+                                    out_tx.send_without_waiting(
+                                        messages,
+                                        "RespondAndThenCloseConnection message",
+                                    );
                                     return;
                                 }
                                 Err(CodecReadError::Parser(err)) => {
@@ -958,8 +1013,13 @@ impl<C: CodecBuilder + 'static> Handler<C> {
                 );
                 // The connection is going to be closed once we return Err.
                 // So first make a best effort attempt of responding to any pending requests with an error response.
-                // Terminal: the connection closes as soon as this returns Err.
-                out_tx.send_terminal(self.pending_requests.to_errors(chain_name, &err));
+                // The client is owed these errors, and this is the main task — the writer drains
+                // independently, so waiting for room here cannot deadlock. Dropping them instead
+                // would leave the client with a truncated result and a bare socket close, and under
+                // a slow client (the only reason this channel is bounded) a full channel is the
+                // steady state rather than an anomaly.
+                let errors = self.pending_requests.to_errors(chain_name, &err);
+                send_to_client(&mut self.shutdown, self.timeout, out_tx, errors).await;
                 return Err(err);
             }
         };
@@ -970,19 +1030,10 @@ impl<C: CodecBuilder + 'static> Handler<C> {
         if !responses.is_empty() {
             debug!("sending {} responses to client", responses.len());
             trace!("sending response to client: {responses:?}");
-            // Awaiting here is what makes a slow client slow the backend down (see
-            // `ResponseSender`), so it can block for as long as the client takes to read. Racing
-            // shutdown keeps that from holding the connection open forever: nothing aborts a
-            // connection task, it is only signalled, and a task parked here is not in `run_loop`'s
-            // select to notice.
-            tokio::select! {
-                result = out_tx.send(responses) => {
-                    if result.is_err() {
-                        // the client has disconnected so we should terminate this connection
-                        return Ok(Some(CloseReason::ClientClosed));
-                    }
-                }
-                _ = self.shutdown.recv() => return Ok(Some(CloseReason::ShotoverShutdown)),
+            if let Some(close_reason) =
+                send_to_client(&mut self.shutdown, self.timeout, out_tx, responses).await
+            {
+                return Ok(Some(close_reason));
             }
         }
 
@@ -1187,7 +1238,7 @@ impl PendingRequests {
 
 #[cfg(test)]
 mod response_channel_tests {
-    use super::{ResponseSender, response_channel};
+    use super::{CloseReason, ResponseSender, Shutdown, response_channel, send_to_client};
     use crate::message::Message;
     use std::time::Duration;
 
@@ -1231,31 +1282,91 @@ mod response_channel_tests {
         }
     }
 
-    /// A terminal message is sent from the task that reports a failure, so it must never wait —
-    /// dropping it is correct when the connection is closing anyway.
+    /// The reader task reports decode failures, so its send must never wait — dropping the message
+    /// is correct when the connection is closing anyway, and waiting would stall the very path that
+    /// reports the problem.
     #[tokio::test]
-    async fn a_terminal_send_never_waits_on_a_full_channel() {
+    async fn a_reader_task_send_never_waits_on_a_full_channel() {
         let (tx, _rx) = response_channel(Some(1));
         tx.send(batch()).await.unwrap();
         // Full. This must return rather than block; the message is logged and dropped.
         tokio::time::timeout(Duration::from_millis(100), async {
-            tx.send_terminal(batch())
+            tx.send_without_waiting(batch(), "test message")
         })
         .await
-        .expect("a terminal send blocked on a full channel");
+        .expect("a reader-task send blocked on a full channel");
+    }
+
+    /// Graceful shutdown exists to let in-flight work reach a safe state, so a response the chain
+    /// has ALREADY produced must still be delivered when there is room for it — even though the
+    /// shutdown signal is also ready. `Shutdown::recv` returns immediately once signalled and a
+    /// non-full send completes on its first poll, so an unbiased `select!` would throw the response
+    /// away on roughly half of these iterations.
+    #[tokio::test]
+    async fn an_already_signalled_shutdown_does_not_discard_a_response_that_fits() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+        let mut shutdown = Shutdown::new(shutdown_rx);
+        let (tx, mut rx) = response_channel(Some(1));
+
+        for _ in 0..20 {
+            let reason = send_to_client(&mut shutdown, None, &tx, batch()).await;
+            assert!(
+                reason.is_none(),
+                "a response that fitted was dropped in favour of an already-signalled shutdown"
+            );
+            assert!(rx.recv().await.is_some());
+        }
+    }
+
+    /// But a send with nowhere to go must yield to shutdown rather than wait for a client that may
+    /// never read — nothing aborts a connection task, so this is the only way it ends.
+    #[tokio::test]
+    async fn a_blocked_send_yields_to_shutdown() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+        let mut shutdown = Shutdown::new(shutdown_rx);
+        let (tx, _rx) = response_channel(Some(1));
+        tx.send(batch()).await.unwrap();
+
+        let reason = tokio::time::timeout(
+            Duration::from_millis(100),
+            send_to_client(&mut shutdown, None, &tx, batch()),
+        )
+        .await
+        .expect("a full channel blocked shutdown");
+        assert!(matches!(reason, Some(CloseReason::ShotoverShutdown)));
+    }
+
+    /// And a client that never reads is closed once the source's idle timeout is configured,
+    /// instead of holding its connection slot forever.
+    #[tokio::test]
+    async fn a_blocked_send_gives_up_after_the_idle_timeout() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut shutdown = Shutdown::new(shutdown_rx);
+        let (tx, _rx) = response_channel(Some(1));
+        tx.send(batch()).await.unwrap();
+
+        let reason = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_to_client(&mut shutdown, Some(Duration::from_millis(50)), &tx, batch()),
+        )
+        .await
+        .expect("a client that never reads was never timed out");
+        assert!(matches!(reason, Some(CloseReason::ClientClosed)));
     }
 
     /// A send fails once the receiver is gone, which is how the chain learns the client left.
     #[tokio::test]
     async fn a_send_fails_once_the_writer_is_gone() {
-        for buffer in [None, Some(4)] {
-            let (tx, rx) = response_channel(buffer);
-            drop(rx);
-            assert!(matches!(
-                tx,
-                ResponseSender::Unbounded(_) | ResponseSender::Bounded(_)
-            ));
-            assert!(tx.send(batch()).await.is_err());
-        }
+        let (tx, rx) = response_channel(None);
+        assert!(matches!(tx, ResponseSender::Unbounded(_)));
+        drop(rx);
+        assert!(tx.send(batch()).await.is_err());
+
+        let (tx, rx) = response_channel(Some(4));
+        assert!(matches!(tx, ResponseSender::Bounded(_)));
+        drop(rx);
+        assert!(tx.send(batch()).await.is_err());
     }
 }

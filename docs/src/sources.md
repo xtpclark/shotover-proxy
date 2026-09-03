@@ -72,6 +72,24 @@ Postgres:
   # If not provided defaults to false
   hard_connection_limit: false
 
+  # How many batches of responses may queue for the client before the transform chain waits for it
+  # to catch up. If not provided the queue is unbounded, which is how every source behaves by
+  # default.
+  #
+  # Only worth setting alongside `stream_threshold_bytes` on a postgres sink. With streaming on, a
+  # client that reads slowly otherwise accumulates the whole result in this queue, because the chain
+  # hands responses to the writer and returns rather than waiting for the socket. Bounding it makes
+  # the chain wait, which stops it draining the backend, which lets TCP stall the backend — so a
+  # slow client costs a bounded amount of memory instead of the whole result.
+  #
+  # Sizing: a queued batch can hold a whole sink queue's worth of chunks, so budget roughly
+  # (response_buffer_batches + 1) * 8 * stream_threshold_bytes per streaming connection.
+  #
+  # Costs: a client that stops reading entirely stalls its own requests, exactly as it would talking
+  # to postgres directly — and it parks the chain outside the loop that applies `timeout`, so set
+  # `timeout` too, or such a connection holds its slot against `connection_limit` indefinitely.
+  #response_buffer_batches: 4
+
   # When this field is provided TLS is used when the client connects to Shotover.
   # Clients negotiate TLS through the standard postgres SSLRequest handshake.
   # When TLS is configured a client attempting a plaintext startup is refused,

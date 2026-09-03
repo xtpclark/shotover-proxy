@@ -30,11 +30,16 @@ pub struct PostgresSourceConfig {
     /// Set it alongside `stream_threshold_bytes` on the sink: with streaming on, a client that
     /// reads slowly otherwise accumulates the whole result here, because the chain hands responses
     /// to the writer task and returns rather than waiting for the socket. Bounding it makes the
-    /// chain wait, which stops it draining the backend, which lets TCP stall the backend — so a
-    /// slow client costs roughly this many chunks of memory instead of the whole result.
+    /// chain wait, which stops it draining the backend, which lets TCP stall the backend.
     ///
-    /// The cost of setting it is that a client which stops reading entirely stalls its own
-    /// requests, exactly as it would talking to PostgreSQL directly.
+    /// Sizing: a batch queued here can hold a whole sink queue's worth of chunks, so budget about
+    /// `(this + 1) * 8 * stream_threshold_bytes` per streaming connection — with 4 and a 1 MiB
+    /// threshold, roughly 40 MB, not 5.
+    ///
+    /// Two costs. A client that stops reading entirely stalls its own requests, exactly as it would
+    /// talking to PostgreSQL directly. And such a client parks the chain outside the loop that
+    /// applies `timeout`, so SET `timeout` as well — without it a connection that never reads holds
+    /// its slot against `connection_limit` indefinitely.
     #[serde(default)]
     pub response_buffer_batches: Option<usize>,
     pub chain: TransformChainConfig,
