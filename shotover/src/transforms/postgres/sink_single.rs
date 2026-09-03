@@ -160,13 +160,8 @@ pub struct PostgresSinkSingle {
     read_timeout: Option<Duration>,
     stream_threshold_bytes: usize,
     force_run_chain: Arc<Notify>,
-    /// Set while a response train is still arriving. `exchange` returns early with chunks in hand
-    /// rather than holding a whole large result, so the rest is collected below — and until it is,
-    /// nothing else applies a timeout to this connection.
-    ///
-    /// Recomputed from the tail of every batch this transform forwards (see
-    /// [`super::train_in_flight`]) rather than tracked by whichever branch ran, because a run can
-    /// both finish one train and begin the next.
+    /// Set while a response train is still arriving, so the drain below keeps a timeout on this
+    /// connection until it ends. See [`super::train_in_flight`] for how it is decided.
     streaming: bool,
     /// Requests sent to the server that have not yet been answered — see [`super::exchange`].
     /// Carried across batches because an extended-query pipeline's responses arrive on the batch
@@ -268,19 +263,15 @@ impl Transform for PostgresSinkSingle {
             // in-flight query and answers them on the same ordered connection, so `outstanding`
             // accounts for them as it always has. Declining to send them would drop them — the chain
             // never re-queues what a transform leaves behind.
-            let before = responses.len();
-            match super::recv_under_idle_timeout(
+            match super::recv_and_account(
                 self.connection.as_mut().unwrap(),
                 &mut responses,
+                &mut self.outstanding,
                 self.read_timeout,
             )
             .await
             {
-                Ok(()) => {
-                    self.outstanding = self
-                        .outstanding
-                        .saturating_sub(super::count_answered(&responses[before..]));
-                }
+                Ok(()) => {}
                 Err(err) if err.downcast_ref::<super::BackendReadTimeout>().is_some() => {
                     self.connection = None;
                     self.outstanding = 0;
@@ -302,14 +293,13 @@ impl Transform for PostgresSinkSingle {
                 // (notifications, notices) without awaiting.
                 // TODO: handle errors here
                 let before = responses.len();
-                // TODO: handle errors here
                 let _ = self
                     .connection
                     .as_mut()
                     .unwrap()
                     .try_recv_into(&mut responses);
-                // A response answered here still answers a request: without this the count stays
-                // high and the next exchange waits for a reply that has already been delivered.
+                // A response answered here still answers a request, and leaving it uncounted makes
+                // the next exchange block for a reply already delivered.
                 self.outstanding = self
                     .outstanding
                     .saturating_sub(super::count_answered(&responses[before..]));
@@ -331,16 +321,15 @@ impl Transform for PostgresSinkSingle {
                     // the client, and close — never hang the client on a response that will not come.
                     self.connection = None;
                     self.outstanding = 0;
-                    self.streaming = false;
                     chain_state.close_client_connection = true;
                     responses.push(read_timeout_error_response(first_id));
                 }
                 Err(err) => return Err(err),
             }
         }
-        // Whatever produced them, the batch being forwarded decides whether more of a train is
-        // coming: only a train's final message carries an id, so a trailing chunk means it has not
-        // arrived. Skipped when nothing was received, which says nothing either way.
+        // One place decides the state, from the batch actually being forwarded. Skipped when
+        // nothing arrived, which says nothing either way — `train_in_flight` of an empty batch is
+        // false and would wrongly clear a live train.
         if !responses.is_empty() {
             self.streaming = super::train_in_flight(&responses);
         }
@@ -475,34 +464,17 @@ mod tests {
         }
     }
 
-    /// THE regression gate for incremental forwarding. Once `exchange` returns early with chunks,
-    /// nothing else applies a timeout to that backend connection — so a backend that goes silent
-    /// mid-train must be caught by the drain arm's own idle timeout, or the client hangs forever.
-    ///
-    /// Drives a real socket: a fake backend writes enough of a row stream to cross the threshold,
-    /// then stops without ever sending the ReadyForQuery that would end the train.
-    #[tokio::test]
-    async fn stalled_mid_train_backend_is_timed_out_by_the_drain_arm() {
+    /// A backend on a real socket that writes `canned` and then falls silent, holding the
+    /// connection open. Returns a sink pointed at it, configured to chunk and to time out quickly.
+    async fn fake_backend(canned: BytesMut) -> (PostgresSinkSingle, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
-
-        // A backend that answers with chunks and then falls silent, holding the socket open.
         let backend = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut train = BytesMut::new();
-            row_description().encode(&mut train).unwrap();
-            for i in 0..200 {
-                BackendMessage::DataRow {
-                    values: vec![Some(Bytes::from(format!("{i:0>60}")))],
-                }
-                .encode(&mut train)
-                .unwrap();
-            }
-            // No CommandComplete, no ReadyForQuery: the train never ends.
-            stream.write_all(&train).await.unwrap();
-            // Hold the connection open and silent until the test drops us.
+            stream.write_all(&canned).await.unwrap();
+            // Silence, until the test drops us.
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
@@ -510,14 +482,66 @@ mod tests {
         sink.address = format!("127.0.0.1:{port}");
         sink.stream_threshold_bytes = 256;
         sink.read_timeout = Some(Duration::from_millis(300));
+        (sink, backend)
+    }
 
-        // First run: the query goes out and `exchange` comes back early with partial chunks.
-        let query = Message::from_frame(Frame::Postgres(PostgresFrame::Request(
+    /// A row stream with no CommandComplete and no ReadyForQuery: a train that never ends.
+    fn endless_train(dst: &mut BytesMut) {
+        row_description().encode(dst).unwrap();
+        for i in 0..200 {
+            BackendMessage::DataRow {
+                values: vec![Some(Bytes::from(format!("{i:0>60}")))],
+            }
+            .encode(dst)
+            .unwrap();
+        }
+    }
+
+    fn query(sql: &str) -> Message {
+        Message::from_frame(Frame::Postgres(PostgresFrame::Request(
             FrontendMessage::Query {
-                query: "SELECT n FROM t".to_owned(),
+                query: sql.to_owned(),
             },
-        )));
-        let mut chain_state = ChainState::new_test(vec![query]);
+        )))
+    }
+
+    /// Runs the sink with no client requests — as the source does on the connection's notify —
+    /// until the stalled backend is timed out. Returns how many requests were answered on the way.
+    async fn drive_until_close(sink: &mut PostgresSinkSingle) -> usize {
+        for _ in 0..500 {
+            let mut chain_state = ChainState::new_test(vec![]);
+            let responses =
+                tokio::time::timeout(Duration::from_secs(5), sink.transform(&mut chain_state))
+                    .await
+                    .expect("the drain arm hung instead of timing out")
+                    .unwrap();
+            if chain_state.close_client_connection {
+                assert_eq!(responses.len(), 1);
+                match responses[0].clone().frame().unwrap() {
+                    Frame::Postgres(PostgresFrame::Response(train)) => assert!(
+                        train[0]
+                            .error_message()
+                            .unwrap()
+                            .contains("did not respond within read_timeout")
+                    ),
+                    other => panic!("expected an error response, got {other:?}"),
+                }
+                return count_answered(&responses);
+            }
+        }
+        panic!("the stalled backend was never timed out");
+    }
+
+    /// THE regression gate for incremental forwarding. Once `exchange` returns early with chunks,
+    /// nothing else applies a timeout to that backend connection — so a backend that goes silent
+    /// mid-train must be caught by the drain arm's own idle timeout, or the client hangs forever.
+    #[tokio::test]
+    async fn stalled_mid_train_backend_is_timed_out_by_the_drain_arm() {
+        let mut canned = BytesMut::new();
+        endless_train(&mut canned);
+        let (mut sink, backend) = fake_backend(canned).await;
+
+        let mut chain_state = ChainState::new_test(vec![query("SELECT n FROM t")]);
         let responses = sink.transform(&mut chain_state).await.unwrap();
         assert!(
             !responses.is_empty(),
@@ -527,47 +551,9 @@ mod tests {
             responses.iter().all(|r| r.request_id().is_none()),
             "a partial chunk must not carry a request id"
         );
-        assert!(
-            sink.streaming,
-            "the sink must know a train is still in flight"
-        );
+        assert!(sink.streaming, "the sink must know a train is in flight");
 
-        // Later runs carry no client requests, exactly as the source's notify-triggered runs do.
-        // The drain arm forwards whatever has arrived; once the backend falls silent it must trip
-        // the idle timeout rather than wait forever for a train that will never end.
-        let mut forwarded = responses.len();
-        let mut timed_out = None;
-        for _ in 0..500 {
-            let mut chain_state = ChainState::new_test(vec![]);
-            let responses =
-                tokio::time::timeout(Duration::from_secs(5), sink.transform(&mut chain_state))
-                    .await
-                    .expect("the drain arm hung instead of timing out")
-                    .unwrap();
-            forwarded += responses.len();
-            if chain_state.close_client_connection {
-                timed_out = Some(responses);
-                break;
-            }
-        }
-        let responses = timed_out.expect("the drain arm never timed the stalled backend out");
-        assert!(
-            forwarded > 1,
-            "the chunks should have been forwarded as they arrived, not held"
-        );
-
-        assert_eq!(responses.len(), 1);
-        match responses[0].clone().frame().unwrap() {
-            Frame::Postgres(PostgresFrame::Response(train)) => {
-                assert!(
-                    train[0]
-                        .error_message()
-                        .unwrap()
-                        .contains("did not respond within read_timeout")
-                );
-            }
-            other => panic!("expected an error response, got {other:?}"),
-        }
+        drive_until_close(&mut sink).await;
         assert!(!sink.streaming);
         assert!(
             sink.connection.is_none(),
@@ -583,58 +569,28 @@ mod tests {
     /// timeout watching it. Pipelines a completed small result in front of an endless one.
     #[tokio::test]
     async fn a_finished_train_does_not_clear_the_one_still_arriving() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
+        let mut canned = BytesMut::new();
+        // A complete train answering the first query.
+        row_description().encode(&mut canned).unwrap();
+        BackendMessage::DataRow {
+            values: vec![Some(Bytes::from_static(b"1"))],
+        }
+        .encode(&mut canned)
+        .unwrap();
+        BackendMessage::CommandComplete {
+            tag: "SELECT 1".to_owned(),
+        }
+        .encode(&mut canned)
+        .unwrap();
+        BackendMessage::ReadyForQuery { status: b'I' }
+            .encode(&mut canned)
             .unwrap();
-        let port = listener.local_addr().unwrap().port();
+        // Then the second query's, which never ends.
+        endless_train(&mut canned);
+        let (mut sink, backend) = fake_backend(canned).await;
 
-        let backend = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = BytesMut::new();
-            // A complete train answering the first query.
-            row_description().encode(&mut bytes).unwrap();
-            BackendMessage::DataRow {
-                values: vec![Some(Bytes::from_static(b"1"))],
-            }
-            .encode(&mut bytes)
-            .unwrap();
-            BackendMessage::CommandComplete {
-                tag: "SELECT 1".to_owned(),
-            }
-            .encode(&mut bytes)
-            .unwrap();
-            BackendMessage::ReadyForQuery { status: b'I' }
-                .encode(&mut bytes)
-                .unwrap();
-            // Then the second query's train, which never ends.
-            row_description().encode(&mut bytes).unwrap();
-            for i in 0..200 {
-                BackendMessage::DataRow {
-                    values: vec![Some(Bytes::from(format!("{i:0>60}")))],
-                }
-                .encode(&mut bytes)
-                .unwrap();
-            }
-            stream.write_all(&bytes).await.unwrap();
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        });
-
-        let mut sink = sink();
-        sink.address = format!("127.0.0.1:{port}");
-        sink.stream_threshold_bytes = 256;
-        sink.read_timeout = Some(Duration::from_millis(300));
-
-        let queries: Vec<Message> = ["SELECT 1", "SELECT n FROM t"]
-            .iter()
-            .map(|q| {
-                Message::from_frame(Frame::Postgres(PostgresFrame::Request(
-                    FrontendMessage::Query {
-                        query: (*q).to_owned(),
-                    },
-                )))
-            })
-            .collect();
-        let mut chain_state = ChainState::new_test(queries);
+        let mut chain_state =
+            ChainState::new_test(vec![query("SELECT 1"), query("SELECT n FROM t")]);
         let responses = sink.transform(&mut chain_state).await.unwrap();
 
         // The backend wrote both trains at once, so this one batch carries the first query's
@@ -651,23 +607,7 @@ mod tests {
             "a completed train cleared the streaming flag while another was still arriving"
         );
 
-        // And the still-arriving train must remain watched: a backend that now goes silent has to
-        // be timed out rather than hang the client.
-        let mut timed_out = false;
-        for _ in 0..500 {
-            let mut chain_state = ChainState::new_test(vec![]);
-            let responses =
-                tokio::time::timeout(Duration::from_secs(5), sink.transform(&mut chain_state))
-                    .await
-                    .expect("the drain arm hung instead of timing out")
-                    .unwrap();
-            if chain_state.close_client_connection {
-                timed_out = true;
-                break;
-            }
-            answered += count_answered(&responses);
-        }
-        assert!(timed_out, "the stalled second train was never timed out");
+        answered += drive_until_close(&mut sink).await;
         assert_eq!(
             answered, 1,
             "only the first query should have been answered"
