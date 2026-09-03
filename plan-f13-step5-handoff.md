@@ -1,6 +1,6 @@
 # F13 — handoff into step 5 (streaming redaction)
 
-Branch `f13-step4b-backpressure` @ `bc7bf541` on the **fork**
+Branch `f13-step4b-backpressure` @ `9b809b00` on the **fork**
 (`github.com/xtpclark/shotover-proxy`). Steps 4a and 4b are DONE and cold-re-verified.
 
 ## Where the numbers stand
@@ -19,7 +19,7 @@ pgbench prepared/8 clients is 1023 tps with the bound and 1023 tps without.
 
 ## Review findings
 
-**1. `try_send` in the client reader task — FIXED in `4e57a37e`.** Both
+**1. `try_send` in the client reader task — FIXED in `9b809b00`.** Both
 `CodecReadError::RespondAndThenCloseConnection` arms now use `send_terminal`, a bounded wait
 (`TERMINAL_MESSAGE_TIMEOUT`, 5 s). It needs neither a `Shutdown` nor the source `timeout`, so
 `spawn_read_write_tasks` keeps its signature and all five sources are untouched. The client gets its
