@@ -70,8 +70,14 @@ instead — **a zero-install way to lint the workspace on any host with openssl-
 whose absence the earlier misread was hiding.
 
 What remains unlinted is only the `kafka-cpp-driver-tests` and `cassandra-cpp-driver-tests` cfgs in
-`test-helpers`, reachable only via `--all-features`, which additionally needs `cmake` for
-`rdkafka-sys`. The dev container here does not have it. Nothing in a shipping path is uncovered.
+`test-helpers`, reachable only via `--all-features`. Its prerequisites are **`cmake` AND
+`libcurl-devel`**, not cmake alone: `rdkafka-sys` builds librdkafka from source, and librdkafka 2.12
+includes `curl/curl.h` unconditionally in `rdkafka_conf.c` even though the build script passes
+`-DWITH_CURL=0`. The review host has cmake 3.30.8 and, with `OPENSSL_NO_VENDOR=1`, still fails there
+on the missing curl header; the dev container here has neither. So
+`cargo clippy --workspace --all-features --all-targets` remains unrun by anyone, and closing it needs
+system packages on one of the user's machines — theirs to authorise, and worth little, since nothing
+in a shipping path is uncovered.
 
 ## Still parked from 4a
 
