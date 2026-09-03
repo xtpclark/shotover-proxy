@@ -39,9 +39,10 @@ pub struct SinkConnection {
 ///
 /// Ten thousand is effectively unbounded for a request/response protocol, where a batch is a small
 /// answer to one request — which is what every sink relied on before responses could be streamed in
-/// pieces. It is NOT effectively unbounded once a batch is a chunk of a large result: a sink that
-/// streams should pass a small value, so that a chain which stops draining (because the client is
-/// slow) parks this reader and lets TCP stall the backend.
+/// pieces. It is NOT effectively unbounded once a batch is a chunk of a large result, which is why
+/// [`CodecBuilder::response_buffer_batches`] lets a streaming codec ask for a small value: a chain
+/// that stops draining (because the client is slow) then parks this reader and lets TCP stall the
+/// backend.
 pub const DEFAULT_RESPONSE_BUFFER_BATCHES: usize = 10_000;
 
 impl SinkConnection {
@@ -53,35 +54,9 @@ impl SinkConnection {
         force_run_chain: Arc<Notify>,
         read_timeout: Option<Duration>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_response_buffer(
-            host,
-            codec_builder,
-            tls,
-            connect_timeout,
-            force_run_chain,
-            read_timeout,
-            DEFAULT_RESPONSE_BUFFER_BATCHES,
-        )
-        .await
-    }
-
-    /// As [`SinkConnection::new`], but bounding how many response batches may queue ahead of the
-    /// chain. See [`DEFAULT_RESPONSE_BUFFER_BATCHES`] for why a streaming sink wants a small one.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn new_with_response_buffer<
-        A: ToSocketAddrs + ToHostname + std::fmt::Debug,
-        C: CodecBuilder + 'static,
-    >(
-        host: A,
-        codec_builder: C,
-        tls: &Option<TlsConnector>,
-        connect_timeout: Duration,
-        force_run_chain: Arc<Notify>,
-        read_timeout: Option<Duration>,
-        response_buffer_batches: usize,
-    ) -> anyhow::Result<Self> {
         let destination = tokio::net::lookup_host(&host).await?.next().unwrap();
-        let (in_tx, in_rx) = mpsc::channel::<Messages>(response_buffer_batches.max(1));
+        let (in_tx, in_rx) =
+            mpsc::channel::<Messages>(codec_builder.response_buffer_batches().max(1));
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Messages>();
         let (connection_closed_tx, connection_closed_rx) = mpsc::channel(1);
 
@@ -561,7 +536,7 @@ async fn reader_task<C: CodecBuilder + 'static, R: AsyncRead + Unpin + Send + 's
     }
 }
 
-async fn sleep_for_duration_or_forever(duration: Option<Duration>) {
+pub(crate) async fn sleep_for_duration_or_forever(duration: Option<Duration>) {
     if let Some(duration) = duration {
         tokio::time::sleep(duration).await
     } else {

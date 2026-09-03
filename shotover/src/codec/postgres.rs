@@ -302,7 +302,27 @@ impl CodecBuilder for PostgresCodecBuilder {
     fn protocol(&self) -> MessageType {
         MessageType::Postgres
     }
+
+    fn response_buffer_batches(&self) -> usize {
+        if self.stream_threshold_bytes > 0 {
+            STREAMING_RESPONSE_BUFFER_BATCHES
+        } else {
+            crate::connection::DEFAULT_RESPONSE_BUFFER_BATCHES
+        }
+    }
 }
+
+/// How many response batches a STREAMING sink lets its backend run ahead of the chain.
+///
+/// It has to be small for a bounded client channel to mean anything: a chain that stops draining
+/// because the client is slow would otherwise just fill this queue with the rest of the result.
+///
+/// Sizing, and it is NOT one chunk per batch downstream: `SinkConnection::recv_into` exhausts this
+/// queue before returning, so one chain run coalesces everything queued here into a SINGLE batch
+/// for the client channel. A client-channel slot therefore holds up to this many chunks, and the
+/// ceiling for a streaming connection is about `(response_buffer_batches * this + this) *
+/// stream_threshold_bytes` — not the sum of the two bounds.
+const STREAMING_RESPONSE_BUFFER_BATCHES: usize = 8;
 
 /// What kind of request was sent to the server, used by the sink decoder to
 /// determine where its response train ends.

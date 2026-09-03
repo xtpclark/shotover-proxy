@@ -1311,7 +1311,7 @@ impl PostgresSinkCluster {
     }
 
     async fn new_backend_connection(&self, host: &str) -> Result<SinkConnection> {
-        SinkConnection::new_with_response_buffer(
+        SinkConnection::new(
             host,
             PostgresCodecBuilder::new(Direction::Sink, "PostgresSinkCluster".to_owned())
                 .with_stream_threshold(self.stream_threshold_bytes),
@@ -1319,11 +1319,6 @@ impl PostgresSinkCluster {
             self.connect_timeout,
             self.force_run_chain.clone(),
             None,
-            if self.stream_threshold_bytes > 0 {
-                super::STREAMING_RESPONSE_BUFFER_BATCHES
-            } else {
-                crate::connection::DEFAULT_RESPONSE_BUFFER_BATCHES
-            },
         )
         .await
     }

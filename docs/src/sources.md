@@ -73,8 +73,8 @@ Postgres:
   hard_connection_limit: false
 
   # How many batches of responses may queue for the client before the transform chain waits for it
-  # to catch up. If not provided the queue is unbounded, which is how every source behaves by
-  # default.
+  # to catch up. If not provided the limit is one no source could reach before streaming existed,
+  # which is how every source behaves by default.
   #
   # Only worth setting alongside `stream_threshold_bytes` on a postgres sink. With streaming on, a
   # client that reads slowly otherwise accumulates the whole result in this queue, because the chain
@@ -85,9 +85,9 @@ Postgres:
   # Sizing: a queued batch can hold a whole sink queue's worth of chunks, so budget roughly
   # (response_buffer_batches + 1) * 8 * stream_threshold_bytes per streaming connection.
   #
-  # Costs: a client that stops reading entirely stalls its own requests, exactly as it would talking
-  # to postgres directly — and it parks the chain outside the loop that applies `timeout`, so set
-  # `timeout` too, or such a connection holds its slot against `connection_limit` indefinitely.
+  # Cost: a client that stops reading entirely stalls its own requests, exactly as it would talking
+  # to postgres directly. Such a connection parks the chain outside the loop that re-arms the idle
+  # timeout, so `timeout` is what reclaims it — setting this without `timeout` is refused at startup.
   #response_buffer_batches: 4
 
   # When this field is provided TLS is used when the client connects to Shotover.
@@ -105,6 +105,8 @@ Postgres:
   #  #certificate_authority_path: "tls/localhost_CA.crt"
 
   # Timeout in seconds after which to terminate an idle connection. This field is optional, if not provided, idle connections will never be terminated.
+  # With response_buffer_batches set it also bounds how long the chain waits for a slow client, and
+  # is required, because a connection parked on the full response queue cannot re-arm this timeout.
   # timeout: 60
 
   chain:
