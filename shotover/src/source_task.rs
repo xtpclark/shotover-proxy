@@ -31,6 +31,30 @@ use tracing::{debug, error, warn};
 
 const MAX_RETRY_BACKOFF_SECONDS: u64 = 64;
 
+/// How long the client reader task will wait to hand over the last message on a connection that is
+/// closing. Arbitrary, and deliberately short: see [`send_terminal`].
+const TERMINAL_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Best-effort delivery of the error response a client is owed before its connection closes.
+///
+/// Called from the client reader task, which returns immediately afterwards, so it must not park
+/// forever: when the client has stopped reading, the writer task is itself blocked on the socket and
+/// nobody drains the response queue, and an unbounded wait would strand this task for as long as
+/// that lasts. But `try_send` gives up too easily — with `response_buffer_batches` set, a few
+/// batches are queued most of the time while a large result streams, so a client sending malformed
+/// frames would lose its error response and see a bare socket close. A short bounded wait delivers
+/// it whenever the writer is draining at all, and abandons it otherwise.
+async fn send_terminal(out_tx: &mpsc::Sender<Messages>, messages: Messages, within: Duration) {
+    match time::timeout(within, out_tx.send(messages)).await {
+        Ok(Ok(())) => {}
+        // The client hung up first, which is the ordinary way this happens.
+        Ok(Err(_)) => debug!("client closed before its error response could be sent"),
+        Err(_) => {
+            error!("client did not read its error response within {within:?}, closing without it")
+        }
+    }
+}
+
 /// Hands a batch of responses to the writer task.
 ///
 /// Awaiting a permit here is what makes a slow client slow the backend down, so this can block for
@@ -641,11 +665,7 @@ pub fn spawn_read_write_tasks<
                         }
                         Ok(None) => break,
                         Err(CodecReadError::RespondAndThenCloseConnection(messages)) => {
-                            // Never wait here: this task reports the decode failure, so parking it on a
-                            // full channel would stall the very path that reports the problem.
-                            if out_tx.try_send(messages).is_err() {
-                                error!("Failed to send RespondAndThenCloseConnection message");
-                            }
+                            send_terminal(&out_tx, messages, TERMINAL_MESSAGE_TIMEOUT).await;
                             return;
                         }
                         Err(err) => {
@@ -668,12 +688,8 @@ pub fn spawn_read_write_tasks<
                                     }
                                 }
                                 Err(CodecReadError::RespondAndThenCloseConnection(messages)) => {
-                                    // See the note on the other RespondAndThenCloseConnection send.
-                                    if out_tx.try_send(messages).is_err() {
-                                        error!(
-                                            "Failed to send RespondAndThenCloseConnection message"
-                                        );
-                                    }
+                                    send_terminal(&out_tx, messages, TERMINAL_MESSAGE_TIMEOUT)
+                                        .await;
                                     return;
                                 }
                                 Err(CodecReadError::Parser(err)) => {
@@ -1159,13 +1175,51 @@ impl PendingRequests {
 
 #[cfg(test)]
 mod send_to_client_tests {
-    use super::{CloseReason, Shutdown, send_to_client};
+    use super::{CloseReason, Shutdown, TERMINAL_MESSAGE_TIMEOUT, send_terminal, send_to_client};
     use crate::message::{Message, Messages};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
     fn batch() -> Messages {
         vec![Message::from_frame(crate::frame::Frame::Dummy)]
+    }
+
+    /// The error response a client is owed must survive a queue that is merely BUSY. Under
+    /// `response_buffer_batches` a few batches are queued most of the time while a large result
+    /// streams, so a `try_send` here drops the message exactly when a client is most likely to need
+    /// it — and it then sees a bare socket close with no reason.
+    #[tokio::test]
+    async fn a_terminal_message_waits_for_room_rather_than_dropping() {
+        let (tx, mut rx) = mpsc::channel::<Messages>(1);
+        tx.send(batch()).await.unwrap();
+
+        // Polled by hand rather than spawned: a spawned sender races the drain below, and would
+        // pass under a `try_send` that happened to find room.
+        let mut sending = std::pin::pin!(send_terminal(&tx, batch(), TERMINAL_MESSAGE_TIMEOUT));
+        assert!(
+            futures::poll!(&mut sending).is_pending(),
+            "the terminal message was abandoned instead of waiting for room"
+        );
+
+        assert!(rx.recv().await.is_some(), "the queued batch went missing");
+        sending.await;
+        assert!(
+            rx.recv().await.is_some(),
+            "the terminal message never reached the client"
+        );
+    }
+
+    /// But it gives up rather than stranding the reader task. A client that has stopped reading
+    /// leaves the writer blocked on its socket, so nothing will ever drain the queue.
+    #[tokio::test]
+    async fn a_terminal_message_gives_up_rather_than_stranding_the_reader() {
+        let (tx, _rx) = mpsc::channel::<Messages>(1);
+        tx.send(batch()).await.unwrap();
+
+        let within = Duration::from_millis(20);
+        tokio::time::timeout(within * 100, send_terminal(&tx, batch(), within))
+            .await
+            .expect("the reader task was stranded on a queue nobody drains");
     }
 
     /// Graceful shutdown exists to let in-flight work reach a safe state, so a response the chain
