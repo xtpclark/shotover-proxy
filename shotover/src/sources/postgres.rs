@@ -22,10 +22,15 @@ pub struct PostgresSourceConfig {
     pub connection_limit: Option<usize>,
     pub hard_connection_limit: Option<bool>,
     pub tls: Option<TlsAcceptorConfig>,
+    /// Seconds of idleness after which a client connection is terminated. Unset means never.
+    ///
+    /// With `response_buffer_batches` set this also bounds how long the chain waits for a client to
+    /// read: a connection parked on the full queue is not in the loop that re-arms the idle timeout,
+    /// so this is the only thing that ends it. Required whenever `response_buffer_batches` is set.
     pub timeout: Option<u64>,
     /// How many response batches may queue for the client before the transform chain has to wait
-    /// for it to catch up. Unset leaves that queue unbounded, which is the behaviour of every other
-    /// source and of this one before streaming existed.
+    /// for it to catch up. Unset means a limit no source could reach before streaming existed, which
+    /// is the behaviour of every other source and of this one until now.
     ///
     /// Set it alongside `stream_threshold_bytes` on the sink: with streaming on, a client that
     /// reads slowly otherwise accumulates the whole result here, because the chain hands responses
@@ -36,11 +41,10 @@ pub struct PostgresSourceConfig {
     /// `(this + 1) * 8 * stream_threshold_bytes` per streaming connection — with 4 and a 1 MiB
     /// threshold, roughly 40 MB, not 5.
     ///
-    /// Two costs. A client that stops reading entirely stalls its own requests, exactly as it would
-    /// talking to PostgreSQL directly. And such a client parks the chain outside the loop that
-    /// applies `timeout`, so SET `timeout` as well — without it a connection that never reads holds
-    /// its slot against `connection_limit` indefinitely.
-    #[serde(default)]
+    /// The cost is that a client which stops reading entirely stalls its own requests, exactly as it
+    /// would talking to PostgreSQL directly. Because such a connection parks the chain outside the
+    /// loop that re-arms the idle timeout, `timeout` is what eventually reclaims it, and setting
+    /// this without `timeout` is refused at startup.
     pub response_buffer_batches: Option<usize>,
     pub chain: TransformChainConfig,
 }
@@ -51,6 +55,15 @@ impl PostgresSourceConfig {
         trigger_shutdown_rx: watch::Receiver<bool>,
         hot_reload_listeners: &mut HashMap<u16, TcpListener>,
     ) -> Result<Source, Vec<String>> {
+        if self.response_buffer_batches.is_some() && self.timeout.is_none() {
+            return Err(vec![format!(
+                "Postgres source {}: response_buffer_batches requires timeout to be set as well. \
+                 A client that stops reading parks the chain on the full response queue, where the \
+                 idle timeout is the only thing that can reclaim the connection.",
+                self.name
+            )]);
+        }
+
         info!("Starting Postgres source on [{}]", self.listen_addr);
 
         let (hot_reload_tx, hot_reload_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -81,5 +94,49 @@ impl PostgresSourceConfig {
             gradual_shutdown_tx,
             self.name.clone(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PostgresSourceConfig;
+    use crate::config::chain::TransformChainConfig;
+
+    fn config(
+        response_buffer_batches: Option<usize>,
+        timeout: Option<u64>,
+    ) -> PostgresSourceConfig {
+        PostgresSourceConfig {
+            name: "test".to_owned(),
+            listen_addr: "127.0.0.1:0".to_owned(),
+            connection_limit: None,
+            hard_connection_limit: None,
+            tls: None,
+            timeout,
+            response_buffer_batches,
+            chain: TransformChainConfig(vec![]),
+        }
+    }
+
+    /// A client parked on the full response queue is not in the loop that re-arms the idle timeout,
+    /// so `timeout` is the only thing that can ever reclaim its connection. Pairing them is a
+    /// startup error rather than a documentation note, because the failure it prevents — connection
+    /// slots leaking until the source stops accepting anyone — only shows up under the slow client
+    /// the bound exists to serve.
+    #[tokio::test]
+    async fn bounding_the_response_queue_requires_an_idle_timeout() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let Err(errors) = config(Some(4), None)
+            .build(rx, &mut Default::default())
+            .await
+        else {
+            panic!("a bounded response queue without a timeout was accepted");
+        };
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("response_buffer_batches requires timeout"),
+            "unexpected error: {}",
+            errors[0]
+        );
     }
 }
