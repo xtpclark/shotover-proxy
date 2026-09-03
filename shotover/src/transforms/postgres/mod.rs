@@ -70,10 +70,14 @@ fn trailing_unanswerable(requests: &mut [Message]) -> Option<usize> {
 
 /// How many response batches a STREAMING postgres sink lets its backend run ahead of the chain.
 ///
-/// With streaming on, a batch is about one chunk, so this is a byte bound in disguise: roughly this
-/// many times `stream_threshold_bytes`. It has to be small for a bounded client channel to mean
-/// anything — a chain that stops draining because the client is slow would otherwise just fill this
-/// queue with the rest of the result instead.
+/// It has to be small for a bounded client channel to mean anything: a chain that stops draining
+/// because the client is slow would otherwise just fill this queue with the rest of the result.
+///
+/// Sizing, and it is NOT one chunk per batch downstream: `SinkConnection::recv_into` exhausts this
+/// queue before returning, so one chain run coalesces everything queued here into a SINGLE batch
+/// for the client channel. A client-channel slot therefore holds up to this many chunks, and the
+/// ceiling for a streaming connection is about `(response_buffer_batches * this + this) *
+/// stream_threshold_bytes` — not the sum of the two bounds.
 pub(crate) const STREAMING_RESPONSE_BUFFER_BATCHES: usize = 8;
 
 /// Waits for more of a backend's response, under the idle timeout the sink configured.
