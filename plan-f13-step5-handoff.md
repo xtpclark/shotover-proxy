@@ -43,6 +43,30 @@ wiring nobody wanted to guess at. The argument is that the default 10,000-batch 
 previous effective behaviour and the diff touches nothing on its path beyond the channel type. That
 held for the three above when measured, but it is still not a measurement.
 
+## Verification gap, mostly closed
+
+**`cargo clippy --workspace --all-features --all-targets` has still been run by nobody.** It was reported
+clean during the 4b re-verify and then retracted: that run exited 101 in `openssl-src`'s build script
+(vendored OpenSSL runs `perl ./Configure`, which needs `Time::Piece`; the host lacks
+`perl-Time-Piece`), and the failure was missed because the output was piped through `tail` and the
+exit status never checked. On this machine the same command fails differently — `rdkafka-sys` needs
+`cmake`, which the dev container does not have.
+
+`rdkafka` is only a `test-helpers` dependency behind the optional `kafka-cpp-driver-tests` feature,
+so `--all-features` is what drags it in; it is in no shipping path. Working around it closes most of
+the gap. Coverage actually established, each with `-- -D warnings` and the exit status checked:
+
+- `cargo clippy -p shotover --all-features --all-targets` — clean on both machines. Covers all of
+  `shotover`, `alpha-transforms` included.
+- `cargo clippy --workspace --all-targets` (default features = all five protocols) — clean here.
+- `cargo clippy --workspace --all-targets --features shotover-proxy/alpha-transforms,shotover-proxy/jemalloc`
+  — clean here: `shotover`, `test-helpers` and `shotover-proxy` all re-checked, zero diagnostics.
+
+What remains unlinted is only the `kafka-cpp-driver-tests` and `cassandra-cpp-driver-tests` cfgs in
+`test-helpers`, which need `cmake` in the dev container (or `perl-Time-Piece` on the review host for
+the `--all-features` route). Both are system package changes on the user's machines and theirs to
+authorise. Nothing in a shipping path is uncovered.
+
 ## Still parked from 4a
 
 Moving the sink's idle timeout into `reader_task`'s watchdog, and deleting `outstanding` in favour of
