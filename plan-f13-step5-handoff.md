@@ -62,10 +62,16 @@ the gap. Coverage actually established, each with `-- -D warnings` and the exit 
 - `cargo clippy --workspace --all-targets --features shotover-proxy/alpha-transforms,shotover-proxy/jemalloc`
   — clean here: `shotover`, `test-helpers` and `shotover-proxy` all re-checked, zero diagnostics.
 
+Both `--workspace` runs are independently confirmed on the review host too, with exit statuses
+captured rather than piped. That host needed `OPENSSL_NO_VENDOR=1`: the build failure there was
+`openssl-sys` (pulled in by `test-helpers`) choosing its VENDORED build, whose `Configure` needs
+perl's `Time::Piece`. With `openssl-devel` present, that variable makes it link the system library
+instead — **a zero-install way to lint the workspace on any host with openssl-devel**, and the thing
+whose absence the earlier misread was hiding.
+
 What remains unlinted is only the `kafka-cpp-driver-tests` and `cassandra-cpp-driver-tests` cfgs in
-`test-helpers`, which need `cmake` in the dev container (or `perl-Time-Piece` on the review host for
-the `--all-features` route). Both are system package changes on the user's machines and theirs to
-authorise. Nothing in a shipping path is uncovered.
+`test-helpers`, reachable only via `--all-features`, which additionally needs `cmake` for
+`rdkafka-sys`. The dev container here does not have it. Nothing in a shipping path is uncovered.
 
 ## Still parked from 4a
 
