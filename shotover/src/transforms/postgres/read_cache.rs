@@ -963,8 +963,11 @@ impl PostgresReadCache {
         relations: Vec<Relation>,
         issued_at: Instant,
     ) {
-        // Never cache an unmeasurable result, or one larger than the whole budget.
-        if size == 0 || size > self.max_bytes {
+        // Never cache an unmeasurable result — the store's own invariant, not something to leave to
+        // callers. The over-budget case is not tested here: the sole caller gates the clone on
+        // `size <= max_bytes` above, and the `total_bytes + size > max_bytes` bound below already
+        // subsumes a per-entry `size > max_bytes` (total_bytes is never negative).
+        if size == 0 {
             return;
         }
         if let Ok(mut store) = self.cache.lock() {
