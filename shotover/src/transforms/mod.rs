@@ -143,9 +143,20 @@ pub trait TransformConfig: Debug {
     ///
     /// `false` is the deliberate default: a transform that has not been reviewed against chunked
     /// responses refuses to run in a streaming chain rather than silently receive a shape it was
-    /// never written for. Answer `true` only if the transform either ignores response bodies, or
-    /// explicitly skips partials before doing anything that assumes a whole train — which includes
-    /// PARSING one, since parsing a chunk is exactly the cost streaming exists to avoid.
+    /// never written for. Answer `true` only if the transform either ignores response bodies, skips
+    /// partials before doing anything that assumes a whole train, or is written to process a chunk
+    /// AS a chunk — carrying whatever cross-chunk state that needs, and never treating one as a
+    /// whole result.
+    ///
+    /// The first two are free. The third is not: parsing and re-encoding every chunk is the cost
+    /// streaming exists to avoid. The parsed frame pins the bytes it was decoded from — every
+    /// untouched column is a slice of the original chunk — and a modified message re-encodes into a
+    /// third copy. The multiplier is **at least threefold and is set by ROW WIDTH**, not by anything
+    /// the operator configures: the parsed row structures cost roughly 56 bytes per message plus 32
+    /// per column, so narrow rows can exceed 5x their wire bytes on their own. `SELECT id, ssn FROM
+    /// t` lands near 7x in total; wide rows approach 2x. `PostgresRedactColumn` is the one transform
+    /// that takes this trade, because redaction is worthless if it cannot see the rows. Size a chain
+    /// containing it accordingly (see `response_buffer_batches` in the source docs).
     fn accepts_partial_responses(&self) -> bool {
         false
     }

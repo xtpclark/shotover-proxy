@@ -1004,6 +1004,21 @@ mod partial_response_validation_tests {
     stream_threshold_bytes: 1048576
 "#;
 
+    const TEE_THEN_STREAMING_SINK: &str = r#"
+- Tee:
+    name: "tee"
+    chain:
+      - PostgresSinkSingle:
+          name: "teed-sink"
+          remote_address: "127.0.0.1:5432"
+          connect_timeout_ms: 3000
+- PostgresSinkSingle:
+    name: "sink"
+    remote_address: "127.0.0.1:5432"
+    connect_timeout_ms: 3000
+    stream_threshold_bytes: 1048576
+"#;
+
     /// Redaction and a chunking sink together, which step 5 unblocked. This chain was refused until
     /// the redactor could carry a row shape across chunk boundaries and resolve an id-less first
     /// chunk through the decoder's `train_request_id` stamp.
@@ -1018,21 +1033,7 @@ mod partial_response_validation_tests {
     /// against its sub-chain's, and chunk boundaries depend on when each backend flushed.
     #[test]
     fn refuses_a_streaming_chain_containing_a_whole_train_transform() {
-        let yaml = r#"
-- Tee:
-    name: "tee"
-    chain:
-      - PostgresSinkSingle:
-          name: "teed-sink"
-          remote_address: "127.0.0.1:5432"
-          connect_timeout_ms: 3000
-- PostgresSinkSingle:
-    name: "sink"
-    remote_address: "127.0.0.1:5432"
-    connect_timeout_ms: 3000
-    stream_threshold_bytes: 1048576
-"#;
-        let errors = errors(yaml);
+        let errors = errors(TEE_THEN_STREAMING_SINK);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("Tee"), "{}", errors[0]);
         assert!(errors[0].contains(r#""tee""#), "{}", errors[0]);

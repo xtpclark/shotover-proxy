@@ -1192,7 +1192,7 @@ mod tests {
                 // The codec stamps the message that completes a chunked train as a tail, which is
                 // how everything above it knows the result is not whole.
                 let state = if self.chunked {
-                    PostgresCodecState::chunked_response_tail()
+                    PostgresCodecState::chunked_response_tail(request.id())
                 } else {
                     PostgresCodecState::response()
                 };

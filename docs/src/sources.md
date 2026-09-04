@@ -88,6 +88,16 @@ Postgres:
   # allocator slack and budget roughly double: measured peak RSS with 4 and a 1 MiB threshold is
   # 95 MB for a 442 MB result, against 458 MB unbounded.
   #
+  # That figure is for a chain that forwards chunks without reading them. A transform that inspects
+  # every chunk — PostgresRedactColumn is the only one — parses and re-encodes it, which holds the
+  # decoded frame and the re-encoded output alongside the original bytes.
+  #
+  # Multiply the above by at least three for such a chain, and note the multiplier grows as rows get
+  # NARROWER, because the parsed structures cost roughly 56 bytes per message plus 32 per column
+  # regardless of how few bytes the row carried on the wire. A two-column result of short values is
+  # nearer seven times; wide rows approach two. Measure your own workload before sizing to the
+  # bottom of that range.
+  #
   # Cost: a client that stops reading entirely stalls its own requests, exactly as it would talking
   # to postgres directly. Such a connection parks the chain outside the loop that re-arms the idle
   # timeout, so `timeout` is what reclaims it — setting this without `timeout` is refused at startup.
