@@ -1183,7 +1183,7 @@ mod tests {
                 let final_messages = if self.chunked {
                     responses.push(encode_as(
                         head.clone(),
-                        PostgresCodecState::partial_response(),
+                        PostgresCodecState::partial_response(request.id()),
                     ));
                     tail.clone()
                 } else {

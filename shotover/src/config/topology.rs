@@ -1004,14 +1004,38 @@ mod partial_response_validation_tests {
     stream_threshold_bytes: 1048576
 "#;
 
-    /// A chunking sink plus a transform that needs whole trains is refused, and the error names the
-    /// transform and says how to fix it.
+    /// Redaction and a chunking sink together, which step 5 unblocked. This chain was refused until
+    /// the redactor could carry a row shape across chunk boundaries and resolve an id-less first
+    /// chunk through the decoder's `train_request_id` stamp.
     #[test]
-    fn refuses_streaming_chain_containing_redaction() {
-        let errors = errors(REDACT_THEN_STREAMING_SINK);
+    fn accepts_a_streaming_chain_containing_redaction() {
+        assert!(streams(REDACT_THEN_STREAMING_SINK));
+        assert!(errors(REDACT_THEN_STREAMING_SINK).is_empty());
+    }
+
+    /// A chunking sink plus a transform that DOES need whole trains is still refused, and the error
+    /// names the transform and says how to fix it. Tee is that transform: it compares a response
+    /// against its sub-chain's, and chunk boundaries depend on when each backend flushed.
+    #[test]
+    fn refuses_a_streaming_chain_containing_a_whole_train_transform() {
+        let yaml = r#"
+- Tee:
+    name: "tee"
+    chain:
+      - PostgresSinkSingle:
+          name: "teed-sink"
+          remote_address: "127.0.0.1:5432"
+          connect_timeout_ms: 3000
+- PostgresSinkSingle:
+    name: "sink"
+    remote_address: "127.0.0.1:5432"
+    connect_timeout_ms: 3000
+    stream_threshold_bytes: 1048576
+"#;
+        let errors = errors(yaml);
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("PostgresRedactColumn"), "{}", errors[0]);
-        assert!(errors[0].contains(r#""redact""#), "{}", errors[0]);
+        assert!(errors[0].contains("Tee"), "{}", errors[0]);
+        assert!(errors[0].contains(r#""tee""#), "{}", errors[0]);
         assert!(
             errors[0].contains("stream_threshold_bytes: 0"),
             "{}",
