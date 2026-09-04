@@ -191,6 +191,20 @@ pub struct PostgresCodecState {
     /// backend connection are merged into a single batch by the cluster sink, so a transform cannot
     /// tell which train an earlier partial belonged to. This flag rides on the message it describes.
     pub chunked_tail: bool,
+    /// Sink responses only: the id of the REQUEST whose train this partial chunk belongs to. `None`
+    /// on everything else, including the tail — which carries the real [`Message::request_id`].
+    ///
+    /// This is deliberately NOT the request id. A partial must never look like an answer to the four
+    /// sites that count answered requests (`count_answered`, `PendingRequests::Ordered`,
+    /// `DummyResponseInserter`, the `RequestPending` gauge), all of which filter on
+    /// `request_id().is_some()`; that invariant is untouched and stays literally true.
+    ///
+    /// It exists so a transform can tell WHICH train a chunk belongs to without re-deriving it from
+    /// what it saw earlier — the mistake `chunked_tail` above warns about. The decoder is the only
+    /// layer that knows, because it holds the queue of requests awaiting responses; anything above it
+    /// would be guessing from ordering it does not own. Read it with
+    /// [`partial_train_request_id`].
+    pub train_request_id: Option<MessageId>,
 }
 
 impl PostgresCodecState {
@@ -201,6 +215,7 @@ impl PostgresCodecState {
             startup,
             partial: false,
             chunked_tail: false,
+            train_request_id: None,
         }
     }
 
@@ -211,18 +226,21 @@ impl PostgresCodecState {
             startup: false,
             partial: false,
             chunked_tail: false,
+            train_request_id: None,
         }
     }
 
-    /// One chunk of a response train that is still being received. The only state that sets
-    /// `partial`, so every other construction is a whole message by construction rather than by
-    /// remembering to write `partial: false`.
-    pub fn partial_response() -> Self {
+    /// One chunk of a response train that is still being received, belonging to the train of
+    /// `train_request_id`. The only state that sets `partial`, so every other construction is a whole
+    /// message by construction rather than by remembering to write `partial: false` — and the only
+    /// one that can set `train_request_id`, so the two cannot drift apart.
+    pub fn partial_response(train_request_id: MessageId) -> Self {
         Self {
             is_request: false,
             startup: false,
             partial: true,
             chunked_tail: false,
+            train_request_id: Some(train_request_id),
         }
     }
 
@@ -233,6 +251,7 @@ impl PostgresCodecState {
             startup: false,
             partial: false,
             chunked_tail: true,
+            train_request_id: None,
         }
     }
 }
@@ -532,8 +551,8 @@ impl PostgresDecoder {
                 pretty_hex::pretty_hex(&bytes)
             );
 
-            let (head_kind, head_streamable) = match self.pending.front() {
-                Some(info) => (info.kind, info.streamable),
+            let (head_kind, head_streamable, head_id) = match self.pending.front() {
+                Some(info) => (info.kind, info.streamable, info.id),
                 None => {
                     // No request is awaiting a response: async server traffic
                     // (notices, notifications, parameter changes, or a dying gasp error).
@@ -566,7 +585,7 @@ impl PostgresDecoder {
                 && head_streamable
                 && !self.discarding_until_sync
             {
-                messages.push(self.emit_partial_chunk());
+                messages.push(self.emit_partial_chunk(head_id));
             }
 
             // Deliberately not `train.is_empty()`: emitting a partial chunk empties `train`
@@ -657,7 +676,7 @@ impl PostgresDecoder {
     ///
     /// `train_started_at` is deliberately not taken: the latency sample covers the whole train and
     /// is recorded once, by the final chunk.
-    fn emit_partial_chunk(&mut self) -> Message {
+    fn emit_partial_chunk(&mut self, train_request_id: MessageId) -> Message {
         self.train_chunked = true;
         // `mem::replace` rather than `BytesMut::split`: split would leave `train` holding only the
         // SPARE capacity of the buffer it just handed to the chunk, and because the chunk keeps
@@ -680,7 +699,7 @@ impl PostgresDecoder {
         );
         Message::from_bytes(
             chunk,
-            CodecState::Postgres(PostgresCodecState::partial_response()),
+            CodecState::Postgres(PostgresCodecState::partial_response(train_request_id)),
         )
     }
 
@@ -710,6 +729,16 @@ pub fn is_partial_response(message: &Message) -> bool {
 /// only the tail of its result. See [`PostgresCodecState::chunked_tail`].
 pub fn is_chunked_train_tail(message: &Message) -> bool {
     matches!(message.codec_state, CodecState::Postgres(state) if state.chunked_tail)
+}
+
+/// The id of the request whose train this PARTIAL chunk belongs to, or `None` for anything that is
+/// not a partial chunk. See [`PostgresCodecState::train_request_id`] for why this is not the request
+/// id.
+pub fn partial_train_request_id(message: &Message) -> Option<MessageId> {
+    match message.codec_state {
+        CodecState::Postgres(state) => state.train_request_id,
+        _ => None,
+    }
 }
 
 /// Whether `bytes` holds a whole number of backend messages, i.e. walking their length headers
@@ -1006,9 +1035,21 @@ mod postgres_tests {
                 "a partial chunk must never carry a request id"
             );
             assert!(is_partial(partial));
+            // Not the request id (see above), but the chunk still names the train it belongs to, so
+            // a transform never has to guess which request it is answering.
+            assert_eq!(
+                partial_train_request_id(partial),
+                Some(query_id),
+                "a partial chunk must name the train it belongs to"
+            );
         }
         assert_eq!(final_chunk.request_id(), Some(query_id));
         assert!(!is_partial(final_chunk));
+        assert_eq!(
+            partial_train_request_id(final_chunk),
+            None,
+            "only a partial names its train; the tail carries the real request id"
+        );
         // Everything above the codec learns "this result is not whole" from this stamp, so it must
         // be set by the decoder itself — a transform cannot re-derive it, because the cluster sink
         // merges responses from two backend connections into one batch.
