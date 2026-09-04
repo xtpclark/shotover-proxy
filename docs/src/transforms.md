@@ -596,11 +596,31 @@ with an error. Two cases fail closed:
   that already executed on the server, but dropping the connection makes the
   server roll the transaction back, so nothing the transaction did is committed.
   Outside a transaction the error alone is coherent and the connection stays
-  open.
+  open — unless the result was being streamed, for which see below.
 - `COPY ... TO STDOUT` carries rows outside `DataRow` messages and cannot be
   redacted here, so **any** COPY-based read through a chain containing this
   transform fails closed regardless of which columns the table has. `pg_dump`
   and other COPY consumers will not work through such a chain.
+
+#### With a streaming sink
+
+This transform works with `stream_threshold_bytes` set on the sink, so a large
+redacted result does not have to be buffered whole. Two things differ from the
+non-streaming case, and both matter operationally:
+
+- **A fail-close always closes the connection**, in or out of a transaction.
+  Earlier chunks of the result have already reached the client and the rest is
+  still arriving from the server, so there is no coherent way to continue; the
+  client receives the error and then the connection closes.
+- **The guarantee is narrower.** No row is ever forwarded unredacted or under an
+  unknown shape — each chunk is inspected completely before it is forwarded, and
+  a chunk that cannot be redacted is replaced before any of its rows go out. But
+  a failure discovered part-way through a large result cannot recall the rows
+  already sent. Buffering the whole result is the only way to avoid that, and it
+  is what `stream_threshold_bytes` exists to stop doing.
+
+Streaming does not change what a redaction can *see*: the label-matching
+limitation described above applies identically either way.
 
 ```yaml
 - PostgresRedactColumn:

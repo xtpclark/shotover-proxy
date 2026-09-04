@@ -191,19 +191,24 @@ pub struct PostgresCodecState {
     /// backend connection are merged into a single batch by the cluster sink, so a transform cannot
     /// tell which train an earlier partial belonged to. This flag rides on the message it describes.
     pub chunked_tail: bool,
-    /// Sink responses only: the id of the REQUEST whose train this partial chunk belongs to. `None`
-    /// on everything else, including the tail — which carries the real [`Message::request_id`].
+    /// Sink responses only: the id of the REQUEST whose train this message is part of. Set on every
+    /// chunk of a chunked train — the partials AND the tail — and `None` on a whole response.
     ///
     /// This is deliberately NOT the request id. A partial must never look like an answer to the four
     /// sites that count answered requests (`count_answered`, `PendingRequests::Ordered`,
     /// `DummyResponseInserter`, the `RequestPending` gauge), all of which filter on
-    /// `request_id().is_some()`; that invariant is untouched and stays literally true.
+    /// `request_id().is_some()`; that invariant is untouched and stays literally true. On the tail,
+    /// where a request id IS carried, the two hold the same value — asserted in the chunked-train
+    /// contract the codec tests run every chunking scenario through.
     ///
-    /// It exists so a transform can tell WHICH train a chunk belongs to without re-deriving it from
+    /// It exists so a transform can tell WHICH train a message belongs to without re-deriving it from
     /// what it saw earlier — the mistake `chunked_tail` above warns about. The decoder is the only
     /// layer that knows, because it holds the queue of requests awaiting responses; anything above it
-    /// would be guessing from ordering it does not own. Read it with
-    /// [`partial_train_request_id`].
+    /// would be guessing from ordering it does not own. Read it with [`chunked_train_id`].
+    ///
+    /// Costs 32 bytes (`Option<u128>` has no niche and aligns to 16), which widens every `Message` in
+    /// every protocol by roughly a third. Against F13's ceiling of ~80 chunks in flight that is under
+    /// 4 KB, and each of those messages points at a payload orders of magnitude larger.
     pub train_request_id: Option<MessageId>,
 }
 
@@ -245,13 +250,13 @@ impl PostgresCodecState {
     }
 
     /// The message that completes a train already partly delivered as chunks.
-    pub fn chunked_response_tail() -> Self {
+    pub fn chunked_response_tail(train_request_id: MessageId) -> Self {
         Self {
             is_request: false,
             startup: false,
             partial: false,
             chunked_tail: true,
-            train_request_id: None,
+            train_request_id: Some(train_request_id),
         }
     }
 }
@@ -619,7 +624,7 @@ impl PostgresDecoder {
                     // everything upstream that needs a whole train reads this off the message
                     // instead of trying to remember what went past earlier.
                     let state = if std::mem::take(&mut self.train_chunked) {
-                        PostgresCodecState::chunked_response_tail()
+                        PostgresCodecState::chunked_response_tail(info.id)
                     } else {
                         PostgresCodecState::response()
                     };
@@ -731,10 +736,13 @@ pub fn is_chunked_train_tail(message: &Message) -> bool {
     matches!(message.codec_state, CodecState::Postgres(state) if state.chunked_tail)
 }
 
-/// The id of the request whose train this PARTIAL chunk belongs to, or `None` for anything that is
-/// not a partial chunk. See [`PostgresCodecState::train_request_id`] for why this is not the request
-/// id.
-pub fn partial_train_request_id(message: &Message) -> Option<MessageId> {
+/// The id of the request whose train `message` is part of, or `None` if it is not part of a chunked
+/// train at all.
+///
+/// Total over chunked messages — partials and the tail alike — so a reader never has to know which
+/// kind it is holding, nor re-unite two accessors to ask one question. See
+/// [`PostgresCodecState::train_request_id`] for why this is not the request id.
+pub fn chunked_train_id(message: &Message) -> Option<MessageId> {
     match message.codec_state {
         CodecState::Postgres(state) => state.train_request_id,
         _ => None,
@@ -1038,17 +1046,19 @@ mod postgres_tests {
             // Not the request id (see above), but the chunk still names the train it belongs to, so
             // a transform never has to guess which request it is answering.
             assert_eq!(
-                partial_train_request_id(partial),
+                chunked_train_id(partial),
                 Some(query_id),
                 "a partial chunk must name the train it belongs to"
             );
         }
         assert_eq!(final_chunk.request_id(), Some(query_id));
         assert!(!is_partial(final_chunk));
+        // The tail names its train as well, and the two must agree: everything that redacts across a
+        // chunked train leans on the stamp and the request id being the same value.
         assert_eq!(
-            partial_train_request_id(final_chunk),
-            None,
-            "only a partial names its train; the tail carries the real request id"
+            chunked_train_id(final_chunk),
+            Some(query_id),
+            "the tail must name the same train its request id names"
         );
         // Everything above the codec learns "this result is not whole" from this stamp, so it must
         // be set by the decoder itself — a transform cannot re-derive it, because the cluster sink

@@ -1,6 +1,4 @@
-use crate::codec::postgres::{
-    is_chunked_train_tail, is_partial_response, partial_train_request_id,
-};
+use crate::codec::postgres::{chunked_train_id, is_partial_response};
 use crate::frame::postgres::{BackendMessage, FrontendMessage, PostgresFrame};
 use crate::frame::{Frame, MessageType};
 use crate::message::{Message, MessageId, Messages};
@@ -133,10 +131,9 @@ impl TransformConfig for PostgresRedactColumnConfig {
         vec![]
     }
 
-    /// `true`: see the "Streaming" section of the module doc. The shape is carried across chunk
-    /// boundaries, and the first chunk of an extended-protocol train — which carries neither a
-    /// RowDescription nor a request id — is matched to its statement through the decoder's
-    /// `train_request_id` stamp. Anything that cannot be resolved still fails closed.
+    /// `true`, and this is the one transform that reads partial chunks rather than skipping them —
+    /// see the "Streaming" section of the module doc for how, and for what the guarantee costs.
+    /// Anything whose shape cannot be resolved still fails closed.
     fn accepts_partial_responses(&self) -> bool {
         true
     }
@@ -152,13 +149,12 @@ impl TransformBuilder for PostgresRedactColumnBuilder {
     fn build(&self, _transform_context: TransformContextBuilder) -> Box<dyn Transform> {
         Box::new(PostgresRedactColumn {
             column: self.column.clone(),
-            replacement: self.replacement.clone(),
+            replacement: Bytes::copy_from_slice(self.replacement.as_bytes()),
             statement_shapes: HashMap::new(),
             portal_statements: HashMap::new(),
             pending: HashMap::new(),
             in_transaction: false,
             train_shape: None,
-            poisoned: false,
         })
     }
 
@@ -199,7 +195,9 @@ enum Awaiting {
 
 pub struct PostgresRedactColumn {
     column: String,
-    replacement: String,
+    /// Built once, cloned per redacted cell: `Bytes::clone` is a refcount bump, where rebuilding it
+    /// from the configured `String` was a malloc for every cell of every row of every result.
+    replacement: Bytes,
     /// Remembered result shape per prepared statement name, learned from a Describe/RowDescription.
     statement_shapes: HashMap<String, Shape>,
     /// Portal name -> prepared statement name, from Bind, so an Execute can find its shape.
@@ -210,21 +208,21 @@ pub struct PostgresRedactColumn {
     /// the server emits (any status other than 'I' means in a transaction). A fail-close inside a
     /// transaction closes the connection so the server rolls back — see the transform loop.
     in_transaction: bool,
-    /// The row shape in force for a response train currently arriving in CHUNKS.
+    /// The row shape in force for a response train currently arriving in CHUNKS, together with the
+    /// id of the request whose train it belongs to.
     ///
     /// Only the first chunk of a train can carry a RowDescription, so the shape has to survive from
     /// one chunk to the next. This is exactly the `shape` local that `redact_response` already walks
     /// a response with, lifted out so a chunked train resumes where the previous chunk stopped: seeded
     /// from here for a partial or a tail, written back after a partial, cleared by the tail.
     ///
-    /// `None` means either "no chunked train open" or "open, shape not yet known" — the two are only
-    /// ever consulted through a message that says which it is.
-    train_shape: Option<Shape>,
-    /// Set when a chunked train has failed closed. The connection is being torn down at that point
-    /// (see the transform loop), so nothing should reach the chain again — but if anything ever did,
-    /// the remaining chunks of that train would resolve their shape from the decoder stamp and be
-    /// forwarded, which is the leak the fail-close just prevented. Poisoning drops them instead.
-    poisoned: bool,
+    /// It is KEYED, and that is the point. An unkeyed slot would be "the shape of whatever chunk went
+    /// past last", which is the reconstruction `PostgresCodecState::chunked_tail` tells transforms not
+    /// to attempt. Only one train streams at a time today, but that is a rule enforced in
+    /// `sink_cluster`, and a slot keyed by train does not depend on it: were two ever interleaved they
+    /// would thrash and fail closed rather than redact each other's rows. The keying buys fail-safe,
+    /// not concurrency.
+    train_shape: Option<(MessageId, Shape)>,
 }
 
 #[async_trait]
@@ -244,6 +242,13 @@ impl Transform for PostgresRedactColumn {
         }
 
         let mut responses = chain_state.call_next_transform().await?;
+        // One decode can yield several chunks of the same train, so a chunk that fails closed may be
+        // followed by more of its own train in THIS batch. Those must not be forwarded: they would
+        // resolve their shape from the decoder stamp and deliver exactly the rows the fail-close
+        // withheld. Beyond this batch there is nothing to guard — `close_client_connection` returns
+        // from `run_loop` as soon as these responses are sent, with no flush and no further chain
+        // call — so this is a local, not connection state.
+        let mut poisoned = false;
         for response in &mut responses {
             // Remove the pending entry for this response whatever its kind, so entries for requests
             // answered by a synthesised Dummy (e.g. requests discarded after an extended-protocol
@@ -255,27 +260,15 @@ impl Transform for PostgresRedactColumn {
             if response.message_type() != MessageType::Postgres {
                 continue;
             }
-            // Should be unreachable: a chunked train that failed closed set this AND asked for the
-            // connection to be closed, and `run_loop` returns as soon as it has sent that run's
-            // responses. But if anything ever did run the chain again, the remaining chunks of that
-            // train would resolve their shape from the decoder stamp and be forwarded — exactly the
-            // rows the fail-close just withheld. So refuse to redact anything more on this
-            // connection rather than rely on a teardown owned by another file.
-            if self.poisoned {
-                *response = self.fail_closed_response(
-                    response,
-                    "connection is closing after a redaction failure",
-                );
-                chain_state.close_client_connection = true;
-                continue;
-            }
             // Whether this response is part of a train delivered in chunks, which changes what a
             // fail-close can achieve — read before `redact_response` borrows the frame.
-            let chunked = is_partial_response(response) || is_chunked_train_tail(response);
-            if let Err(reason) = self.redact_response(response, awaiting) {
-                // Fail closed: never let an unredactable result reach the client. Replace it with
-                // an error carrying the same request id so the client sees a failure, not data.
-                *response = self.fail_closed_response(response, &reason);
+            let chunked = chunked_train_id(response).is_some();
+            let outcome = if poisoned {
+                Err("connection is closing after a redaction failure".to_owned())
+            } else {
+                self.redact_response(response, awaiting)
+            };
+            if let Err(reason) = outcome {
                 // Inside a transaction, make the abort REAL: the statement already executed on the
                 // server and a response-side transform cannot roll it back, so close the client
                 // connection. The chain sends this error to the client FIRST, then closes (see
@@ -288,12 +281,16 @@ impl Transform for PostgresRedactColumn {
                 // replacement error is unpaired (a partial carries no request id to copy), and the
                 // rest of the train is still arriving from the backend — forwarding it would leak
                 // precisely what this fail-close withheld. There is no coherent way to continue.
-                if self.in_transaction || chunked {
-                    chain_state.close_client_connection = true;
-                }
+                let closing = self.in_transaction || chunked || poisoned;
+                // Fail closed: never let an unredactable result reach the client. Replace it with an
+                // error carrying the same request id so the client sees a failure, not data. It is
+                // told whether the connection is closing rather than working it out again, so the
+                // error can never say "ready for the next query" into a socket about to shut.
+                *response = self.fail_closed_response(response, &reason, closing);
+                chain_state.close_client_connection |= closing;
                 if chunked {
                     self.train_shape = None;
-                    self.poisoned = true;
+                    poisoned = true;
                 }
             }
             // Track transaction state from this response's ReadyForQuery and reclaim portal state at
@@ -319,7 +316,13 @@ impl PostgresRedactColumn {
     /// client. Inside a transaction NO ReadyForQuery is appended in either case: the caller closes the
     /// connection (see the transform loop), so the client should receive the error and then the close —
     /// a ReadyForQuery would falsely say "ready for the next query" as we are about to disconnect.
-    fn fail_closed_response(&self, original: &mut Message, reason: &str) -> Message {
+    ///
+    /// `closing` is what actually decides it, and the caller passes it because the caller is what
+    /// decides it. A ReadyForQuery is appended only when the connection SURVIVES the fail-close —
+    /// otherwise it would tell the client to send its next statement into a socket about to shut.
+    /// That used to read `!self.in_transaction`, which was the same thing until chunked trains
+    /// started closing whether or not a transaction was open.
+    fn fail_closed_response(&self, original: &mut Message, reason: &str, closing: bool) -> Message {
         let had_ready_for_query = matches!(
             original.frame(),
             Some(Frame::Postgres(PostgresFrame::Response(messages)))
@@ -333,7 +336,7 @@ impl PostgresRedactColumn {
                 (b'M', format!("PostgresRedactColumn: {reason}")),
             ],
         }];
-        if had_ready_for_query && !self.in_transaction {
+        if had_ready_for_query && !closing {
             messages.push(BackendMessage::ReadyForQuery { status: b'I' });
         }
         let mut response = Message::from_frame(Frame::Postgres(PostgresFrame::Response(messages)));
@@ -360,6 +363,12 @@ impl PostgresRedactColumn {
     /// end ('I') the non-holdable portals Postgres itself drops are reclaimed, bounding per-connection
     /// state (a WITH HOLD cursor then fails closed on its next fetch — safe).
     fn observe_transaction_state(&mut self, response: &mut Message) {
+        // A ReadyForQuery ends a train, so a partial is by definition mid-train and cannot hold one.
+        // Skipping is not just tidiness: this walk is O(rows), and a 1 MiB chunk of narrow rows is
+        // tens of thousands of them.
+        if is_partial_response(response) {
+            return;
+        }
         let Some(Frame::Postgres(PostgresFrame::Response(messages))) = response.frame() else {
             return;
         };
@@ -435,31 +444,35 @@ impl PostgresRedactColumn {
         response: &mut Message,
         awaiting: Option<Awaiting>,
     ) -> Result<(), String> {
-        let statement = match &awaiting {
+        let partial = is_partial_response(response);
+        // Which train this message is part of, if any; the decoder stamps every chunk of one.
+        let train = chunked_train_id(response);
+
+        // The request this response answers. A whole response and a tail name it directly, through
+        // the id `awaiting` was looked up by. A partial carries no request id — that is the whole
+        // point — so it names its request through the stamp instead, and its entry is still in
+        // `pending` precisely because removal is keyed on the request id it does not have.
+        //
+        // Resolving the first chunk of an extended-protocol train is what this exists for: that chunk
+        // carries no RowDescription either, because the RowDescription arrived earlier on the
+        // Describe's own train, and a cached prepared statement re-executes without a Describe at all.
+        let pending = match awaiting {
+            Some(ref awaiting) => Some(awaiting),
+            None => train.and_then(|id| self.pending.get(&id)),
+        };
+        let statement = match pending {
             Some(Awaiting::Describe(s)) | Some(Awaiting::Execute(s)) => s.clone(),
             _ => None,
         };
-        let partial = is_partial_response(response);
-        let chunked = partial || is_chunked_train_tail(response);
-        // An Execute starts from its statement's remembered shape; everything else starts unknown
-        // and relies on a RowDescription within the response itself.
-        let from_awaiting: Option<Shape> = match &awaiting {
-            Some(Awaiting::Execute(Some(s))) => self.statement_shapes.get(s).copied(),
-            _ => None,
-        };
-        // A chunk resumes the train the previous chunk left off in. Three sources, in order of
-        // authority: the shape carried from an earlier chunk; the statement the decoder stamped this
-        // chunk with, which is how the FIRST chunk of an extended-protocol train finds its shape
-        // (that chunk carries neither a RowDescription nor a request id); and finally the request
-        // this response answers, which only a tail has. A whole response uses the last of these
-        // alone, exactly as before.
-        let mut shape: Option<Shape> = if chunked {
-            self.train_shape
-                .or_else(|| self.stamped_train_shape(response))
-                .or(from_awaiting)
-        } else {
-            from_awaiting
-        };
+        // An Execute starts from its statement's remembered shape; everything else starts unknown and
+        // relies on a RowDescription within the response itself — or, mid-train, on the shape the
+        // previous chunk ended with, since only the first chunk can carry a RowDescription.
+        let mut shape: Option<Shape> = self
+            .carried_shape(train)
+            .or_else(|| match pending {
+                Some(Awaiting::Execute(Some(s))) => self.statement_shapes.get(s).copied(),
+                _ => None,
+            });
 
         let mut modified = false;
         let mut fail: Option<String> = None;
@@ -491,7 +504,7 @@ impl PostgresRedactColumn {
                             if let Some(value) = values.get_mut(index)
                                 && value.is_some()
                             {
-                                *value = Some(Bytes::copy_from_slice(self.replacement.as_bytes()));
+                                *value = Some(self.replacement.clone());
                                 modified = true;
                             }
                         }
@@ -528,10 +541,11 @@ impl PostgresRedactColumn {
         }
         if partial {
             // More of this train is coming and only the first chunk could have carried a
-            // RowDescription, so the shape this chunk ended on is what the next one starts from.
-            self.train_shape = shape;
-        } else if chunked {
-            // The tail ends the train.
+            // RowDescription, so the shape this chunk ended on is what the next one starts from —
+            // stored against this train's id so no other train can pick it up.
+            self.train_shape = train.zip(shape);
+        } else {
+            // A tail ends its train; a whole response means none is open.
             self.train_shape = None;
         }
         if let Some(reason) = fail {
@@ -543,25 +557,12 @@ impl PostgresRedactColumn {
         Ok(())
     }
 
-    /// The shape of the train this PARTIAL chunk belongs to, found through the request id the
-    /// decoder stamped on it.
-    ///
-    /// This is what lets the first chunk of an extended-protocol Execute redact at all: its
-    /// RowDescription arrived earlier, on the Describe's own train, and the chunk itself carries no
-    /// request id to look up. The decoder knows which request is being answered because it holds the
-    /// queue of requests awaiting responses; nothing above it does, which is why this is a stamp
-    /// rather than something reconstructed here from what went past (see
-    /// `PostgresCodecState::chunked_tail`).
-    ///
-    /// The entry is still in `pending` because entries are removed by `request_id`, which a partial
-    /// does not have — only the tail ends up removing it.
-    fn stamped_train_shape(&self, response: &Message) -> Option<Shape> {
-        match self.pending.get(&partial_train_request_id(response)?) {
-            Some(Awaiting::Execute(Some(statement))) => {
-                self.statement_shapes.get(statement).copied()
-            }
-            // A simple query carries its own RowDescription in its first chunk, and a Describe train
-            // is too small to chunk. Neither needs this, and neither should fabricate a shape.
+    /// The shape carried over from an earlier chunk of `train`, if that is the train it was stored
+    /// for. A mismatch, or no train at all, simply yields `None` and the caller falls through to the
+    /// fail-closed path.
+    fn carried_shape(&self, train: Option<MessageId>) -> Option<Shape> {
+        match self.train_shape {
+            Some((carried, shape)) if Some(carried) == train => Some(shape),
             _ => None,
         }
     }
@@ -578,13 +579,12 @@ mod tests {
     fn redactor() -> PostgresRedactColumn {
         PostgresRedactColumn {
             column: "ssn".to_owned(),
-            replacement: "[REDACTED]".to_owned(),
+            replacement: Bytes::from_static(b"[REDACTED]"),
             statement_shapes: HashMap::new(),
             portal_statements: HashMap::new(),
             pending: HashMap::new(),
             in_transaction: false,
             train_shape: None,
-            poisoned: false,
         }
     }
 
@@ -648,7 +648,7 @@ mod tests {
     /// The message that completes a chunked train: carries the request id, marked as a tail.
     fn chunked_tail(id: MessageId, messages: Vec<BackendMessage>) -> Message {
         let mut m = response_for(id, messages);
-        m.codec_state = CodecState::Postgres(PostgresCodecState::chunked_response_tail());
+        m.codec_state = CodecState::Postgres(PostgresCodecState::chunked_response_tail(id));
         m
     }
 
@@ -1114,6 +1114,159 @@ mod tests {
         assert!(redact(&mut r, &mut first).is_err());
     }
 
+    /// A backend that hands back preprogrammed batches, one per chain run, so the tests below
+    /// exercise the real `transform()` loop rather than `redact_response` alone. The loop is where
+    /// the fail-close decisions live — whether the connection closes, and whether anything is
+    /// forwarded afterwards — and none of them are visible through the `redact` helper.
+    struct CannedBackend {
+        batches: std::collections::VecDeque<Messages>,
+    }
+
+    #[async_trait]
+    impl Transform for CannedBackend {
+        fn get_name(&self) -> &'static str {
+            "CannedBackend"
+        }
+
+        async fn transform<'shorter, 'longer: 'shorter>(
+            &mut self,
+            _chain_state: &'shorter mut ChainState<'longer>,
+        ) -> Result<Messages> {
+            Ok(self.batches.pop_front().unwrap_or_default())
+        }
+    }
+
+    fn backend(batches: Vec<Messages>) -> Vec<crate::transforms::TransformAndMetrics> {
+        vec![crate::transforms::TransformAndMetrics::new(
+            Box::new(CannedBackend {
+                batches: batches.into(),
+            }),
+            "backend",
+            "CannedBackend",
+        )]
+    }
+
+    fn row_count(messages: &mut [Message]) -> usize {
+        messages
+            .iter_mut()
+            .filter_map(|m| match m.frame() {
+                Some(Frame::Postgres(PostgresFrame::Response(msgs))) => Some(
+                    msgs.iter()
+                        .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+                        .count(),
+                ),
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// The chunks of a multi-statement simple query where the second result set never presents a
+    /// RowDescription: the first chunk redacts, `CommandComplete` resets the shape, and the tail's
+    /// rows can only fail closed. The tail is the one that carries ReadyForQuery.
+    fn unredactable_chunked_train(query: MessageId) -> Vec<Messages> {
+        vec![vec![
+            partial_chunk(
+                query,
+                vec![
+                    BackendMessage::RowDescription {
+                        fields: vec![field("id"), field("ssn")],
+                    },
+                    row("1", "111-22-3333"),
+                    BackendMessage::CommandComplete {
+                        tag: "SELECT 1".to_owned(),
+                    },
+                ],
+            ),
+            chunked_tail(
+                query,
+                vec![
+                    row("2", "222-33-4444"),
+                    BackendMessage::CommandComplete {
+                        tag: "SELECT 1".to_owned(),
+                    },
+                    BackendMessage::ReadyForQuery { status: b'I' },
+                ],
+            ),
+        ]]
+    }
+
+    fn query_request() -> Message {
+        Message::from_frame(Frame::Postgres(PostgresFrame::Request(
+            FrontendMessage::Query {
+                query: "SELECT id, ssn FROM t; SELECT id, ssn FROM t".to_owned(),
+            },
+        )))
+    }
+
+    /// A chunked train that fails closed closes the connection even with no transaction open — rows
+    /// of it already reached the client and the rest is still coming, so there is nothing coherent to
+    /// continue with. The replacement therefore must NOT carry a ReadyForQuery: that would tell the
+    /// client to send its next statement into a socket about to shut, which is the exact thing
+    /// `fail_closed_response` avoids for the in-transaction case.
+    #[tokio::test]
+    async fn a_chunked_fail_close_closes_without_claiming_ready() {
+        let mut r = redactor();
+        let request = query_request();
+        let id = request.id();
+        let mut chain = backend(unredactable_chunked_train(id));
+        let mut chain_state = ChainState::new_test(vec![request.clone()]);
+        chain_state.reset(&mut chain, "test");
+
+        let mut responses = r.transform(&mut chain_state).await.unwrap();
+
+        assert!(
+            !r.in_transaction,
+            "this test is about the NO transaction case"
+        );
+        assert!(
+            chain_state.close_client_connection,
+            "a chunked train that failed closed must close the connection"
+        );
+        let tail = responses.last_mut().unwrap();
+        assert_eq!(
+            trailing_rfq(tail),
+            None,
+            "the connection is about to close, so the error must not say the session is ready"
+        );
+    }
+
+    /// And nothing more of that train is forwarded. One decode can yield several chunks, so the
+    /// chunk that fails closed and the chunks after it arrive in the SAME batch — that is the case
+    /// this has to cover, and the only one it can: `close_client_connection` ends the connection
+    /// before another chain run, so there is no "next run" to guard.
+    ///
+    /// The trailing chunk here is deliberately redactable on its own — it opens a fresh result set
+    /// with its own RowDescription — so nothing but the poisoning stops its rows going out.
+    #[tokio::test]
+    async fn no_later_chunk_in_the_batch_is_forwarded_after_a_fail_close() {
+        let mut r = redactor();
+        let request = query_request();
+        let id = request.id();
+
+        let mut batches = unredactable_chunked_train(id);
+        batches[0].push(partial_chunk(
+            id,
+            vec![
+                BackendMessage::RowDescription {
+                    fields: vec![field("id"), field("ssn")],
+                },
+                row("3", "333-44-5555"),
+            ],
+        ));
+        let mut chain = backend(batches);
+
+        let mut chain_state = ChainState::new_test(vec![request.clone()]);
+        chain_state.reset(&mut chain, "test");
+        let mut responses = r.transform(&mut chain_state).await.unwrap();
+
+        assert_eq!(
+            row_count(&mut responses[1..]),
+            0,
+            "a chunk after a fail-close must not be forwarded, redactable or not"
+        );
+        assert!(chain_state.close_client_connection);
+    }
+
     #[test]
     fn test_fail_closed_response_matches_ready_for_query_of_original() {
         let r = redactor();
@@ -1125,7 +1278,7 @@ mod tests {
             },
             BackendMessage::ReadyForQuery { status: b'I' },
         ]);
-        let mut replaced = r.fail_closed_response(&mut simple, "x");
+        let mut replaced = r.fail_closed_response(&mut simple, "x", false);
         assert!(matches!(
             replaced.frame(),
             Some(Frame::Postgres(PostgresFrame::Response(m)))
@@ -1139,7 +1292,7 @@ mod tests {
                 tag: "SELECT 1".to_owned(),
             },
         ]);
-        let mut replaced = r.fail_closed_response(&mut extended, "x");
+        let mut replaced = r.fail_closed_response(&mut extended, "x", false);
         assert!(matches!(
             replaced.frame(),
             Some(Frame::Postgres(PostgresFrame::Response(m)))
@@ -1148,13 +1301,13 @@ mod tests {
     }
 
     #[test]
-    fn test_in_transaction_fail_close_omits_ready_for_query() {
+    fn test_fail_close_omits_ready_for_query_when_the_connection_closes() {
         // A fail-close INSIDE a transaction closes the connection (the transform loop sets
         // close_client_connection so the server rolls back). Its replacement must NOT carry a
         // ReadyForQuery — the client receives the error and then the close, not "ready for the next
-        // query". Outside a transaction the connection stays open and a simple-query fail-close keeps
-        // its ReadyForQuery (idle 'I'); an extended Execute train never carries one.
-        let mut r = redactor();
+        // query". When it survives, a simple-query fail-close keeps its ReadyForQuery (idle 'I');
+        // an extended Execute train never carries one either way.
+        let r = redactor();
         let simple = || {
             response(vec![
                 BackendMessage::DataRow { values: vec![] },
@@ -1170,20 +1323,24 @@ mod tests {
             }])
         };
 
-        r.in_transaction = true;
-        assert_eq!(trailing_rfq(&mut r.fail_closed_response(&mut simple(), "x")), None);
+        // Closing: neither shape may claim the session is ready, because it is about to be gone.
         assert_eq!(
-            trailing_rfq(&mut r.fail_closed_response(&mut extended(), "x")),
+            trailing_rfq(&mut r.fail_closed_response(&mut simple(), "x", true)),
+            None
+        );
+        assert_eq!(
+            trailing_rfq(&mut r.fail_closed_response(&mut extended(), "x", true)),
             None
         );
 
-        r.in_transaction = false;
+        // Surviving: the simple-query replacement stands in for a train that carried its own
+        // ReadyForQuery, so it carries one too. The extended one never did.
         assert_eq!(
-            trailing_rfq(&mut r.fail_closed_response(&mut simple(), "x")),
+            trailing_rfq(&mut r.fail_closed_response(&mut simple(), "x", false)),
             Some(b'I')
         );
         assert_eq!(
-            trailing_rfq(&mut r.fail_closed_response(&mut extended(), "x")),
+            trailing_rfq(&mut r.fail_closed_response(&mut extended(), "x", false)),
             None
         );
     }
