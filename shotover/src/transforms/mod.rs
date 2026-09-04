@@ -148,15 +148,18 @@ pub trait TransformConfig: Debug {
     /// AS a chunk — carrying whatever cross-chunk state that needs, and never treating one as a
     /// whole result.
     ///
-    /// The first two are free. The third is not: parsing and re-encoding every chunk is the cost
-    /// streaming exists to avoid. The parsed frame pins the bytes it was decoded from — every
-    /// untouched column is a slice of the original chunk — and a modified message re-encodes into a
-    /// third copy. The multiplier is **at least threefold and is set by ROW WIDTH**, not by anything
-    /// the operator configures: the parsed row structures cost roughly 56 bytes per message plus 32
-    /// per column, so narrow rows can exceed 5x their wire bytes on their own. `SELECT id, ssn FROM
-    /// t` lands near 7x in total; wide rows approach 2x. `PostgresRedactColumn` is the one transform
-    /// that takes this trade, because redaction is worthless if it cannot see the rows. Size a chain
-    /// containing it accordingly (see `response_buffer_batches` in the source docs).
+    /// The first two are free. The third is not: parsing and re-encoding a chunk holds the decoded
+    /// frame and the re-encoded output alongside the bytes they came from, and the parsed spine of
+    /// narrow rows can exceed their wire size several times over (~56 bytes per message plus 32 per
+    /// column, whatever the row carried).
+    ///
+    /// That cost applies only to the chunks in flight, though, and they are freed as they are
+    /// written — so it multiplies the streaming PEAK, not the result. Measured: a redacting chain at
+    /// a 1 MiB threshold peaked at 156 MB on a 10M-row, 313 MB result, against 1949 MB for the same
+    /// chain with streaming off, and roughly double the 74-84 MB a non-redacting streaming chain
+    /// peaks at. Budget about twice a plain streaming chain; do not try to derive it from the wire
+    /// size. `PostgresRedactColumn` is the one transform that takes this trade, because redaction is
+    /// worthless if it cannot see the rows.
     fn accepts_partial_responses(&self) -> bool {
         false
     }

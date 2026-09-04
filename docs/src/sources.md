@@ -90,13 +90,13 @@ Postgres:
   #
   # That figure is for a chain that forwards chunks without reading them. A transform that inspects
   # every chunk — PostgresRedactColumn is the only one — parses and re-encodes it, which holds the
-  # decoded frame and the re-encoded output alongside the original bytes.
+  # decoded frame and the re-encoded output alongside the original bytes. That cost applies only to
+  # the chunks in flight, and they are freed as they are written, so it roughly DOUBLES the peak
+  # rather than scaling with the result.
   #
-  # Multiply the above by at least three for such a chain, and note the multiplier grows as rows get
-  # NARROWER, because the parsed structures cost roughly 56 bytes per message plus 32 per column
-  # regardless of how few bytes the row carried on the wire. A two-column result of short values is
-  # nearer seven times; wide rows approach two. Measure your own workload before sizing to the
-  # bottom of that range.
+  # Measured, release build with jemalloc, 10,000,000 rows of (id, ssn) = 313 MB on the wire:
+  # redaction at a 1 MiB threshold peaked at 156 MB; the same chain with streaming off peaked at
+  # 1949 MB.
   #
   # Cost: a client that stops reading entirely stalls its own requests, exactly as it would talking
   # to postgres directly. Such a connection parks the chain outside the loop that re-arms the idle

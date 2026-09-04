@@ -218,10 +218,14 @@ pub struct PostgresRedactColumn {
     ///
     /// It is KEYED, and that is the point. An unkeyed slot would be "the shape of whatever chunk went
     /// past last", which is the reconstruction `PostgresCodecState::chunked_tail` tells transforms not
-    /// to attempt. Only one train streams at a time today, but that is a rule enforced in
-    /// `sink_cluster`, and a slot keyed by train does not depend on it: were two ever interleaved they
-    /// would thrash and fail closed rather than redact each other's rows. The keying buys fail-safe,
-    /// not concurrency.
+    /// to attempt.
+    ///
+    /// One slot is enough because a connection answers its requests in order, so each train's chunks
+    /// are contiguous — verified by alternating `Execute pA; Execute pB; Execute pA; Execute pB` for
+    /// two statements of DIFFERENT shapes in one batch at a 1-byte threshold: 4000 rows, every one
+    /// redacted under its own statement's shape. The keying is not what makes that work; it is what
+    /// makes the failure safe if it ever stops being true, since a mismatched slot yields no shape and
+    /// falls through to fail-closed rather than redacting one train's rows by another's shape.
     train_shape: Option<(MessageId, Shape)>,
 }
 
