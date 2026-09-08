@@ -994,6 +994,15 @@ mod partial_response_validation_tests {
     name: "sink"
     remote_address: "127.0.0.1:5432"
     connect_timeout_ms: 3000
+    stream_threshold_bytes: 0
+"#;
+
+    /// A sink that says nothing about streaming. Since step 6 that means 1 MiB, not off.
+    const SINK_WITH_DEFAULTS: &str = r#"
+- PostgresSinkSingle:
+    name: "sink"
+    remote_address: "127.0.0.1:5432"
+    connect_timeout_ms: 3000
 "#;
 
     const STREAMING_SINK_ONLY: &str = r#"
@@ -1044,12 +1053,21 @@ mod partial_response_validation_tests {
         );
     }
 
-    /// The same chain with streaming off is accepted. `stream_threshold_bytes` defaults to 0, so no
-    /// topology that starts today can begin failing because of this validation.
+    /// The same chain with streaming explicitly off is accepted and does not stream. This is the
+    /// escape hatch the startup error points a whole-train chain at.
     #[test]
     fn accepts_the_same_chain_with_streaming_off() {
         assert!(!streams(REDACT_THEN_WHOLE_TRAIN_SINK));
         assert!(errors(REDACT_THEN_WHOLE_TRAIN_SINK).is_empty());
+    }
+
+    /// Step 6: a sink that configures nothing streams. Until then `stream_threshold_bytes` defaulted
+    /// to 0 and this validation could not fire on a topology that had not opted in; now it can, which
+    /// is the whole risk of the default flip and is why the changelog carries it.
+    #[test]
+    fn a_sink_that_configures_nothing_streams() {
+        assert!(streams(SINK_WITH_DEFAULTS));
+        assert!(errors(SINK_WITH_DEFAULTS).is_empty());
     }
 
     /// A chunking sink on its own is fine: it both emits partials and accepts them.

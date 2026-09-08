@@ -36,15 +36,32 @@ pub struct PostgresSinkSingleConfig {
     #[serde(default)]
     pub read_timeout_ms: Option<u64>,
     /// Bytes of an in-progress response train past which the sink codec emits the accumulated whole
-    /// backend messages as a partial chunk, instead of holding the entire result in memory. `0`,
-    /// the default, never chunks.
+    /// backend messages as a partial chunk, instead of holding the entire result in memory.
     ///
-    /// Transforms that cannot handle partial trains are refused at startup with an error naming
-    /// them, rather than silently misbehaving — see
-    /// [`PostgresCodecBuilder::with_stream_threshold`]. Still undocumented in the user guide, and
-    /// still defaulted off, until the remaining steps bound memory end to end.
-    #[serde(default)]
+    /// Defaults to 1 MiB. Buffering a whole result costs memory proportional to the RESULT; chunking
+    /// costs memory proportional to the threshold, and delivers the first rows while the rest are
+    /// still arriving. Measured on a 442 MB result: 740-836 MB peak whole-train against 74-84 MB
+    /// chunked, and a backend killed mid-result delivers ~3.1M rows where whole-train delivered none.
+    /// Throughput is unchanged (1023 tps either way, pgbench prepared, 8 clients).
+    ///
+    /// `0` restores whole-train buffering, which is what a chain containing a transform that needs
+    /// whole response trains must set — such a chain is refused at startup with an error naming the
+    /// transform, rather than silently misbehaving. See
+    /// [`PostgresCodecBuilder::with_stream_threshold`].
+    ///
+    /// A SLOW client still accumulates the result in the source's response queue unless
+    /// `response_buffer_batches` is set on the postgres source; see its documentation. Chunking alone
+    /// takes a slow client's 442 MB result from 740-836 MB to 458 MB, and the source-side bound takes
+    /// it to 95 MB.
+    #[serde(default = "default_stream_threshold_bytes")]
     pub stream_threshold_bytes: usize,
+}
+
+/// The default `stream_threshold_bytes` for both postgres sinks: large enough that ordinary
+/// request/response traffic never chunks, small enough that a large result is bounded by it rather
+/// than by its own size.
+pub(crate) fn default_stream_threshold_bytes() -> usize {
+    1024 * 1024
 }
 
 const NAME: &str = "PostgresSinkSingle";
