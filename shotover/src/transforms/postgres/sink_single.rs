@@ -38,27 +38,23 @@ pub struct PostgresSinkSingleConfig {
     /// Bytes of an in-progress response train past which the sink codec emits the accumulated whole
     /// backend messages as a partial chunk, instead of holding the entire result in memory.
     ///
-    /// Defaults to 1 MiB. Buffering a whole result costs memory proportional to the RESULT; chunking
-    /// costs memory proportional to the threshold, and delivers the first rows while the rest are
-    /// still arriving. Measured on a 442 MB result: 740-836 MB peak whole-train against 74-84 MB
-    /// chunked, and a backend killed mid-result delivers ~3.1M rows where whole-train delivered none.
-    /// Throughput is unchanged (1023 tps either way, pgbench prepared, 8 clients).
+    /// Defaults to 1 MiB, so a large result costs memory proportional to the THRESHOLD rather than to
+    /// the result, and its first rows reach the client while the rest are still arriving. See
+    /// [`PostgresDecoder::stream_threshold_bytes`] for the measurements.
     ///
-    /// `0` restores whole-train buffering, which is what a chain containing a transform that needs
-    /// whole response trains must set — such a chain is refused at startup with an error naming the
-    /// transform, rather than silently misbehaving. See
-    /// [`PostgresCodecBuilder::with_stream_threshold`].
+    /// `0` restores whole-train buffering. A chain containing a transform that needs whole response
+    /// trains must set it, and is refused at startup with an error naming the transform rather than
+    /// silently misbehaving; so must a chain whose `PostgresReadCache` should cache results larger
+    /// than the threshold, since a result that streams is never stored.
     ///
-    /// A SLOW client still accumulates the result in the source's response queue unless
-    /// `response_buffer_batches` is set on the postgres source; see its documentation. Chunking alone
-    /// takes a slow client's 442 MB result from 740-836 MB to 458 MB, and the source-side bound takes
-    /// it to 95 MB.    ///
-    /// Any non-zero value also tightens the sink's own response queue, from
+    /// Two things a non-zero value does NOT do. It does not bound a SLOW client, which accumulates
+    /// the result in the source's response queue unless `response_buffer_batches` is set on the
+    /// postgres source. And it is not free for a deployment whose results never reach it: any
+    /// non-zero value also tightens this sink's own response queue, from
     /// [`DEFAULT_RESPONSE_BUFFER_BATCHES`](crate::connection::DEFAULT_RESPONSE_BUFFER_BATCHES)
-    /// batches to a few, because a batch stops being one whole small answer and becomes a chunk of
-    /// unbounded size. A deployment whose results never reach the threshold gets none of the memory
-    /// benefit and still gets the tighter queue: under deep pipelining its reader task can park where
-    /// it previously would not, applying backpressure to the backend sooner.
+    /// batches to a few, because a queued batch stops being one whole small answer and becomes a
+    /// chunk of unbounded size — so its reader task can park under deep pipelining where it
+    /// previously would not, applying backpressure to the backend sooner.
     #[serde(default = "default_stream_threshold_bytes")]
     pub stream_threshold_bytes: usize,
 }

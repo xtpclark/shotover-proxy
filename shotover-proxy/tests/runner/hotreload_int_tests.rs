@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 use test_helpers::connection::valkey_connection::create_tls_valkey_client_from_certs;
 use test_helpers::docker_compose::docker_compose;
+use test_helpers::shotover_process::{EventMatcher, Level};
 
 /// Helper function to verify comprehensive Valkey connection functionality
 fn assert_valkey_connection_works(
@@ -388,4 +389,48 @@ async fn test_hot_reload_certificate_change() {
     .unwrap();
 
     shotover_new.shutdown_and_then_consume_events(&[]).await;
+}
+
+/// A new binary that refuses its topology must refuse BEFORE taking the listeners, or it leaves
+/// nothing bound to the port: the running instance closes its originals as soon as it has sent them.
+///
+/// This became reachable without an operator edit when postgres sinks started streaming by default —
+/// the same topology that started under the old binary can now trip the partial-response contract —
+/// so the ordering is load-bearing rather than tidy. The assertion that matters is the last one: the
+/// OLD instance is still serving after the new one gave up.
+#[tokio::test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+async fn test_hot_reload_rejected_topology_leaves_the_old_listener_serving() {
+    let socket_path = "/tmp/test-hotreload-rejected-topology.sock";
+
+    let _compose = docker_compose("tests/test-configs/hotreload/docker-compose.yaml");
+
+    let shotover_old = shotover_process("tests/test-configs/hotreload/topology.yaml")
+        .with_log_name("shot_old_reject")
+        .with_hotreload_socket(socket_path)
+        .with_config("tests/test-configs/shotover-config/config_metrics_disabled.yaml")
+        .start()
+        .await;
+
+    let client = Client::open("valkey://127.0.0.1:6380").unwrap();
+    let mut connection = client.get_connection().unwrap();
+    assert_valkey_connection_works(&mut connection, None, &[]).unwrap();
+
+    // Tee cannot receive partial trains, and the sink beside it streams by default.
+    shotover_process("tests/test-configs/hotreload/topology-invalid.yaml")
+        .with_log_name("shot_new_reject")
+        .with_hotreload_socket(socket_path)
+        .with_config("tests/test-configs/shotover-config/config_metrics_disabled.yaml")
+        .assert_fails_to_start(&[EventMatcher::new()
+            .with_level(Level::Error)
+            .with_target("shotover::runner")])
+        .await;
+
+    // The port is still served, by the instance that was already serving it. If validation ran after
+    // the handoff this connection would fail: the old instance would have closed its listener and the
+    // new one would have exited.
+    let mut connection = client.get_connection().unwrap();
+    assert_valkey_connection_works(&mut connection, None, &[]).unwrap();
+
+    shotover_old.shutdown_and_then_consume_events(&[]).await;
 }

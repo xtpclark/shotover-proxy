@@ -61,12 +61,11 @@ impl TransformConfig for QueryTypeFilterConfig {
     /// `true`: filtering happens on the request side, and the response side only ever REPLACES a
     /// response whose `request_id` matches a request this transform filtered out. A partial chunk
     /// carries no request id, so it never matches and is forwarded untouched — no body is inspected
-    /// and nothing assumes a whole train. That is the same streaming argument `RequestThrottling`
-    /// carries, and only that: unlike the throttle, this transform has no postgres-specific guard, so
-    /// `AllowList` mode remains unusable in front of a postgres sink for reasons that have nothing to
-    /// do with streaming (Startup, Bind, Execute and Sync all classify as `ReadWrite`, so an
-    /// allow-list of reads rejects the client's own startup message). Accepting partials does not
-    /// make that pairing work; see the postgres note in `docs/src/sources.md`.
+    /// and nothing assumes a whole train. Same streaming argument as `RequestThrottling`.
+    ///
+    /// This says nothing about whether the transform is USEFUL in front of a given sink; the postgres
+    /// note in `docs/src/sources.md` covers that, and `AllowList` mode remains unusable there for
+    /// reasons unrelated to streaming.
     fn accepts_partial_responses(&self) -> bool {
         true
     }

@@ -160,6 +160,12 @@ impl Shotover {
         trigger_shutdown_tx: watch::Sender<bool>,
         trigger_shutdown_rx: watch::Receiver<bool>,
     ) -> Result<()> {
+        // BEFORE any hot reload handoff. Requesting the listeners is a point of no return: the
+        // running instance closes its originals as soon as it has sent them, so a topology this
+        // binary refuses would leave nothing bound to the port. Validating first means a bad
+        // combination fails while the old instance is still serving.
+        topology.validate_config()?;
+
         let hotreload_client = hotreload_socket.clone().and_then(HotReloadClient::new);
         let hotreload_listeners = if let Some(client) = &hotreload_client {
             info!("Hot reload CLIENT mode - requesting socket handoff from existing shotover");

@@ -21,6 +21,16 @@
 //!     Setting `stream_threshold_bytes: 0` on the sink removes this residual, at the cost of
 //!     buffering whole results.
 //!
+//! ### `max_bytes` above the sink's `stream_threshold_bytes` caches nothing extra
+//! A result that streams arrives as a chunked tail — a fragment, not a whole result — and a fragment
+//! is never stored (caching it would serve a truncated, RowDescription-less row set). So the largest
+//! result that can be cached is the largest one that does NOT chunk: with the sink's default
+//! `stream_threshold_bytes` of 1 MiB, nothing above 1 MiB is cached however high `max_bytes` goes.
+//! Raise `stream_threshold_bytes` above `max_bytes` to cache larger results, and accept the whole-
+//! train memory cost for them. This band changed with the F13 default flip: results between 1 MiB
+//! and `max_bytes` cached before it and do not now, showing up only as sustained misses.
+//!
+//!
 //! ## What it does
 //! For a client's simple `Query` that the grammar analysis proves is a pure, replica-safe read (no
 //! writes, no session-state, no `FOR UPDATE`) AND that contains no obviously volatile construct
@@ -92,18 +102,10 @@
 //!   trailing ReadyForQuery is idle ('I'), never 'T'.
 //! - **Never an error.** A train containing an ErrorResponse is not cached, so a transient error is not
 //!   replayed to other sessions (F8).
-//! ## `max_bytes` above the sink's `stream_threshold_bytes` caches nothing extra
-//! A result that streams arrives as a chunked tail — a fragment, not a whole result — and a fragment
-//! is never stored (caching it would serve a truncated, RowDescription-less row set). So the largest
-//! result that can be cached is the largest one that does NOT chunk: with the sink's default
-//! `stream_threshold_bytes` of 1 MiB, nothing above 1 MiB is cached however high `max_bytes` goes.
-//! Raise `stream_threshold_bytes` above `max_bytes` to cache larger results, and accept the whole-
-//! train memory cost for them. This band changed with the F13 default flip: results between 1 MiB
-//! and `max_bytes` cached before it and do not now, showing up only as sustained misses.
-//!
 //! - **Bounded by BOTH `max_entries` AND `max_bytes`** (estimated payload), so a few large results
 //!   cannot size the proxy's memory (F2). NOTE the proxy already buffers a whole response train in
-//!   memory regardless of the cache (a separate architectural limit), so keep `max_bytes` modest.
+//!   memory bounded by the sink's `stream_threshold_bytes` rather than by the result, and never
+//!   caches a result that streamed — so `max_bytes` above that threshold buys nothing.
 
 use crate::codec::postgres::{is_chunked_train_tail, is_partial_response};
 use crate::frame::postgres::{
@@ -286,7 +288,8 @@ impl TransformConfig for PostgresReadCacheConfig {
             hits: counter!("shotover_postgres_read_cache_hits_count", "chain" => chain.clone(), "transform" => NAME),
             misses: counter!("shotover_postgres_read_cache_misses_count", "chain" => chain.clone(), "transform" => NAME),
             evictions: counter!("shotover_postgres_read_cache_evictions_count", "chain" => chain.clone(), "transform" => NAME),
-            untracked_execute: counter!("shotover_postgres_read_cache_untracked_execute_count", "chain" => chain, "transform" => NAME),
+            untracked_execute: counter!("shotover_postgres_read_cache_untracked_execute_count", "chain" => chain.clone(), "transform" => NAME),
+            uncacheable_streamed: counter!("shotover_postgres_read_cache_uncacheable_streamed_count", "chain" => chain, "transform" => NAME),
         }))
     }
 
@@ -400,6 +403,11 @@ pub struct PostgresReadCacheBuilder {
     misses: Counter,
     evictions: Counter,
     untracked_execute: Counter,
+    /// Reads that were cacheable in every other respect but arrived in chunks, so were not stored.
+    /// Its own counter because it is the one uncacheable reason an operator can act on — raising the
+    /// sink's `stream_threshold_bytes` above `max_bytes` — and it is indistinguishable from an
+    /// ordinary miss otherwise.
+    uncacheable_streamed: Counter,
 }
 
 impl TransformBuilder for PostgresReadCacheBuilder {
@@ -415,6 +423,7 @@ impl TransformBuilder for PostgresReadCacheBuilder {
             misses: self.misses.clone(),
             evictions: self.evictions.clone(),
             untracked_execute: self.untracked_execute.clone(),
+            uncacheable_streamed: self.uncacheable_streamed.clone(),
             user: None,
             database: None,
             rendering_gucs: BTreeMap::new(),
@@ -514,6 +523,8 @@ pub struct PostgresReadCache {
     /// Executes that hit the evict-all fallback because their statement/portal was untracked (review
     /// F-INV-8 — makes the safe-but-blunt fallback visible to operators).
     untracked_execute: Counter,
+    /// See the builder field of the same name.
+    uncacheable_streamed: Counter,
     // Per-connection state:
     user: Option<String>,
     database: Option<String>,
@@ -803,12 +814,10 @@ impl Transform for PostgresReadCache {
                     // never the tail of a train whose earlier rows already went out as chunks
                     // (caching that would serve a truncated, RowDescription-less row set).
                     if is_chunked_train_tail(response) {
-                        // Not silent: this is the one reason a cacheable read is never stored no
-                        // matter how often it repeats, and it is invisible in the miss count.
-                        tracing::debug!(
-                            "postgres read cache: not caching a result that streamed in chunks; \
-                             raise stream_threshold_bytes above max_bytes to cache results this large"
-                        );
+                        // Counted, not logged: this is the one reason a cacheable read is never
+                        // stored however often it repeats, it is indistinguishable from an ordinary
+                        // miss, and a log line would be invisible at the level a proxy runs at.
+                        self.uncacheable_streamed.increment(1);
                     } else if response_is_cacheable(response) {
                         let size = estimate_response_size(response);
                         self.cache_put(key, response.clone(), size, relations, issued_at);
@@ -1292,6 +1301,7 @@ mod tests {
             misses: counter!("test_misses"),
             evictions: counter!("test_evictions"),
             untracked_execute: counter!("test_untracked"),
+            uncacheable_streamed: counter!("test_uncacheable_streamed"),
             user: Some("u".to_owned()),
             database: Some("db".to_owned()),
             rendering_gucs: BTreeMap::new(),

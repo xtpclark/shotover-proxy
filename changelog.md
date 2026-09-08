@@ -12,13 +12,23 @@ This assists us in knowing when to make the next release a breaking release and 
 * Removed websocket support
 * `PostgresSinkSingle` and `PostgresSinkCluster` now default `stream_threshold_bytes` to `1048576`
   (1 MiB) instead of `0`. Large results are delivered in chunks rather than buffered whole, which
-  takes the peak memory of a 442 MB result from 740-836 MB to 74-84 MB at unchanged throughput.
+  takes the peak memory of a 442 MB result from 2748 MB to 74-84 MB at unchanged throughput.
 
   **This can stop an existing topology from starting.** A transform that needs whole response trains
   cannot run in a chain that streams, and shotover refuses to start such a chain rather than feed the
-  transform a shape it was not written for — the error names the transform. `Tee` is affected, as is
-  any postgres sink inside a `ConnectionBalanceAndPool` sub-chain. Set `stream_threshold_bytes: 0` on
-  the sink to restore the old behaviour.
+  transform a shape it was not written for — the error names the transform. Set
+  `stream_threshold_bytes: 0` on the sink to restore the old behaviour.
+
+  `accepts_partial_responses` defaults to `false`, so this covers more than the transforms shipped as
+  whole-train-only (`Tee`, `DebugPrinter`, `DebugForceParse`, `DebugReturner`, and a postgres sink
+  inside a `ConnectionBalanceAndPool` sub-chain). **It covers every custom transform**: the method did
+  not exist before this release, so nothing written against 0.7 can have overridden it, and any
+  postgres chain containing one needs `stream_threshold_bytes: 0` until the transform is reviewed
+  against chunked responses and declares otherwise.
+
+  Shotover now validates the topology BEFORE requesting a hot reload handoff, so a binary that
+  refuses its topology fails while the running instance is still serving, rather than after it has
+  given up its listeners.
 
   A slow client still buffers the whole result unless `response_buffer_batches` is also set on the
   `Postgres` source; see its documentation.
