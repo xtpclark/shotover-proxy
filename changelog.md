@@ -23,6 +23,16 @@ This assists us in knowing when to make the next release a breaking release and 
   A slow client still buffers the whole result unless `response_buffer_batches` is also set on the
   `Postgres` source; see its documentation.
 
+  Two further consequences for existing deployments, neither of which errors:
+
+  * `PostgresReadCache` no longer stores any result that streams, so nothing above
+    `stream_threshold_bytes` is cached however high `max_bytes` is set. Results between the two
+    cached before this change and now miss every time. Raise `stream_threshold_bytes` above
+    `max_bytes` to restore it.
+  * A non-zero `stream_threshold_bytes` also tightens the sink's own response queue, so a deployment
+    whose results never reach the threshold still sees backpressure applied to the backend sooner
+    under deep pipelining.
+
 ## 0.7.0
 
 ### shotover rust API

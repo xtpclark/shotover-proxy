@@ -76,11 +76,12 @@ Postgres:
   # to catch up. If not provided the limit is one no source could reach before streaming existed,
   # which is how every source behaves by default.
   #
-  # Only worth setting alongside `stream_threshold_bytes` on a postgres sink. With streaming on, a
-  # client that reads slowly otherwise accumulates the whole result in this queue, because the chain
-  # hands responses to the writer and returns rather than waiting for the socket. Bounding it makes
-  # the chain wait, which stops it draining the backend, which lets TCP stall the backend — so a
-  # slow client costs a bounded amount of memory instead of the whole result.
+  # Postgres sinks stream by default, so this applies to every postgres deployment, not just ones
+  # that opted in. With streaming on, a client that reads slowly accumulates the whole result in this
+  # queue, because the chain hands responses to the writer and returns rather than waiting for the
+  # socket. Bounding it makes the chain wait, which stops it draining the backend, which lets TCP
+  # stall the backend — so a slow client costs a bounded amount of memory instead of the whole
+  # result. Measured on a 442 MB result to a ~4 MB/s client: 458 MB unset, 95 MB at 4.
   #
   # Sizing: a queued batch can hold a whole sink queue's worth of chunks (8), and two more are in
   # flight in the writer task and the chain, so the buffers come to about
