@@ -756,10 +756,12 @@ threshold buys nothing, and results between the two are never cached at all.
 Metrics: `shotover_postgres_read_cache_hits_count`, `shotover_postgres_read_cache_misses_count`,
 `shotover_postgres_read_cache_evictions_count` (entries dropped by write invalidation), and
 `shotover_postgres_read_cache_untracked_execute_count` (an Execute of an untracked portal fell back to
-evict-all — normally zero; a non-zero rate suggests raising the prepared-statement cap), and
-`shotover_postgres_read_cache_uncacheable_streamed_count` (a read that was cacheable in every other
-respect but arrived in chunks, so was not stored — a non-zero rate means results are crossing the
-sink's `stream_threshold_bytes`, and raising it above `max_bytes` is the only way to cache them).
+evict-all — normally zero; a non-zero rate suggests raising the prepared-statement cap).
+
+A read whose result streams is never cached, and there is no metric that distinguishes it: it is
+counted as an ordinary miss. Sustained misses on a repeated read whose result exceeds the sink's
+`stream_threshold_bytes` are that case; raising the threshold above `max_bytes` is the only way to
+cache such a read.
 
 ```yaml
 - PostgresReadCache:

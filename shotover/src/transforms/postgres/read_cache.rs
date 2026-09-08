@@ -28,7 +28,17 @@
 //! `stream_threshold_bytes` of 1 MiB, nothing above 1 MiB is cached however high `max_bytes` goes.
 //! Raise `stream_threshold_bytes` above `max_bytes` to cache larger results, and accept the whole-
 //! train memory cost for them. This band changed with the F13 default flip: results between 1 MiB
-//! and `max_bytes` cached before it and do not now, showing up only as sustained misses.
+//! and `max_bytes` cached before it and do not now.
+//!
+//! **It shows up as ordinary misses and nothing else.** The map of reads awaiting a response is a
+//! per-CHAIN-RUN local, and a streamed result's tail arrives in a LATER run, so the tail is never
+//! matched against it — the read is recorded as a miss and the decision not to store it is never
+//! reached. A metric on that decision was tried and removed: it could only ever have fired when a
+//! whole train and its tail landed in a single receive, which a genuinely streamed result does not
+//! do. The same per-run scope is why a non-chunked response that lands in a later run (a pipelined
+//! `[large; small]`, say) is also a miss that is never stored. Making that map per-CONNECTION,
+//! keyed by request id and removed on the id-carrying response, fixes both; it is a behaviour change
+//! to what gets cached and belongs in its own change rather than riding along with a default flip.
 //!
 //!
 //! ## What it does
@@ -288,8 +298,7 @@ impl TransformConfig for PostgresReadCacheConfig {
             hits: counter!("shotover_postgres_read_cache_hits_count", "chain" => chain.clone(), "transform" => NAME),
             misses: counter!("shotover_postgres_read_cache_misses_count", "chain" => chain.clone(), "transform" => NAME),
             evictions: counter!("shotover_postgres_read_cache_evictions_count", "chain" => chain.clone(), "transform" => NAME),
-            untracked_execute: counter!("shotover_postgres_read_cache_untracked_execute_count", "chain" => chain.clone(), "transform" => NAME),
-            uncacheable_streamed: counter!("shotover_postgres_read_cache_uncacheable_streamed_count", "chain" => chain, "transform" => NAME),
+            untracked_execute: counter!("shotover_postgres_read_cache_untracked_execute_count", "chain" => chain, "transform" => NAME),
         }))
     }
 
@@ -403,11 +412,6 @@ pub struct PostgresReadCacheBuilder {
     misses: Counter,
     evictions: Counter,
     untracked_execute: Counter,
-    /// Reads that were cacheable in every other respect but arrived in chunks, so were not stored.
-    /// Its own counter because it is the one uncacheable reason an operator can act on — raising the
-    /// sink's `stream_threshold_bytes` above `max_bytes` — and it is indistinguishable from an
-    /// ordinary miss otherwise.
-    uncacheable_streamed: Counter,
 }
 
 impl TransformBuilder for PostgresReadCacheBuilder {
@@ -423,7 +427,6 @@ impl TransformBuilder for PostgresReadCacheBuilder {
             misses: self.misses.clone(),
             evictions: self.evictions.clone(),
             untracked_execute: self.untracked_execute.clone(),
-            uncacheable_streamed: self.uncacheable_streamed.clone(),
             user: None,
             database: None,
             rendering_gucs: BTreeMap::new(),
@@ -523,8 +526,6 @@ pub struct PostgresReadCache {
     /// Executes that hit the evict-all fallback because their statement/portal was untracked (review
     /// F-INV-8 — makes the safe-but-blunt fallback visible to operators).
     untracked_execute: Counter,
-    /// See the builder field of the same name.
-    uncacheable_streamed: Counter,
     // Per-connection state:
     user: Option<String>,
     database: Option<String>,
@@ -813,12 +814,12 @@ impl Transform for PostgresReadCache {
                     // ReadyForQuery('I'), never an in-transaction train ending in 'T' (F7), and
                     // never the tail of a train whose earlier rows already went out as chunks
                     // (caching that would serve a truncated, RowDescription-less row set).
-                    if is_chunked_train_tail(response) {
-                        // Counted, not logged: this is the one reason a cacheable read is never
-                        // stored however often it repeats, it is indistinguishable from an ordinary
-                        // miss, and a log line would be invisible at the level a proxy runs at.
-                        self.uncacheable_streamed.increment(1);
-                    } else if response_is_cacheable(response) {
+                    // A streamed result reaches here only if every chunk AND the tail landed in one
+                    // receive, which a genuinely streamed result never does — the tail arrives in a
+                    // later chain run, where `cache_on_response` is a fresh empty map. So the common
+                    // case is not this branch at all: the miss is recorded and the tail is simply
+                    // never matched. Both are the same per-run-local limitation; see the module doc.
+                    if !is_chunked_train_tail(response) && response_is_cacheable(response) {
                         let size = estimate_response_size(response);
                         self.cache_put(key, response.clone(), size, relations, issued_at);
                     }
@@ -1301,7 +1302,6 @@ mod tests {
             misses: counter!("test_misses"),
             evictions: counter!("test_evictions"),
             untracked_execute: counter!("test_untracked"),
-            uncacheable_streamed: counter!("test_uncacheable_streamed"),
             user: Some("u".to_owned()),
             database: Some("db".to_owned()),
             rendering_gucs: BTreeMap::new(),
