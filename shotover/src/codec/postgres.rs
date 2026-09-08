@@ -272,8 +272,8 @@ impl PostgresCodecBuilder {
     /// Sets the size, in bytes, past which the sink decoder emits an in-progress response train as
     /// partial chunks rather than accumulate the whole thing (see
     /// [`PostgresDecoder::stream_threshold_bytes`], which records what this does and does not bound
-    /// on its own). `0` never chunks; every caller is a sink passing its configured
-    /// `stream_threshold_bytes`, which defaults to 1 MiB.
+    /// on its own, and holds the measurements). `0` never chunks; every caller is a sink passing its
+    /// configured `stream_threshold_bytes`, which defaults to 1 MiB.
     ///
     /// # Which chains may enable it
     ///
@@ -446,13 +446,29 @@ pub struct PostgresDecoder {
     /// Sink only: Some while a COPY FROM STDIN is in progress.
     copy_mode: Option<CopyMode>,
     /// Sink only: an in-progress STREAMABLE response train is emitted as a partial chunk rather
-    /// than grow past this many bytes. `0` never chunks, which is the default and reproduces the
-    /// unchunked behaviour exactly.
+    /// than grow past this many bytes. `0` never chunks and reproduces the unchunked behaviour
+    /// exactly; the sinks default it to 1 MiB.
     ///
-    /// On its own this takes peak RSS for a large result from roughly 6x the result size down to
-    /// roughly 1.6x, by removing the result-sized accumulation buffer and the repeated doublings
-    /// that grew it (measured on a 442 MB result: 2748 MB peak unchunked, 740-836 MB at a 1 MiB
-    /// threshold, 658 MB at 64 KiB).
+    /// **The measurements for the whole feature live here**, because they are quoted in several
+    /// places and only one of them should be authoritative. All on a 442 MB result unless stated.
+    ///
+    /// | configuration | peak RSS |
+    /// |---|---|
+    /// | `0` — whole trains buffered | 2748 MB |
+    /// | chunking at 1 MiB, codec only (before responses were forwarded incrementally) | 740-836 MB |
+    /// | chunking at 64 KiB, codec only | 658 MB |
+    /// | 1 MiB, forwarded incrementally — what ships | 74-84 MB |
+    /// | 1 MiB, slow (~4 MB/s) client | 458 MB |
+    /// | 1 MiB, slow client, `response_buffer_batches: 4` on the source | 95 MB |
+    /// | 1 MiB, redaction chain (313 MB result, 10M rows) | 156 MB |
+    /// | `0`, redaction chain (same result) | 1949 MB |
+    ///
+    /// Note the second row: 740-836 MB was an INTERMEDIATE state, not the cost of buffering. Quoting
+    /// it as the whole-train baseline understates what streaming saves by roughly 3.5x and, worse,
+    /// under-sizes a deployment that sets `0`.
+    ///
+    /// Throughput is unchanged (1023 tps either way, pgbench prepared, 8 clients), and a backend
+    /// killed mid-result delivers ~3.1M rows where whole-train buffering delivered none.
     ///
     /// It does NOT yet bound memory to O(threshold). The remaining ~1.6x is the chunks themselves:
     /// [`crate::transforms::postgres::exchange`] collects every chunk of a train before returning,

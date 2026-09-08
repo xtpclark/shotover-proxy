@@ -498,28 +498,19 @@ connections in this release; md5/SCRAM origination is a follow-up.
     #replica_users:
     #  app_user: "app_user_backend_password"
     # Bytes of an in-progress response train past which the sink emits what it has accumulated as a
-    # chunk, instead of holding the whole result in memory. Defaults to 1048576 (1 MiB).
-    #
-    # Buffering a whole result costs memory proportional to the RESULT; chunking costs memory
-    # proportional to this threshold, and starts delivering rows while the rest are still arriving.
-    # Measured on a 442 MB result: 740-836 MB peak buffered against 74-84 MB chunked, and a backend
-    # killed mid-result delivers ~3.1M rows where buffering delivered none. Throughput is unchanged
-    # (1023 tps either way, pgbench prepared, 8 clients).
-    #
-    # A SLOW client still accumulates the whole result in the source's response queue unless
-    # `response_buffer_batches` is set on the Postgres source — see the source documentation. That
-    # takes a slow client's 442 MB result from 458 MB to 95 MB.
-    #
-    #
-    # Any non-zero value also tightens this sink's own response queue (a queued batch becomes a chunk
-    # of unbounded size rather than one whole small answer), so a deployment whose results never reach
-    # the threshold still gets tighter backpressure to the backend under deep pipelining. Set 0 if
-    # that matters more than the memory bound.
+    # chunk, instead of holding the whole result in memory. Defaults to 1048576 (1 MiB), so a large
+    # result costs memory proportional to this threshold rather than to the result. See the memory
+    # section of the Postgres deployment guide for the measured figures.
     #
     # Set 0 to buffer whole trains as before. A chain containing a transform that needs whole
-    # response trains MUST set 0: shotover refuses to start otherwise, with an error naming the
-    # transform. Tee is such a transform. Setting 0 is also the only way for a PostgresReadCache to
-    # cache results larger than the threshold, since a streamed result is never stored.
+    # response trains MUST set 0 — shotover refuses to start otherwise, with an error naming the
+    # transform, and Tee is such a transform. So must a chain whose PostgresReadCache should cache
+    # results larger than the threshold, since a result that streams is never stored.
+    #
+    # A non-zero value does NOT bound a SLOW client: that needs `response_buffer_batches` on the
+    # Postgres source. Nor is it free for a deployment whose results never reach it — it also
+    # tightens this sink's own response queue, so backpressure reaches the backend sooner under deep
+    # pipelining.
     #stream_threshold_bytes: 1048576
 
     # Optional TLS to the backends, as for PostgresSinkSingle.
@@ -555,11 +546,11 @@ Behaviour and limitations of this release:
 - **Backend auth is trust/cleartext only.** A per-user userlist (`replica_users`) is supported;
   md5/SCRAM origination to replicas is a follow-up.
 - **Large results stream by default** (`stream_threshold_bytes`, 1 MiB), so a big `SELECT` no longer
-  sizes the proxy's memory for its lifetime: 74-84 MB peak for a 442 MB result, against 740-836 MB
-  when buffered whole. Set `stream_threshold_bytes: 0` to restore whole-train buffering — required
-  for a chain containing a transform that needs whole trains, and the only way to cache results
-  larger than the threshold in a `PostgresReadCache`. A SLOW client still needs
-  `response_buffer_batches` on the source to be bounded; see the source documentation.
+  sizes the proxy's memory for its lifetime: 74-84 MB peak for a 442 MB result, against 2748 MB when
+  buffered whole. Set `stream_threshold_bytes: 0` to restore whole-train buffering — required for a
+  chain containing a transform that needs whole trains, and the only way to cache results larger than
+  the threshold in a `PostgresReadCache`. A SLOW client still needs `response_buffer_batches` on the
+  source to be bounded; see the source documentation.
 - The writing-function detection used for routing is best-effort (see the note on function
   classification); a `SELECT` that calls an unlisted writing or session-mutating function may be
   routed to a replica.
@@ -679,28 +670,19 @@ This transform will send/receive postgres messages to a single postgres instance
     #read_timeout_ms: 30000
 
     # Bytes of an in-progress response train past which the sink emits what it has accumulated as a
-    # chunk, instead of holding the whole result in memory. Defaults to 1048576 (1 MiB).
-    #
-    # Buffering a whole result costs memory proportional to the RESULT; chunking costs memory
-    # proportional to this threshold, and starts delivering rows while the rest are still arriving.
-    # Measured on a 442 MB result: 740-836 MB peak buffered against 74-84 MB chunked, and a backend
-    # killed mid-result delivers ~3.1M rows where buffering delivered none. Throughput is unchanged
-    # (1023 tps either way, pgbench prepared, 8 clients).
-    #
-    # A SLOW client still accumulates the whole result in the source's response queue unless
-    # `response_buffer_batches` is set on the Postgres source — see the source documentation. That
-    # takes a slow client's 442 MB result from 458 MB to 95 MB.
-    #
-    #
-    # Any non-zero value also tightens this sink's own response queue (a queued batch becomes a chunk
-    # of unbounded size rather than one whole small answer), so a deployment whose results never reach
-    # the threshold still gets tighter backpressure to the backend under deep pipelining. Set 0 if
-    # that matters more than the memory bound.
+    # chunk, instead of holding the whole result in memory. Defaults to 1048576 (1 MiB), so a large
+    # result costs memory proportional to this threshold rather than to the result. See the memory
+    # section of the Postgres deployment guide for the measured figures.
     #
     # Set 0 to buffer whole trains as before. A chain containing a transform that needs whole
-    # response trains MUST set 0: shotover refuses to start otherwise, with an error naming the
-    # transform. Tee is such a transform. Setting 0 is also the only way for a PostgresReadCache to
-    # cache results larger than the threshold, since a streamed result is never stored.
+    # response trains MUST set 0 — shotover refuses to start otherwise, with an error naming the
+    # transform, and Tee is such a transform. So must a chain whose PostgresReadCache should cache
+    # results larger than the threshold, since a result that streams is never stored.
+    #
+    # A non-zero value does NOT bound a SLOW client: that needs `response_buffer_batches` on the
+    # Postgres source. Nor is it free for a deployment whose results never reach it — it also
+    # tightens this sink's own response queue, so backpressure reaches the backend sooner under deep
+    # pipelining.
     #stream_threshold_bytes: 1048576
 
     # When this field is provided TLS is used when connecting to the remote address.
@@ -767,13 +749,17 @@ on this proxy evicts everything, but a two-phase transaction committed through a
 instance** is not seen. It also cannot see
 server-side per-role defaults that postgres does not report (`ALTER ROLE … SET search_path`). **Do not
 enable it for untrusted clients, or any deployment that relies on per-role/invisible search_path or role
-customisation.** Because the proxy already buffers whole response trains in memory, keep `max_bytes`
-modest.
+customisation.** A result that streams is never cached, so nothing above the sink's `stream_threshold_bytes`
+(1 MiB by default) is stored however high `max_bytes` is set — raising `max_bytes` past the sink's
+threshold buys nothing, and results between the two are never cached at all.
 
 Metrics: `shotover_postgres_read_cache_hits_count`, `shotover_postgres_read_cache_misses_count`,
 `shotover_postgres_read_cache_evictions_count` (entries dropped by write invalidation), and
 `shotover_postgres_read_cache_untracked_execute_count` (an Execute of an untracked portal fell back to
-evict-all — normally zero; a non-zero rate suggests raising the prepared-statement cap).
+evict-all — normally zero; a non-zero rate suggests raising the prepared-statement cap), and
+`shotover_postgres_read_cache_uncacheable_streamed_count` (a read that was cacheable in every other
+respect but arrived in chunks, so was not stored — a non-zero rate means results are crossing the
+sink's `stream_threshold_bytes`, and raising it above `max_bytes` is the only way to cache them).
 
 ```yaml
 - PostgresReadCache:

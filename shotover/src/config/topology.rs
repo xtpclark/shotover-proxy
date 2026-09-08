@@ -72,13 +72,26 @@ impl Topology {
         Ok(String::from_utf8(output).unwrap())
     }
 
-    pub async fn run_chains(
-        &self,
-        trigger_shutdown_rx: watch::Receiver<bool>,
-        mut hot_reload_listeners: HashMap<u16, TcpListener>,
-    ) -> Result<Vec<Source>> {
-        let mut sources: Vec<Source> = Vec::new();
+    /// Everything about a topology that can be judged from the topology alone: no listeners, no
+    /// connections, no backends.
+    ///
+    /// Split out so it can run BEFORE a hot reload asks the running instance for its listener file
+    /// descriptors. That handoff is a point of no return — the old instance closes its originals as
+    /// soon as it has sent them (see `hot_reload::server`) — so a validation failure after it leaves
+    /// nothing bound to the port. Every check here is cheap and pure, so there is no reason to reach
+    /// that point before running them.
+    pub fn validate_config(&self) -> Result<()> {
+        let errors = self.config_errors()?;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!("Topology errors\n{errors}"))
+        }
+    }
 
+    /// The config-only checks, as accumulated text rather than an error, so [`Topology::run_chains`]
+    /// can report them together with the per-source errors it finds afterwards.
+    fn config_errors(&self) -> Result<String> {
         let mut topology_errors = String::new();
 
         #[derive(Default)]
@@ -205,6 +218,17 @@ impl Topology {
                 writeln!(topology_errors, "  {error}")?;
             }
         }
+
+        Ok(topology_errors)
+    }
+
+    pub async fn run_chains(
+        &self,
+        trigger_shutdown_rx: watch::Receiver<bool>,
+        mut hot_reload_listeners: HashMap<u16, TcpListener>,
+    ) -> Result<Vec<Source>> {
+        let mut sources: Vec<Source> = Vec::new();
+        let mut topology_errors = self.config_errors()?;
 
         for source in &self.sources {
             match source
@@ -1075,6 +1099,71 @@ mod partial_response_validation_tests {
     fn accepts_a_streaming_sink_on_its_own() {
         assert!(streams(STREAMING_SINK_ONLY));
         assert!(errors(STREAMING_SINK_ONLY).is_empty());
+    }
+
+    /// The refusal must be reachable WITHOUT listeners, because it has to run before a hot reload
+    /// asks the running instance for its file descriptors — that handoff closes the originals, so a
+    /// topology rejected after it leaves nothing bound to the port. Since step 6 a binary upgrade
+    /// alone can trip this validation, with the operator having changed nothing, which is what makes
+    /// the ordering load-bearing rather than merely tidy.
+    #[test]
+    fn config_validation_needs_no_listeners() {
+        let yaml = r#"
+sources:
+  - Postgres:
+      name: "postgres"
+      listen_addr: "127.0.0.1:15432"
+      chain:
+        - Tee:
+            name: "tee"
+            chain:
+              - PostgresSinkSingle:
+                  name: "teed-sink"
+                  remote_address: "127.0.0.1:5432"
+                  connect_timeout_ms: 3000
+        - PostgresSinkSingle:
+            name: "sink"
+            remote_address: "127.0.0.1:5432"
+            connect_timeout_ms: 3000
+"#;
+        let deserializer = serde_yaml::Deserializer::from_str(yaml);
+        let topology: crate::config::topology::Topology =
+            serde_yaml::with::singleton_map_recursive::deserialize(deserializer).unwrap();
+
+        let error = topology.validate_config().unwrap_err().to_string();
+        assert!(error.contains("Tee"), "{error}");
+        assert!(error.contains("stream_threshold_bytes: 0"), "{error}");
+    }
+
+    /// And the same topology with streaming off validates, so the escape hatch the error names is
+    /// reachable from the same code path.
+    #[test]
+    fn config_validation_accepts_the_documented_escape_hatch() {
+        let yaml = r#"
+sources:
+  - Postgres:
+      name: "postgres"
+      listen_addr: "127.0.0.1:15432"
+      chain:
+        - Tee:
+            name: "tee"
+            chain:
+              - PostgresSinkSingle:
+                  name: "teed-sink"
+                  remote_address: "127.0.0.1:5432"
+                  connect_timeout_ms: 3000
+                  stream_threshold_bytes: 0
+        - PostgresSinkSingle:
+            name: "sink"
+            remote_address: "127.0.0.1:5432"
+            connect_timeout_ms: 3000
+            stream_threshold_bytes: 0
+"#;
+        let deserializer = serde_yaml::Deserializer::from_str(yaml);
+        let topology: crate::config::topology::Topology =
+            serde_yaml::with::singleton_map_recursive::deserialize(deserializer).unwrap();
+
+        topology.validate_config().unwrap();
     }
 
     /// A Tee whose SUB-chain streams is refused even though the Tee's own chain does not: the
