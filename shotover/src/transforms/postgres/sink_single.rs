@@ -4,7 +4,7 @@ use crate::frame::postgres::{
     AuthenticationMessage, BackendMessage, FrontendMessage, PostgresFrame,
 };
 use crate::frame::{Frame, MessageType};
-use crate::message::{Message, Messages};
+use crate::message::{Message, MessageId, Messages};
 use crate::tls::{TlsConnector, TlsConnectorConfig};
 use crate::transforms::{
     ChainState, DownChainProtocol, Transform, TransformBuilder, TransformConfig,
@@ -29,6 +29,12 @@ pub struct PostgresSinkSingleConfig {
     pub address: String,
     pub tls: Option<TlsConnectorConfig>,
     pub connect_timeout_ms: u64,
+    /// Milliseconds to wait for the next chunk of a backend response before abandoning a stalled
+    /// backend and returning an error to the client. It is an IDLE timeout — reset whenever data
+    /// arrives — so a large legitimately-streaming result is never cut off; only a backend that stops
+    /// producing trips it. If unset, a stalled backend can hang the client indefinitely.
+    #[serde(default)]
+    pub read_timeout_ms: Option<u64>,
 }
 
 const NAME: &str = "PostgresSinkSingle";
@@ -50,6 +56,7 @@ impl TransformConfig for PostgresSinkSingleConfig {
             self.address.clone(),
             tls,
             self.connect_timeout_ms,
+            self.read_timeout_ms,
         )))
     }
 
@@ -71,6 +78,7 @@ pub struct PostgresSinkSingleBuilder {
     address: String,
     tls: Option<TlsConnector>,
     connect_timeout: Duration,
+    read_timeout: Option<Duration>,
 }
 
 impl PostgresSinkSingleBuilder {
@@ -79,12 +87,14 @@ impl PostgresSinkSingleBuilder {
         address: String,
         tls: Option<TlsConnector>,
         connect_timeout_ms: u64,
+        read_timeout_ms: Option<u64>,
     ) -> Self {
         PostgresSinkSingleBuilder {
             name,
             address,
             tls,
             connect_timeout: Duration::from_millis(connect_timeout_ms),
+            read_timeout: read_timeout_ms.map(Duration::from_millis),
         }
     }
 }
@@ -96,6 +106,7 @@ impl TransformBuilder for PostgresSinkSingleBuilder {
             tls: self.tls.clone(),
             connection: None,
             connect_timeout: self.connect_timeout,
+            read_timeout: self.read_timeout,
             force_run_chain: transform_context.force_run_chain,
             outstanding: 0,
             source_is_tls: transform_context.source_is_tls,
@@ -121,6 +132,8 @@ pub struct PostgresSinkSingle {
     tls: Option<TlsConnector>,
     connection: Option<SinkConnection>,
     connect_timeout: Duration,
+    /// Idle timeout for the next chunk of a backend response (see [`super::exchange`]); None disables.
+    read_timeout: Option<Duration>,
     force_run_chain: Arc<Notify>,
     /// Requests sent to the server that have not yet been answered — see [`super::exchange`].
     /// Carried across batches because an extended-query pipeline's responses arrive on the batch
@@ -220,12 +233,27 @@ impl Transform for PostgresSinkSingle {
                 .unwrap()
                 .try_recv_into(&mut responses);
         } else {
-            responses = super::exchange(
+            let mut requests = std::mem::take(&mut chain_state.requests);
+            let first_id = requests.first_mut().map(|r| r.id());
+            match super::exchange(
                 self.connection.as_mut().unwrap(),
-                std::mem::take(&mut chain_state.requests),
+                requests,
                 &mut self.outstanding,
+                self.read_timeout,
             )
-            .await?;
+            .await
+            {
+                Ok(r) => responses = r,
+                Err(err) if err.downcast_ref::<super::BackendReadTimeout>().is_some() => {
+                    // The backend stalled mid-answer: the connection is now desynced, so drop it, tell
+                    // the client, and close — never hang the client on a response that will not come.
+                    self.connection = None;
+                    self.outstanding = 0;
+                    chain_state.close_client_connection = true;
+                    responses = vec![read_timeout_error_response(first_id)];
+                }
+                Err(err) => return Err(err),
+            }
         }
         // A plaintext client cannot use SCRAM channel binding, so strip SCRAM-SHA-256-PLUS from the
         // backend's SASL offer before it reaches the client. A TLS sink to a channel-binding-capable
@@ -315,6 +343,25 @@ impl PostgresSinkSingle {
     }
 }
 
+/// The ErrorResponse sent to the client when a backend read timed out (read_timeout). SQLSTATE 08006
+/// (connection_failure): shotover is tearing the backend connection down, not surfacing a server error.
+fn read_timeout_error_response(request_id: Option<MessageId>) -> Message {
+    let mut response = Message::from_frame(Frame::Postgres(PostgresFrame::Response(vec![
+        BackendMessage::ErrorResponse {
+            fields: vec![
+                (b'S', "ERROR".to_owned()),
+                (b'V', "ERROR".to_owned()),
+                (b'C', "08006".to_owned()),
+                (b'M', "postgres backend did not respond within read_timeout".to_owned()),
+            ],
+        },
+    ])));
+    if let Some(id) = request_id {
+        response.set_request_id(id);
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +372,7 @@ mod tests {
             tls: None,
             connection: None,
             connect_timeout: Duration::from_secs(1),
+            read_timeout: None,
             force_run_chain: Arc::new(Notify::new()),
             outstanding: 0,
             source_is_tls: false,

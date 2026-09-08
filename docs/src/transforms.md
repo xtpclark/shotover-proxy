@@ -59,6 +59,7 @@ chain:
 | [KafkaSinkSingle](#kafkasinksingle)                      | ✅          | Beta                  |
 | [NullSink](#nullsink)                                    | ✅          | Beta                  |
 | [ParallelMap](#parallelmap)                              | ✅          | Alpha                 |
+| [PostgresReadCache](#postgresreadcache)                  | ❌          | Alpha                 |
 | [PostgresRedactColumn](#postgresredactcolumn)            | ❌          | Alpha                 |
 | [PostgresSinkCluster](#postgressinkcluster)              | ✅          | Alpha                 |
 | [PostgresSinkSingle](#postgressinksingle)                | ✅          | Alpha                 |
@@ -455,37 +456,70 @@ stale by the replication lag — a session needing read-your-writes should wrap 
 transaction.
 
 Authentication: the client authenticates against the primary by passthrough (no client-facing
-credential store, real client auth). Replica connections are originated by the proxy using a
-configured backend password plus the `user`/`database` captured from the client's startup — the
-standard pooler model. Only trust and cleartext `password` backend auth are supported for
-originated replica connections in this release; md5/SCRAM origination and per-user credential
-mapping are follow-ups.
+credential store, real client auth). Replica connections are originated by the proxy using the
+client's `user`/`database` captured from the startup message and a per-user backend password from the
+optional `replica_users` userlist (falling back to the single configured `password`) — the standard
+pooler model. Only trust and cleartext `password` backend auth are supported for originated replica
+connections in this release; md5/SCRAM origination is a follow-up.
 
 ```yaml
 - PostgresSinkCluster:
     name: "pg-cluster"
     # Candidate backend hosts. Each is probed with pg_is_in_recovery() to
     # decide which is the primary and which are read replicas.
+    # List the intended primary FIRST: during a split brain with no resolvable replication
+    # source it is the last-resort tiebreaker (see limitations).
     first_contact_points:
       - "primary.example.com:5432"
       - "replica-1.example.com:5432"
       - "replica-2.example.com:5432"
-    # User and backend password used to originate replica connections and to probe topology.
+    # User and backend password used to PROBE topology, and the fallback for originating replica
+    # connections for any user not in replica_users.
     username: "app"
     password: "secret"
     # Database used only for the pg_is_in_recovery() probe (optional, defaults to "postgres").
     probe_database: "postgres"
     connect_timeout_ms: 3000
+    # Optional idle read timeout (ms): the longest to wait for the NEXT chunk of a backend
+    # response before abandoning a stalled backend (returns a clean error + closes). It resets on
+    # every chunk, so a large streaming result is never cut off — but ANY statement silent for this
+    # long trips it (a long-running query still computing, or small rows still inside PostgreSQL's
+    # ~8KB send buffer), so set it above your longest SILENT execution time. Unset = wait forever.
+    #read_timeout_ms: 30000
+    # Optional: replica addresses to PREFER for reads (a subset of first_contact_points). A read
+    # prefers a healthy preferred replica, then any healthy replica, then the primary.
+    #preferred_replicas:
+    #  - "replica-1.example.com:5432"
+    # How long a replica that fails to connect/authenticate is skipped before it is retried
+    # (ms, default 5000) — so a dead replica does not cost a connect timeout on every read.
+    #replica_health_cooldown_ms: 5000
+    # Optional pgbouncer-style userlist: client username -> cleartext backend password used to
+    # originate THAT user's replica connections. A user not listed falls back to `password`.
+    #replica_users:
+    #  app_user: "app_user_backend_password"
     # Optional TLS to the backends, as for PostgresSinkSingle.
     #tls:
     #  certificate_authority_path: "tls/ca.crt"
     #  verify_hostname: true
 ```
 
-Known limitations of this release:
+Behaviour and limitations of this release:
 
-- **No failover re-probe.** Topology is probed once and cached for the life of the process; if
-  the primary is demoted, writes keep going to the old primary until Shotover is restarted.
+- **Runtime failover, but not transparent mid-session.** A broken primary link (a genuine transport
+  failure, verified by a bounded liveness probe so a single terminated backend or a slow query does
+  not trigger it) discards the cached topology and re-probes, so a NEW connection reaches a promoted
+  replica without a restart. An in-flight session cannot be moved (its open transaction / prepared
+  statements / SET state cannot follow to a new primary), so it is closed with a clean
+  `FATAL 08006 connection to backend lost, please reconnect` and the client reconnects onto the new
+  primary. A window with no reachable primary returns `FATAL 08006 no postgres primary is currently
+  available … please retry`.
+- **Split-brain fencing is best-effort.** If more than one host reports itself writable (an un-fenced
+  old primary that came back), the currently-cached primary is kept if it is still REACHABLE — even if
+  it only rejected the probe (an auth/hba/too-many-connections answer still proves it is up, which is
+  what protects a rotated-probe-password primary) — else the host the replicas actually stream from
+  (`pg_stat_wal_receiver`) is preferred; only if neither resolves does contact-point ORDER decide,
+  logged at ERROR. On a cold start into a split brain with no streaming replicas, list order is all
+  there is — **list the intended primary first**.
 - **Session pinning is permanent.** Once a session issues session state it pins to the primary and
   never returns to read-splitting, so a long-lived pooled connection that prepares a named
   statement early stops offloading reads for the rest of its life.
@@ -493,13 +527,25 @@ Known limitations of this release:
   self-terminating (a simple query, or a `Parse/Bind/Describe/Execute/Sync` that arrives together);
   a read whose pipeline is split across TCP reads, or that ends in `Flush` rather than `Sync`, runs
   on the primary. This trades a little offload for correctness.
-- **Backend auth is trust/cleartext only, one credential.** md5/SCRAM origination to replicas and
-  per-user credential mapping (a pgbouncer-style userlist) are follow-ups.
-- **No cluster-side query cancellation.** A `CancelRequest` is not routed to the node running the
-  query.
+- **Backend auth is trust/cleartext only.** A per-user userlist (`replica_users`) is supported;
+  md5/SCRAM origination to replicas is a follow-up.
+- **Whole response trains are buffered in memory.** The codec assembles an entire response (all its
+  `DataRow`s) before forwarding it, and the allocator retains that space, so one large `SELECT` or
+  `COPY TO STDOUT` sizes the proxy's memory for its lifetime (roughly several times the result's wire
+  size). This is architectural (a streaming-train codec is the real fix) and applies to all postgres
+  chains; keep any `PostgresReadCache` `max_bytes` modest on top of it.
 - The writing-function detection used for routing is best-effort (see the note on function
   classification); a `SELECT` that calls an unlisted writing or session-mutating function may be
   routed to a replica.
+
+A `CancelRequest` IS routed to the node running the query (the proxy captures each backend's
+BackendKeyData and re-issues the cancel to the primary and, for a replica read, to that replica with
+its own key).
+
+Metrics: `shotover_postgres_reads_to_replica_count`, `shotover_postgres_replica_fallback_count`
+(a read that wanted a replica but fell back to the primary), `shotover_postgres_replica_unhealthy_count`,
+`shotover_postgres_backend_read_timeout_count`, and `shotover_postgres_primary_reprobe_count` (a
+failover re-probe), all labelled `chain` and `transform`.
 
 ### PostgresRedactColumn
 
@@ -578,6 +624,14 @@ This transform will send/receive postgres messages to a single postgres instance
     # Timeout in milliseconds for the sink to connect to the destination
     connect_timeout_ms: 3000
 
+    # Optional idle read timeout (ms): the longest to wait for the NEXT chunk of a backend response
+    # before abandoning a stalled backend (returns a clean error to the client and closes). It resets
+    # whenever data arrives, so a large streaming result is never cut off. But ANY statement that sends
+    # no bytes for this long is cut off — including a long-running query still computing, and small
+    # rows still held inside PostgreSQL's ~8KB send buffer — so set it above your longest SILENT
+    # execution time, not just above your network stalls. Unset (the default) waits forever.
+    #read_timeout_ms: 30000
+
     # When this field is provided TLS is used when connecting to the remote address.
     # Removing this field will disable TLS.
     #tls:
@@ -590,6 +644,90 @@ This transform will send/receive postgres messages to a single postgres instance
     #  # Enable/disable verifying the hostname of the destination's certificate.
     #  verify_hostname: true
 ```
+
+### PostgresReadCache
+
+> **ALPHA — write-invalidated, with documented residuals; UNSAFE for multi-tenant or untrusted use.**
+> Enabling it requires the `alpha-transforms` feature. Staleness is possible only through the residuals
+> listed below — a cached read of a **view** or **partition parent/child** is not evicted by a write to
+> its base table or child, a **trigger-driven** write to another table is invisible, a two-phase commit
+> through a **different proxy instance** is not seen, and a **write that bypasses the proxy** is not seen.
+
+A write-invalidated read-through cache for the postgres simple-query protocol: it serves the cached
+response for an identical, cacheable read instead of forwarding it to the backend, and evicts cached
+reads that writes make stale.
+
+Only a pure, replica-safe simple `Query` with no volatile construct (`now()`, `random()`, `nextval`,
+`current_user`, …) and no function the proxy cannot prove pure is cacheable — a `SELECT my_proc(...)`
+whose function is neither a known-pure builtin nor listed in `pure_functions` is treated as a possible
+writer (it might `INSERT`/`UPDATE`) and is never cached. The key is `(database, user, rendering-fingerprint, query)`, where the
+rendering fingerprint is the server-reported rendering GUCs (`client_encoding`/`DateStyle`/`TimeZone`/…)
+so two clients with different timezone/encoding/date formatting never share a result. A response is
+stored only if it is a clean idle result — no `ErrorResponse`, and a trailing `ReadyForQuery('I')`, so
+nothing inside a transaction and no error is ever cached. The cache is turned OFF for a connection that
+issues any session-pinning statement (`SET`/`PREPARE`/temp table, simple OR extended protocol) or a
+state-affecting startup parameter (`options`/`search_path`/`role`/`session_authorization`/
+`extra_float_digits`).
+
+**Write invalidation** is on by default (`invalidate_on_write`): a write seen on the request stream
+evicts the cached reads of its target tables BEFORE it is forwarded, so a following read cannot be
+answered from a now-stale entry. The write's targets come from the same grammar analysis (`INSERT`/
+`UPDATE`/`DELETE`/`MERGE`, including a write hidden in a CTE); a write whose targets cannot be enumerated
+— a stored-procedure `CALL`, a `DO` block, `COPY … FROM`, an unparseable statement, or a read calling an
+unproven function — evicts the WHOLE cache. Table names are matched by bare (schema-stripped, lowercased)
+name, so invalidation is over-eager across schemas rather than ever missing. Several subtler shapes are
+covered: a **prepared write invalidates at `Execute`, not `Parse`** (a driver Parses once and
+Bind/Executes many, so invalidating only at Parse missed every write after the first); **transaction
+boundaries are tracked in both the simple and extended protocols** (a `BEGIN`/`COMMIT` sent by
+pgjdbc/npgsql/pgx as extended Parse/Bind/Execute is seen, and `ROLLBACK TO SAVEPOINT` is correctly not
+treated as a transaction end); a write **defers its invalidation to the commit point** — `COMMIT`/`END`
+for an explicit transaction (`ROLLBACK` discards it), or the `Sync` that commits an implicit extended
+transaction — so a concurrent read cannot cache the not-yet-committed value; and a read whose request was
+issued at or before the most recent invalidation is not stored (the read-after-write race guard). A read
+calling a function the proxy cannot prove pure is logged at debug level naming the function, so operators
+can populate `pure_functions` from evidence.
+
+Residuals remain, bounded by `ttl_ms`: eviction is at the write REQUEST, not the instant the backend
+commits (a window of the commit latency itself), and — because the proxy has no catalog connection to
+resolve `relkind`/`pg_inherits` or triggers — a cached `SELECT` over a **view** or a **partitioned/
+inherited parent** is evicted by a write naming that relation but NOT by a write to its base table or
+child, and a **trigger-driven** write to another table is invisible to the analysis. A `COMMIT PREPARED`
+on this proxy evicts everything, but a two-phase transaction committed through a **different proxy
+instance** is not seen. It also cannot see
+server-side per-role defaults that postgres does not report (`ALTER ROLE … SET search_path`). **Do not
+enable it for untrusted clients, or any deployment that relies on per-role/invisible search_path or role
+customisation.** Because the proxy already buffers whole response trains in memory, keep `max_bytes`
+modest.
+
+Metrics: `shotover_postgres_read_cache_hits_count`, `shotover_postgres_read_cache_misses_count`,
+`shotover_postgres_read_cache_evictions_count` (entries dropped by write invalidation), and
+`shotover_postgres_read_cache_untracked_execute_count` (an Execute of an untracked portal fell back to
+evict-all — normally zero; a non-zero rate suggests raising the prepared-statement cap).
+
+```yaml
+- PostgresReadCache:
+    name: "read-cache"
+    # How long a cached read is served before it is re-fetched (ms). With invalidate_on_write on this
+    # bounds only the residual races below; keep it short.
+    ttl_ms: 5000
+    # Maximum number of cached entries (optional, default 1024).
+    #max_entries: 1024
+    # Maximum total cached bytes, estimated from response payloads (optional, default 16 MiB). A
+    # result larger than this, or one that would exceed the total, is not cached.
+    #max_bytes: 16777216
+    # Evict cached reads of a table when a write to it is seen (optional, default true). Turn OFF only
+    # in front of a read-only replica where no write can arrive on the same chain.
+    #invalidate_on_write: true
+    # Function names (bare, case-insensitive) you certify as PURE — read-only and deterministic. A read
+    # calling a function that is neither a known-pure builtin nor listed here is treated as a possible
+    # writer: not cached, and it invalidates the cache. List your read-only stored functions to let
+    # their SELECTs cache again (optional, default empty).
+    #pure_functions: ["my_readonly_fn"]
+```
+
+When either bound is reached the cache does NOT evict LRU: it drops expired entries, and if it is still
+full it simply skips caching the new result (existing entries stay until their TTL). So a warm cache at
+its limit stops admitting new entries until TTLs expire — expected, not a bug.
 
 ### QueryCounter
 
@@ -796,6 +934,20 @@ This transform emits a metrics [counter](user-guide/observability.md#counter) na
 ### RequestThrottling
 
 This transform will backpressure requests to Shotover, ensuring that throughput does not exceed the `max_requests_per_second` value.`max_requests_per_second` has a minimum allowed value of 50 to ensure that drivers such as Cassandra are able to complete their startup procedure correctly. In Shotover, a "request" is counted as a query/statement to upstream service. In Cassandra, the list of queries in a BATCH statement are each counted as individual queries. It uses a [Generic Cell Rate Algorithm](https://en.wikipedia.org/wiki/Generic_cell_rate_algorithm).
+
+Supported for **Cassandra** and **Postgres** sources.
+
+For Postgres, only self-contained **simple queries** are rate-limited. Postgres is a stateful,
+in-order protocol, so rejecting an arbitrary extended-protocol message (a lone `Parse`/`Bind`/`Execute`)
+mid-pipeline would desync the session, and startup/auth must never be throttled — those all pass
+through untouched, and only a simple `Query` can be throttled. A throttled request is answered with a
+`53400 configuration_limit_exceeded` error whose `ReadyForQuery` mirrors the session's real transaction
+state, so a rejection inside a transaction does not falsely report the session idle.
+
+One simple `Query` MESSAGE counts as one request regardless of how many statements it contains — unlike
+the Cassandra `BATCH` rule above, `"select 1; select 2; select 3"` in one message is one cell. A client
+can therefore pack many statements into one message and pay a single cell; per-statement counting for
+postgres is a follow-up.
 
 ```yaml
 - RequestThrottling

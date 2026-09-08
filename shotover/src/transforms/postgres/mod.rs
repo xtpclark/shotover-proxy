@@ -1,4 +1,6 @@
 #[cfg(feature = "alpha-transforms")]
+pub mod read_cache;
+#[cfg(feature = "alpha-transforms")]
 pub mod redact_column;
 pub mod sink_cluster;
 pub mod sink_single;
@@ -8,6 +10,21 @@ use crate::frame::Frame;
 use crate::frame::postgres::{FrontendMessage, PostgresFrame};
 use crate::message::{Message, Messages};
 use anyhow::Result;
+use std::time::Duration;
+
+/// A backend accepted the connection but did not produce the next response within `read_timeout`.
+/// Typed so a sink can turn it into a client ErrorResponse + connection close rather than letting the
+/// client hang forever on a backend that stalls mid-answer.
+#[derive(Debug)]
+pub(crate) struct BackendReadTimeout;
+
+impl std::fmt::Display for BackendReadTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "postgres backend did not respond within read_timeout")
+    }
+}
+
+impl std::error::Error for BackendReadTimeout {}
 
 /// Returns true if a request makes the server produce output now.
 ///
@@ -62,6 +79,7 @@ pub(crate) async fn exchange(
     connection: &mut SinkConnection,
     mut requests: Messages,
     outstanding: &mut usize,
+    read_timeout: Option<Duration>,
 ) -> Result<Messages> {
     let trailing = trailing_unanswerable(&mut requests);
     *outstanding += requests.len();
@@ -73,7 +91,22 @@ pub(crate) async fn exchange(
         Some(trailing) => {
             while *outstanding > trailing {
                 let before = responses.len();
-                connection.recv_into(&mut responses).await?;
+                // read_timeout is a true IDLE timeout: recv_into_or_idle_timeout resets the clock on
+                // every inbound socket chunk (SinkConnection stamps activity BELOW the frame layer, so
+                // a whole response train's progress is visible), meaning a large continuously-streaming
+                // result is never cut off — only a backend that produces nothing for the whole timeout
+                // trips it.
+                match read_timeout {
+                    Some(timeout) => {
+                        if !connection
+                            .recv_into_or_idle_timeout(&mut responses, timeout)
+                            .await?
+                        {
+                            return Err(BackendReadTimeout.into());
+                        }
+                    }
+                    None => connection.recv_into(&mut responses).await?,
+                }
                 *outstanding = outstanding.saturating_sub(count_answered(&responses[before..]));
             }
         }

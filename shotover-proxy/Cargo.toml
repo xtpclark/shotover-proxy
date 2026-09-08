@@ -9,6 +9,10 @@ license = "Apache-2.0"
 
 [dependencies]
 shotover = { path = "../shotover", default-features = false }
+# Opt-in (feature "jemalloc"): jemalloc with a background purge thread so freed memory returns to the OS
+# after a large response train — a proxy that served one big result would otherwise retain ~1 GB for its
+# lifetime under glibc (F13). Off by default; enable with `--features jemalloc`.
+tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
 prometheus-parse = "0.2.4"
@@ -54,6 +58,8 @@ pretty_assertions.workspace = true
 [features]
 # Include WIP alpha transforms in the public API
 alpha-transforms = ["shotover/alpha-transforms"]
+# Use jemalloc (with a background purge thread) as the global allocator. Opt-in; see main.rs.
+jemalloc = ["dep:tikv-jemallocator"]
 cassandra = ["shotover/cassandra"]
 kafka = ["shotover/kafka"]
 valkey = ["shotover/valkey"]
