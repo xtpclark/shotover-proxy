@@ -22,6 +22,7 @@
 //! the same session are NOT automatically pinned to the primary, so a session that needs
 //! read-your-writes should wrap the read in a transaction (transactions pin to the primary).
 
+use super::sink_single::default_stream_threshold_bytes;
 use crate::codec::{
     CodecBuilder, Direction,
     postgres::{PostgresCodecBuilder, is_partial_response},
@@ -103,14 +104,24 @@ pub struct PostgresSinkClusterConfig {
     pub read_timeout_ms: Option<u64>,
     /// Bytes of an in-progress response train past which the sink codec emits the accumulated whole
     /// backend messages as a partial chunk, instead of holding the entire result in memory. Applies
-    /// to every backend connection this sink opens, primary and replica alike. `0`, the default,
-    /// never chunks.
+    /// to every backend connection this sink opens, primary and replica alike.
     ///
-    /// Transforms that cannot handle partial trains are refused at startup with an error naming
-    /// them, rather than silently misbehaving — see
-    /// [`PostgresCodecBuilder::with_stream_threshold`]. Still undocumented in the user guide, and
-    /// still defaulted off, until the remaining steps bound memory end to end.
-    #[serde(default)]
+    /// Defaults to 1 MiB. Buffering a whole result costs memory proportional to the RESULT; chunking
+    /// costs memory proportional to the threshold, and delivers the first rows while the rest are
+    /// still arriving. Measured on a 442 MB result: 740-836 MB peak whole-train against 74-84 MB
+    /// chunked, and a backend killed mid-result delivers ~3.1M rows where whole-train delivered none.
+    /// Throughput is unchanged (1023 tps either way, pgbench prepared, 8 clients).
+    ///
+    /// `0` restores whole-train buffering, which is what a chain containing a transform that needs
+    /// whole response trains must set — such a chain is refused at startup with an error naming the
+    /// transform, rather than silently misbehaving. See
+    /// [`PostgresCodecBuilder::with_stream_threshold`].
+    ///
+    /// A SLOW client still accumulates the result in the source's response queue unless
+    /// `response_buffer_batches` is set on the postgres source; see its documentation. Chunking alone
+    /// takes a slow client's 442 MB result from 740-836 MB to 458 MB, and the source-side bound takes
+    /// it to 95 MB.
+    #[serde(default = "default_stream_threshold_bytes")]
     pub stream_threshold_bytes: usize,
     /// Replica addresses to PREFER when routing reads (B2, locality). A read picks a healthy
     /// preferred replica first, then any other healthy replica, then the primary. Entries should be a

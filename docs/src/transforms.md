@@ -497,6 +497,24 @@ connections in this release; md5/SCRAM origination is a follow-up.
     # originate THAT user's replica connections. A user not listed falls back to `password`.
     #replica_users:
     #  app_user: "app_user_backend_password"
+    # Bytes of an in-progress response train past which the sink emits what it has accumulated as a
+    # chunk, instead of holding the whole result in memory. Defaults to 1048576 (1 MiB).
+    #
+    # Buffering a whole result costs memory proportional to the RESULT; chunking costs memory
+    # proportional to this threshold, and starts delivering rows while the rest are still arriving.
+    # Measured on a 442 MB result: 740-836 MB peak buffered against 74-84 MB chunked, and a backend
+    # killed mid-result delivers ~3.1M rows where buffering delivered none. Throughput is unchanged
+    # (1023 tps either way, pgbench prepared, 8 clients).
+    #
+    # A SLOW client still accumulates the whole result in the source's response queue unless
+    # `response_buffer_batches` is set on the Postgres source — see the source documentation. That
+    # takes a slow client's 442 MB result from 458 MB to 95 MB.
+    #
+    # Set 0 to buffer whole trains as before. A chain containing a transform that needs whole
+    # response trains MUST set 0: shotover refuses to start otherwise, with an error naming the
+    # transform. Tee is such a transform.
+    #stream_threshold_bytes: 1048576
+
     # Optional TLS to the backends, as for PostgresSinkSingle.
     #tls:
     #  certificate_authority_path: "tls/ca.crt"
@@ -651,6 +669,24 @@ This transform will send/receive postgres messages to a single postgres instance
     # rows still held inside PostgreSQL's ~8KB send buffer — so set it above your longest SILENT
     # execution time, not just above your network stalls. Unset (the default) waits forever.
     #read_timeout_ms: 30000
+
+    # Bytes of an in-progress response train past which the sink emits what it has accumulated as a
+    # chunk, instead of holding the whole result in memory. Defaults to 1048576 (1 MiB).
+    #
+    # Buffering a whole result costs memory proportional to the RESULT; chunking costs memory
+    # proportional to this threshold, and starts delivering rows while the rest are still arriving.
+    # Measured on a 442 MB result: 740-836 MB peak buffered against 74-84 MB chunked, and a backend
+    # killed mid-result delivers ~3.1M rows where buffering delivered none. Throughput is unchanged
+    # (1023 tps either way, pgbench prepared, 8 clients).
+    #
+    # A SLOW client still accumulates the whole result in the source's response queue unless
+    # `response_buffer_batches` is set on the Postgres source — see the source documentation. That
+    # takes a slow client's 442 MB result from 458 MB to 95 MB.
+    #
+    # Set 0 to buffer whole trains as before. A chain containing a transform that needs whole
+    # response trains MUST set 0: shotover refuses to start otherwise, with an error naming the
+    # transform. Tee is such a transform.
+    #stream_threshold_bytes: 1048576
 
     # When this field is provided TLS is used when connecting to the remote address.
     # Removing this field will disable TLS.
