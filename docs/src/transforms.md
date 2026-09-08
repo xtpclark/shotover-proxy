@@ -510,9 +510,16 @@ connections in this release; md5/SCRAM origination is a follow-up.
     # `response_buffer_batches` is set on the Postgres source — see the source documentation. That
     # takes a slow client's 442 MB result from 458 MB to 95 MB.
     #
+    #
+    # Any non-zero value also tightens this sink's own response queue (a queued batch becomes a chunk
+    # of unbounded size rather than one whole small answer), so a deployment whose results never reach
+    # the threshold still gets tighter backpressure to the backend under deep pipelining. Set 0 if
+    # that matters more than the memory bound.
+    #
     # Set 0 to buffer whole trains as before. A chain containing a transform that needs whole
     # response trains MUST set 0: shotover refuses to start otherwise, with an error naming the
-    # transform. Tee is such a transform.
+    # transform. Tee is such a transform. Setting 0 is also the only way for a PostgresReadCache to
+    # cache results larger than the threshold, since a streamed result is never stored.
     #stream_threshold_bytes: 1048576
 
     # Optional TLS to the backends, as for PostgresSinkSingle.
@@ -547,11 +554,12 @@ Behaviour and limitations of this release:
   on the primary. This trades a little offload for correctness.
 - **Backend auth is trust/cleartext only.** A per-user userlist (`replica_users`) is supported;
   md5/SCRAM origination to replicas is a follow-up.
-- **Whole response trains are buffered in memory.** The codec assembles an entire response (all its
-  `DataRow`s) before forwarding it, and the allocator retains that space, so one large `SELECT` or
-  `COPY TO STDOUT` sizes the proxy's memory for its lifetime (roughly several times the result's wire
-  size). This is architectural (a streaming-train codec is the real fix) and applies to all postgres
-  chains; keep any `PostgresReadCache` `max_bytes` modest on top of it.
+- **Large results stream by default** (`stream_threshold_bytes`, 1 MiB), so a big `SELECT` no longer
+  sizes the proxy's memory for its lifetime: 74-84 MB peak for a 442 MB result, against 740-836 MB
+  when buffered whole. Set `stream_threshold_bytes: 0` to restore whole-train buffering — required
+  for a chain containing a transform that needs whole trains, and the only way to cache results
+  larger than the threshold in a `PostgresReadCache`. A SLOW client still needs
+  `response_buffer_batches` on the source to be bounded; see the source documentation.
 - The writing-function detection used for routing is best-effort (see the note on function
   classification); a `SELECT` that calls an unlisted writing or session-mutating function may be
   routed to a replica.
@@ -683,9 +691,16 @@ This transform will send/receive postgres messages to a single postgres instance
     # `response_buffer_batches` is set on the Postgres source — see the source documentation. That
     # takes a slow client's 442 MB result from 458 MB to 95 MB.
     #
+    #
+    # Any non-zero value also tightens this sink's own response queue (a queued batch becomes a chunk
+    # of unbounded size rather than one whole small answer), so a deployment whose results never reach
+    # the threshold still gets tighter backpressure to the backend under deep pipelining. Set 0 if
+    # that matters more than the memory bound.
+    #
     # Set 0 to buffer whole trains as before. A chain containing a transform that needs whole
     # response trains MUST set 0: shotover refuses to start otherwise, with an error naming the
-    # transform. Tee is such a transform.
+    # transform. Tee is such a transform. Setting 0 is also the only way for a PostgresReadCache to
+    # cache results larger than the threshold, since a streamed result is never stored.
     #stream_threshold_bytes: 1048576
 
     # When this field is provided TLS is used when connecting to the remote address.

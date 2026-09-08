@@ -13,12 +13,13 @@
 //!   - a **write that bypasses the proxy** (direct-to-backend, replication) is not seen;
 //!   - it does not know server-side per-role defaults postgres never reports (`ALTER ROLE … SET
 //!     search_path`), so it stays OFF for multi-tenant / untrusted use (see below);
-//!   - **only when the sink streams** (`stream_threshold_bytes` > 0): a function that changes a
-//!     rendering GUC in its own body (`set_config('timezone', …)`), called in a result large enough
-//!     to be chunked, has its `ParameterStatus` skipped along with the chunk carrying it — so a
-//!     later read on that connection can be keyed under the pre-call GUCs. A top-level `SET` does
-//!     not have this problem (it pins the session and turns the cache off), and at the default
-//!     threshold of 0 the whole train is read and the change is seen.
+//!   - **whenever the sink streams** (`stream_threshold_bytes` > 0), **which is now the DEFAULT**:
+//!     a function that changes a rendering GUC in its own body (`set_config('timezone', …)`), called
+//!     in a result large enough to be chunked, has its `ParameterStatus` skipped along with the chunk
+//!     carrying it — so a later read on that connection can be keyed under the pre-call GUCs. A
+//!     top-level `SET` does not have this problem (it pins the session and turns the cache off).
+//!     Setting `stream_threshold_bytes: 0` on the sink removes this residual, at the cost of
+//!     buffering whole results.
 //!
 //! ## What it does
 //! For a client's simple `Query` that the grammar analysis proves is a pure, replica-safe read (no
@@ -91,6 +92,15 @@
 //!   trailing ReadyForQuery is idle ('I'), never 'T'.
 //! - **Never an error.** A train containing an ErrorResponse is not cached, so a transient error is not
 //!   replayed to other sessions (F8).
+//! ## `max_bytes` above the sink's `stream_threshold_bytes` caches nothing extra
+//! A result that streams arrives as a chunked tail — a fragment, not a whole result — and a fragment
+//! is never stored (caching it would serve a truncated, RowDescription-less row set). So the largest
+//! result that can be cached is the largest one that does NOT chunk: with the sink's default
+//! `stream_threshold_bytes` of 1 MiB, nothing above 1 MiB is cached however high `max_bytes` goes.
+//! Raise `stream_threshold_bytes` above `max_bytes` to cache larger results, and accept the whole-
+//! train memory cost for them. This band changed with the F13 default flip: results between 1 MiB
+//! and `max_bytes` cached before it and do not now, showing up only as sustained misses.
+//!
 //! - **Bounded by BOTH `max_entries` AND `max_bytes`** (estimated payload), so a few large results
 //!   cannot size the proxy's memory (F2). NOTE the proxy already buffers a whole response train in
 //!   memory regardless of the cache (a separate architectural limit), so keep `max_bytes` modest.
@@ -792,7 +802,14 @@ impl Transform for PostgresReadCache {
                     // ReadyForQuery('I'), never an in-transaction train ending in 'T' (F7), and
                     // never the tail of a train whose earlier rows already went out as chunks
                     // (caching that would serve a truncated, RowDescription-less row set).
-                    if !is_chunked_train_tail(response) && response_is_cacheable(response) {
+                    if is_chunked_train_tail(response) {
+                        // Not silent: this is the one reason a cacheable read is never stored no
+                        // matter how often it repeats, and it is invisible in the miss count.
+                        tracing::debug!(
+                            "postgres read cache: not caching a result that streamed in chunks; \
+                             raise stream_threshold_bytes above max_bytes to cache results this large"
+                        );
+                    } else if response_is_cacheable(response) {
                         let size = estimate_response_size(response);
                         self.cache_put(key, response.clone(), size, relations, issued_at);
                     }

@@ -272,7 +272,8 @@ impl PostgresCodecBuilder {
     /// Sets the size, in bytes, past which the sink decoder emits an in-progress response train as
     /// partial chunks rather than accumulate the whole thing (see
     /// [`PostgresDecoder::stream_threshold_bytes`], which records what this does and does not bound
-    /// on its own). `0`, the default, never chunks.
+    /// on its own). `0` never chunks; every caller is a sink passing its configured
+    /// `stream_threshold_bytes`, which defaults to 1 MiB.
     ///
     /// # Which chains may enable it
     ///

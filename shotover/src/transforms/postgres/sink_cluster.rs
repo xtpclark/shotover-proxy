@@ -120,7 +120,13 @@ pub struct PostgresSinkClusterConfig {
     /// A SLOW client still accumulates the result in the source's response queue unless
     /// `response_buffer_batches` is set on the postgres source; see its documentation. Chunking alone
     /// takes a slow client's 442 MB result from 740-836 MB to 458 MB, and the source-side bound takes
-    /// it to 95 MB.
+    /// it to 95 MB.    ///
+    /// Any non-zero value also tightens the sink's own response queue, from
+    /// [`DEFAULT_RESPONSE_BUFFER_BATCHES`](crate::connection::DEFAULT_RESPONSE_BUFFER_BATCHES)
+    /// batches to a few, because a batch stops being one whole small answer and becomes a chunk of
+    /// unbounded size. A deployment whose results never reach the threshold gets none of the memory
+    /// benefit and still gets the tighter queue: under deep pipelining its reader task can park where
+    /// it previously would not, applying backpressure to the backend sooner.
     #[serde(default = "default_stream_threshold_bytes")]
     pub stream_threshold_bytes: usize,
     /// Replica addresses to PREFER when routing reads (B2, locality). A read picks a healthy
