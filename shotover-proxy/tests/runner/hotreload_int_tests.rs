@@ -406,7 +406,7 @@ async fn test_hot_reload_rejected_topology_leaves_the_old_listener_serving() {
     let _compose = docker_compose("tests/test-configs/hotreload/docker-compose.yaml");
 
     let shotover_old = shotover_process("tests/test-configs/hotreload/topology.yaml")
-        .with_log_name("shot_old_reject")
+        .with_log_name("shot_oldrj")
         .with_hotreload_socket(socket_path)
         .with_config("tests/test-configs/shotover-config/config_metrics_disabled.yaml")
         .start()
@@ -418,7 +418,7 @@ async fn test_hot_reload_rejected_topology_leaves_the_old_listener_serving() {
 
     // Tee cannot receive partial trains, and the sink beside it streams by default.
     shotover_process("tests/test-configs/hotreload/topology-invalid.yaml")
-        .with_log_name("shot_new_reject")
+        .with_log_name("shot_newrj")
         .with_hotreload_socket(socket_path)
         .with_config("tests/test-configs/shotover-config/config_metrics_disabled.yaml")
         .assert_fails_to_start(&[EventMatcher::new()

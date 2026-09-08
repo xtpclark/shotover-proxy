@@ -467,8 +467,14 @@ pub struct PostgresDecoder {
     /// it as the whole-train baseline understates what streaming saves by roughly 3.5x and, worse,
     /// under-sizes a deployment that sets `0`.
     ///
-    /// Throughput is unchanged (1023 tps either way, pgbench prepared, 8 clients), and a backend
-    /// killed mid-result delivers ~3.1M rows where whole-train buffering delivered none.
+    /// A backend killed mid-result delivers ~3.1M rows where whole-train buffering delivered none.
+    ///
+    /// Small queries are unaffected, which is what made the default safe to flip: a result under the
+    /// threshold never chunks, so the hot path is byte-identical. pgbench, 16 clients, 20 s,
+    /// prepared, release + jemalloc, `0` vs the 1 MiB default — TPC-B 1735 vs 1796 tps with p99
+    /// 34.06 vs 32.82 ms; SELECT-only 71k vs 82k tps with p99 0.67 vs 0.55 ms. No pair regressed at
+    /// any percentile; the spread is run noise. With a redaction chain the same holds (TPC-B p99
+    /// 34.87 vs 37.82 ms, SELECT-only 0.54 vs 0.54 ms).
     ///
     /// It does NOT yet bound memory to O(threshold). The remaining ~1.6x is the chunks themselves:
     /// [`crate::transforms::postgres::exchange`] collects every chunk of a train before returning,
