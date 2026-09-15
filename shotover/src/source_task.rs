@@ -1,5 +1,6 @@
 use crate::codec::{CodecBuilder, CodecReadError, CodecWriteError};
 use crate::config::chain::TransformChainConfig;
+use crate::connection::{DEFAULT_RESPONSE_BUFFER_BATCHES, sleep_for_duration_or_forever};
 use crate::frame::MessageType;
 use crate::hot_reload::protocol::{
     GradualShutdownRequest, HotReloadListenerRequest, HotReloadListenerResponse,
@@ -20,7 +21,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -30,6 +30,68 @@ use tracing::{Instrument, info, trace};
 use tracing::{debug, error, warn};
 
 const MAX_RETRY_BACKOFF_SECONDS: u64 = 64;
+
+/// How long the client reader task will wait to hand over the last message on a connection that is
+/// closing. Arbitrary, and deliberately short: see [`send_terminal`].
+const TERMINAL_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Best-effort delivery of the error response a client is owed before its connection closes.
+///
+/// Called from the client reader task, which returns immediately afterwards, so it must not park
+/// forever: when the client has stopped reading, the writer task is itself blocked on the socket and
+/// nobody drains the response queue, and an unbounded wait would strand this task for as long as
+/// that lasts. But `try_send` gives up too easily — with `response_buffer_batches` set, a few
+/// batches are queued most of the time while a large result streams, so a client sending malformed
+/// frames would lose its error response and see a bare socket close. A short bounded wait delivers
+/// it whenever the writer is draining at all, and abandons it otherwise.
+async fn send_terminal(out_tx: &mpsc::Sender<Messages>, messages: Messages, within: Duration) {
+    match time::timeout(within, out_tx.send(messages)).await {
+        Ok(Ok(())) => {}
+        // The client hung up first, which is the ordinary way this happens.
+        Ok(Err(_)) => debug!("client closed before its error response could be sent"),
+        Err(_) => {
+            error!("client did not read its error response within {within:?}, closing without it")
+        }
+    }
+}
+
+/// Hands a batch of responses to the writer task.
+///
+/// Awaiting a permit here is what makes a slow client slow the backend down, so this can block for
+/// as long as the client takes to read. Two things must still be able to end that wait:
+///
+/// * shutdown — nothing aborts a connection task, it is only signalled, and a task parked here
+///   is not in `run_loop`'s select to notice. The send is polled FIRST (`biased`) so a channel
+///   with room still delivers the answer it already has: a graceful shutdown is meant to let
+///   in-flight work reach a safe state, and an unbiased select would discard it on a coin flip
+///   whenever the signal arrived while the chain was running.
+/// * the source's idle `timeout`, if the operator set one — otherwise a client that sends a
+///   query and then never reads holds its connection permit, its backend connection and its
+///   buffered chunks forever, and enough of them stop the source accepting anyone. That is the
+///   one thing a bounded channel takes away from the old behaviour, where the send returned
+///   immediately and `run_loop` re-armed the timeout on the next pass.
+///
+/// A free function rather than a method: both call sites still hold a `ChainState` borrowing
+/// `self.chain`, so it can only take the two fields it actually needs.
+async fn send_to_client(
+    shutdown: &mut Shutdown,
+    timeout: Option<Duration>,
+    out_tx: &mpsc::Sender<Messages>,
+    responses: Messages,
+) -> Option<CloseReason> {
+    tokio::select! {
+        biased;
+        result = out_tx.send(responses) => {
+            // the client has disconnected so we should terminate this connection
+            result.err().map(|_| CloseReason::ClientClosed)
+        }
+        _ = shutdown.recv() => Some(CloseReason::ShotoverShutdown),
+        _ = sleep_for_duration_or_forever(timeout) => {
+            info!("client did not read its responses within the configured timeout, closing");
+            Some(CloseReason::ClientClosed)
+        }
+    }
+}
 
 /// Represents a tracked connection with a shutdown sender
 struct TrackedConnection {
@@ -89,6 +151,12 @@ pub(crate) struct SourceTask<C: CodecBuilder> {
     /// Timeout after which to kill an idle connection. No timeout means connections will never be timed out.
     timeout: Option<Duration>,
 
+    /// How many response batches may queue for the client before the chain has to wait. `None`
+    /// means [`DEFAULT_RESPONSE_BUFFER_BATCHES`], which no source could reach before responses
+    /// could be streamed in pieces: one chain run produced at most one response batch, and runs are
+    /// driven by requests that the request channel already caps at the same number.
+    response_buffer_batches: Option<usize>,
+
     connection_handles: Vec<TrackedConnection>,
 
     transport: Transport,
@@ -110,6 +178,7 @@ impl<C: CodecBuilder + 'static> SourceTask<C> {
         limit_connections: Arc<Semaphore>,
         tls: Option<TlsAcceptor>,
         timeout: Option<Duration>,
+        response_buffer_batches: Option<usize>,
         transport: Transport,
         hot_reload_rx: tokio::sync::mpsc::UnboundedReceiver<HotReloadListenerRequest>,
         hot_reload_listeners: &mut HashMap<u16, TcpListener>,
@@ -192,6 +261,7 @@ impl<C: CodecBuilder + 'static> SourceTask<C> {
             connections_accept_failures,
             listener_create_failures,
             timeout,
+            response_buffer_batches,
             connection_handles: vec![],
             transport,
             hot_reload_rx,
@@ -301,6 +371,7 @@ impl<C: CodecBuilder + 'static> SourceTask<C> {
                             tls: self.tls.clone(),
                             pending_requests: PendingRequests::new(self.codec.protocol()),
                             timeout: self.timeout,
+                            response_buffer_batches: self.response_buffer_batches,
                             _permit: permit,
                         };
                         // Spawn a new task to process the connections.
@@ -531,6 +602,7 @@ pub struct Handler<C: CodecBuilder> {
     shutdown: Shutdown,
     /// Timeout in seconds after which to kill an idle connection. No timeout means connections will never be timed out.
     timeout: Option<Duration>,
+    response_buffer_batches: Option<usize>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -543,8 +615,8 @@ pub fn spawn_read_write_tasks<
     rx: R,
     tx: W,
     in_tx: mpsc::Sender<Messages>,
-    mut out_rx: UnboundedReceiver<Messages>,
-    out_tx: UnboundedSender<Messages>,
+    mut out_rx: mpsc::Receiver<Messages>,
+    out_tx: mpsc::Sender<Messages>,
     read_buffer_seed: Option<BytesMut>,
 ) {
     let (decoder, encoder) = codec.build();
@@ -593,9 +665,7 @@ pub fn spawn_read_write_tasks<
                         }
                         Ok(None) => break,
                         Err(CodecReadError::RespondAndThenCloseConnection(messages)) => {
-                            if let Err(err) = out_tx.send(messages) {
-                                error!("Failed to send RespondAndThenCloseConnection message: {err}");
-                            }
+                            send_terminal(&out_tx, messages, TERMINAL_MESSAGE_TIMEOUT).await;
                             return;
                         }
                         Err(err) => {
@@ -618,9 +688,8 @@ pub fn spawn_read_write_tasks<
                                     }
                                 }
                                 Err(CodecReadError::RespondAndThenCloseConnection(messages)) => {
-                                    if let Err(err) = out_tx.send(messages) {
-                                        error!("Failed to send RespondAndThenCloseConnection message: {err}");
-                                    }
+                                    send_terminal(&out_tx, messages, TERMINAL_MESSAGE_TIMEOUT)
+                                        .await;
                                     return;
                                 }
                                 Err(CodecReadError::Parser(err)) => {
@@ -709,7 +778,16 @@ impl<C: CodecBuilder + 'static> Handler<C> {
         // than for the client to send to us, the buffer will grow indefinitely, increasing latency until the buffer triggers an OoM.
         // To avoid that we have currently hardcoded a limit of 10,000 but if we start hitting that in production we should make this user configurable.
         let (in_tx, in_rx) = mpsc::channel::<Messages>(10_000);
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<Messages>();
+        // Bounded, like `in_tx` above and for the same reason. Unset means the historic
+        // 10,000 batches, which no non-streaming source can reach: one chain run emits at most one
+        // response batch, and runs are driven by requests that `in_tx` already caps at 10,000.
+        // Streaming is what decouples response volume from request volume, which is why only the
+        // postgres source exposes this.
+        let (out_tx, out_rx) = mpsc::channel::<Messages>(
+            self.response_buffer_batches
+                .unwrap_or(DEFAULT_RESPONSE_BUFFER_BATCHES)
+                .max(1),
+        );
 
         let local_addr = stream.local_addr()?;
 
@@ -806,7 +884,7 @@ impl<C: CodecBuilder + 'static> Handler<C> {
         client_details: &str,
         local_addr: SocketAddr,
         mut in_rx: mpsc::Receiver<Messages>,
-        out_tx: mpsc::UnboundedSender<Messages>,
+        out_tx: mpsc::Sender<Messages>,
         force_run_chain: Arc<Notify>,
     ) -> Result<CloseReason> {
         // As long as the shutdown signal has not been received, try to read a
@@ -855,7 +933,7 @@ impl<C: CodecBuilder + 'static> Handler<C> {
     async fn send_receive_chain(
         &mut self,
         local_addr: SocketAddr,
-        out_tx: &mpsc::UnboundedSender<Messages>,
+        out_tx: &mpsc::Sender<Messages>,
         requests: Messages,
     ) -> Result<Option<CloseReason>> {
         trace!("running transform chain with requests: {requests:?}");
@@ -872,7 +950,13 @@ impl<C: CodecBuilder + 'static> Handler<C> {
                 );
                 // The connection is going to be closed once we return Err.
                 // So first make a best effort attempt of responding to any pending requests with an error response.
-                out_tx.send(self.pending_requests.to_errors(chain_name, &err))?;
+                // The client is owed these errors, and this is the main task — the writer drains
+                // independently, so waiting for room here cannot deadlock. Dropping them instead
+                // would leave the client with a truncated result and a bare socket close, and under
+                // a slow client (the only reason this channel is bounded) a full channel is the
+                // steady state rather than an anomaly.
+                let errors = self.pending_requests.to_errors(chain_name, &err);
+                send_to_client(&mut self.shutdown, self.timeout, out_tx, errors).await;
                 return Err(err);
             }
         };
@@ -883,9 +967,10 @@ impl<C: CodecBuilder + 'static> Handler<C> {
         if !responses.is_empty() {
             debug!("sending {} responses to client", responses.len());
             trace!("sending response to client: {responses:?}");
-            if out_tx.send(responses).is_err() {
-                // the client has disconnected so we should terminate this connection
-                return Ok(Some(CloseReason::ClientClosed));
+            if let Some(close_reason) =
+                send_to_client(&mut self.shutdown, self.timeout, out_tx, responses).await
+            {
+                return Ok(Some(close_reason));
             }
         }
 
@@ -1085,5 +1170,114 @@ impl PendingRequests {
                 vec![]
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod send_to_client_tests {
+    use super::{CloseReason, Shutdown, TERMINAL_MESSAGE_TIMEOUT, send_terminal, send_to_client};
+    use crate::message::{Message, Messages};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn batch() -> Messages {
+        vec![Message::from_frame(crate::frame::Frame::Dummy)]
+    }
+
+    /// The error response a client is owed must survive a queue that is merely BUSY. Under
+    /// `response_buffer_batches` a few batches are queued most of the time while a large result
+    /// streams, so a `try_send` here drops the message exactly when a client is most likely to need
+    /// it — and it then sees a bare socket close with no reason.
+    #[tokio::test]
+    async fn a_terminal_message_waits_for_room_rather_than_dropping() {
+        let (tx, mut rx) = mpsc::channel::<Messages>(1);
+        tx.send(batch()).await.unwrap();
+
+        // Polled by hand rather than spawned: a spawned sender races the drain below, and would
+        // pass under a `try_send` that happened to find room.
+        let mut sending = std::pin::pin!(send_terminal(&tx, batch(), TERMINAL_MESSAGE_TIMEOUT));
+        assert!(
+            futures::poll!(&mut sending).is_pending(),
+            "the terminal message was abandoned instead of waiting for room"
+        );
+
+        assert!(rx.recv().await.is_some(), "the queued batch went missing");
+        sending.await;
+        assert!(
+            rx.recv().await.is_some(),
+            "the terminal message never reached the client"
+        );
+    }
+
+    /// But it gives up rather than stranding the reader task. A client that has stopped reading
+    /// leaves the writer blocked on its socket, so nothing will ever drain the queue.
+    #[tokio::test]
+    async fn a_terminal_message_gives_up_rather_than_stranding_the_reader() {
+        let (tx, _rx) = mpsc::channel::<Messages>(1);
+        tx.send(batch()).await.unwrap();
+
+        let within = Duration::from_millis(20);
+        tokio::time::timeout(within * 100, send_terminal(&tx, batch(), within))
+            .await
+            .expect("the reader task was stranded on a queue nobody drains");
+    }
+
+    /// Graceful shutdown exists to let in-flight work reach a safe state, so a response the chain
+    /// has ALREADY produced must still be delivered when there is room for it — even though the
+    /// shutdown signal is also ready. `Shutdown::recv` returns immediately once signalled and a
+    /// non-full send completes on its first poll, so an unbiased `select!` would throw the response
+    /// away on roughly half of these iterations.
+    #[tokio::test]
+    async fn an_already_signalled_shutdown_does_not_discard_a_response_that_fits() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+        let mut shutdown = Shutdown::new(shutdown_rx);
+        let (tx, mut rx) = mpsc::channel::<Messages>(1);
+
+        for _ in 0..20 {
+            let reason = send_to_client(&mut shutdown, None, &tx, batch()).await;
+            assert!(
+                reason.is_none(),
+                "a response that fitted was dropped in favour of an already-signalled shutdown"
+            );
+            assert!(rx.recv().await.is_some());
+        }
+    }
+
+    /// But a send with nowhere to go must yield to shutdown rather than wait for a client that may
+    /// never read — nothing aborts a connection task, so this is the only way it ends.
+    #[tokio::test]
+    async fn a_blocked_send_yields_to_shutdown() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+        let mut shutdown = Shutdown::new(shutdown_rx);
+        let (tx, _rx) = mpsc::channel::<Messages>(1);
+        tx.send(batch()).await.unwrap();
+
+        let reason = tokio::time::timeout(
+            Duration::from_millis(100),
+            send_to_client(&mut shutdown, None, &tx, batch()),
+        )
+        .await
+        .expect("a full channel blocked shutdown");
+        assert!(matches!(reason, Some(CloseReason::ShotoverShutdown)));
+    }
+
+    /// And a client that never reads is closed once the source's idle timeout is configured,
+    /// instead of holding its connection slot forever.
+    #[tokio::test]
+    async fn a_blocked_send_gives_up_after_the_idle_timeout() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut shutdown = Shutdown::new(shutdown_rx);
+        let (tx, _rx) = mpsc::channel::<Messages>(1);
+        tx.send(batch()).await.unwrap();
+
+        let reason = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_to_client(&mut shutdown, Some(Duration::from_millis(50)), &tx, batch()),
+        )
+        .await
+        .expect("a client that never reads was never timed out");
+        assert!(matches!(reason, Some(CloseReason::ClientClosed)));
     }
 }

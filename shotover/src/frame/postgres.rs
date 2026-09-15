@@ -271,17 +271,15 @@ impl PostgresFrame {
 
     pub fn as_codec_state(&self) -> PostgresCodecState {
         match self {
-            PostgresFrame::Request(message) => PostgresCodecState {
-                is_request: true,
-                startup: matches!(
-                    message,
-                    FrontendMessage::Startup { .. } | FrontendMessage::CancelRequest { .. }
-                ),
-            },
-            PostgresFrame::Response(_) => PostgresCodecState {
-                is_request: false,
-                startup: false,
-            },
+            PostgresFrame::Request(message) => PostgresCodecState::request(matches!(
+                message,
+                FrontendMessage::Startup { .. } | FrontendMessage::CancelRequest { .. }
+            )),
+            // A frame carries no record of having been a partial chunk, so a message REBUILT from
+            // one via `Message::from_frame` claims to be a whole response. Transforms that branch
+            // on `partial` must mutate a partial in place, which preserves its codec state, rather
+            // than reconstruct it.
+            PostgresFrame::Response(_) => PostgresCodecState::response(),
         }
     }
 }
@@ -1035,6 +1033,17 @@ impl BackendMessage {
             _ => None,
         }
     }
+
+    /// The SQLSTATE code (the `C` field) of an error response, if this is one.
+    pub fn error_code(&self) -> Option<&str> {
+        match self {
+            BackendMessage::ErrorResponse { fields } => fields
+                .iter()
+                .find(|(field_type, _)| *field_type == b'C')
+                .map(|(_, value)| value.as_str()),
+            _ => None,
+        }
+    }
 }
 
 impl Display for PostgresFrame {
@@ -1142,6 +1151,27 @@ pub fn query_name(frame: &PostgresFrame) -> Option<String> {
 
 /// Classifies a request for QueryCounter and QueryTypeFilter.
 /// The result of statically analysing a SQL string with the real postgres grammar.
+/// Transaction-control effect of a statement, from pg_query's `TransactionStmt.kind`. Used by
+/// PostgresReadCache to know when to apply or discard its deferred invalidation across BOTH the simple
+/// and extended protocols (a bare `starts_with("rollback")` wrongly caught `ROLLBACK TO SAVEPOINT`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxnControl {
+    /// BEGIN / START TRANSACTION — opens an explicit transaction.
+    Begin,
+    /// COMMIT / END / PREPARE TRANSACTION — ends it; apply the deferred invalidation. `chain` (AND
+    /// CHAIN) immediately opens a new transaction, so the session stays in one.
+    Commit { chain: bool },
+    /// ROLLBACK / ABORT — ends it; discard the deferred invalidation. `chain` opens a new one.
+    Rollback { chain: bool },
+    /// COMMIT PREPARED — commits a two-phase transaction that may have been PREPAREd on a DIFFERENT
+    /// connection, so its writes are unknown here; a cache must evict everything (review Y7). Runs
+    /// standalone (never inside a transaction block).
+    CommitPrepared,
+    /// SAVEPOINT / RELEASE / ROLLBACK TO / ROLLBACK PREPARED — does NOT end the current transaction (or,
+    /// for ROLLBACK PREPARED, aborts a two-phase txn that committed nothing); keep the deferred set.
+    Nested,
+}
+
 /// Drives both query classification (QueryCounter/QueryTypeFilter) and read/write-split routing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SqlAnalysis {
@@ -1155,6 +1185,24 @@ pub struct SqlAnalysis {
     /// (SET, named PREPARE, LISTEN, DECLARE CURSOR, temp table): once seen, the whole
     /// session must pin to the primary so that state is visible to subsequent requests.
     pub pins_session: bool,
+    /// Relations a pure read reads (pg_query `select_tables`); empty for a non-read. Names are as
+    /// pg_query returns them (schema-qualified iff the SQL qualified them). Used by PostgresReadCache
+    /// to record what a cached entry depends on; the cluster router ignores it.
+    pub reads: Vec<String>,
+    /// Relations a write or DDL targets (`dml_tables` ∪ `ddl_tables`). Used to evict cached reads of
+    /// them on the write path.
+    pub writes: Vec<String>,
+    /// A statement that has an effect but whose target relations are UNKNOWN — a writing function, a
+    /// `DO` block, `CALL`, `COPY ... FROM`, or an unparseable statement — so a cache must evict
+    /// everything rather than risk serving stale data.
+    pub opaque_write: bool,
+    /// Bare, lowercased names of every function the statement CALLS (pg_query `functions`). A read that
+    /// calls a function whose body the proxy cannot see (any user function) might write; PostgresReadCache
+    /// uses this to refuse to cache such a read and to invalidate for it. Empty for a parse failure.
+    pub functions: Vec<String>,
+    /// Present iff the statement is transaction control (BEGIN/COMMIT/…). Lets the cache track
+    /// transaction boundaries precisely and across the extended protocol. `None` for everything else.
+    pub txn: Option<TxnControl>,
 }
 
 /// True if a RangeVar names a temporary relation (relpersistence 't').
@@ -1176,7 +1224,7 @@ fn into_clause_is_temp(into: Option<&pg_query::protobuf::IntoClause>) -> bool {
 /// This list is best-effort and cannot be complete — any volatile or user-defined function may
 /// write, and a `SELECT` that calls one is not detected here. It covers the common built-ins whose
 /// silent misbehaviour on a replica is worst.
-fn is_writing_function(name: &str) -> bool {
+pub(crate) fn is_writing_function(name: &str) -> bool {
     let bare = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
     // Advisory locks in all forms (pg_advisory_lock, pg_try_advisory_xact_lock_shared, …): taking
     // one on a replica silently breaks the mutual exclusion the caller intended.
@@ -1224,6 +1272,12 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
                 query_type: query_type_by_keyword(sql),
                 replica_safe: false,
                 pins_session: false,
+                reads: Vec::new(),
+                writes: Vec::new(),
+                // Unparseable and not provably a read: a cache must assume it could have written.
+                opaque_write: true,
+                functions: Vec::new(),
+                txn: None,
             };
         }
     };
@@ -1257,6 +1311,16 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
     let mut saw_read = false;
     let mut saw_write = writes_tables || has_row_lock;
     let mut saw_ddl = ddl_tables;
+    // For PostgresReadCache invalidation: a data write whose target tables cannot be enumerated (a
+    // stored-procedure CALL, a DO block, COPY FROM, or an unrecognised node) — the cache must then
+    // evict EVERYTHING, not a named set. Deliberately NOT set by SET/PREPARE/BEGIN/COMMIT/SELECT FOR
+    // UPDATE/nextval(): those dirty no cached table, so evicting on them would gut the cache.
+    let mut opaque_write = false;
+    // A positively-identified INSERT/UPDATE/DELETE/MERGE node; paired with the extracted write targets
+    // below as a backstop — a DML node seen with no target surfaced falls back to evict-all.
+    let mut saw_dml_node = false;
+    // Transaction control (BEGIN/COMMIT/…), for the cache's transaction tracking.
+    let mut txn_control: Option<TxnControl> = None;
 
     for stmt in &parsed.protobuf.stmts {
         let Some(node) = stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
@@ -1304,6 +1368,15 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
                 replica_safe = false;
                 pins_session = true;
             }
+            // DISCARD resets state that belongs to one backend: TEMP drops this session's
+            // temporary tables, PLANS its cached plans, SEQUENCES its sequence state, ALL of those
+            // plus prepared statements, cursors and GUCs. So it must run on the node the session
+            // keeps using, and a later read that depends on the reset must not diverge to a replica
+            // that never saw it. Previously unmodelled, and so replica-eligible.
+            NodeEnum::DiscardStmt(_) => {
+                replica_safe = false;
+                pins_session = true;
+            }
             NodeEnum::PrepareStmt(_)
             | NodeEnum::DeclareCursorStmt(_)
             | NodeEnum::ListenStmt(_)
@@ -1325,22 +1398,46 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
                     pins_session = true;
                 }
             }
-            NodeEnum::TransactionStmt(_) => {
+            NodeEnum::TransactionStmt(txn) => {
                 // Transaction control is routed to the primary/current node by the router.
                 replica_safe = false;
+                // Use the typed enum (the protobuf enum prepends an UNDEFINED=0 sentinel, so raw ints
+                // are +1 from PostgreSQL's C enum). PREPARE TRANSACTION is treated as a commit (apply
+                // deferred invalidation conservatively — the prepared txn will commit, maybe elsewhere);
+                // SAVEPOINT/RELEASE/ROLLBACK TO/COMMIT-or-ROLLBACK PREPARED do NOT end this transaction.
+                use pg_query::protobuf::TransactionStmtKind::*;
+                txn_control = Some(match txn.kind() {
+                    TransStmtBegin | TransStmtStart => TxnControl::Begin,
+                    TransStmtCommit | TransStmtPrepare => TxnControl::Commit { chain: txn.chain },
+                    TransStmtRollback => TxnControl::Rollback { chain: txn.chain },
+                    TransStmtCommitPrepared => TxnControl::CommitPrepared,
+                    _ => TxnControl::Nested,
+                });
             }
             NodeEnum::InsertStmt(_)
             | NodeEnum::UpdateStmt(_)
             | NodeEnum::DeleteStmt(_)
-            | NodeEnum::MergeStmt(_)
-            | NodeEnum::CopyStmt(_) => {
+            | NodeEnum::MergeStmt(_) => {
                 saw_write = true;
                 replica_safe = false;
+                saw_dml_node = true;
             }
-            // Anything not positively identified as a read is treated as a write.
+            NodeEnum::CopyStmt(copy) => {
+                saw_write = true;
+                replica_safe = false;
+                // COPY ... FROM bulk-writes its target, which the table extractor does not surface;
+                // COPY ... TO is a read but the router already sends every COPY to the primary, so
+                // treating the write direction as opaque (evict-all) is consistent and safe.
+                if copy.is_from {
+                    opaque_write = true;
+                }
+            }
+            // Anything not positively identified as a read is treated as a write. This includes CALL
+            // and DO, which run arbitrary DML the parser cannot see into — so evict everything.
             _ => {
                 replica_safe = false;
                 saw_write = true;
+                opaque_write = true;
             }
         }
     }
@@ -1355,10 +1452,36 @@ pub fn analyze_sql(sql: &str) -> SqlAnalysis {
         QueryType::ReadWrite
     };
 
+    // Cache dependency tracking: a read's relations (to record), a write's relations (to evict), and
+    // whether a write's targets are unknown (evict everything). A session-state statement (SET, …) is
+    // NOT a data write, so it never triggers eviction.
+    let mut writes = parsed.dml_tables();
+    writes.extend(parsed.ddl_tables());
+    writes.sort();
+    writes.dedup();
+    let reads = if replica_safe {
+        parsed.select_tables()
+    } else {
+        Vec::new()
+    };
+    // Backstop: a DML node whose target the extractor did not surface (e.g. a grammar shape a future
+    // pg_query misses) must evict everything rather than silently keep stale reads.
+    if saw_dml_node && writes.is_empty() {
+        opaque_write = true;
+    }
+
     SqlAnalysis {
         query_type,
         replica_safe,
         pins_session,
+        reads,
+        writes,
+        opaque_write,
+        functions: functions
+            .iter()
+            .map(|f| f.rsplit('.').next().unwrap_or(f).to_ascii_lowercase())
+            .collect(),
+        txn: txn_control,
     }
 }
 
@@ -1534,6 +1657,11 @@ mod tests {
             "LISTEN channel",
             "DECLARE c CURSOR FOR SELECT * FROM t",
             "CREATE TEMP TABLE tmp (a int)",
+            // DISCARD's reset is per backend (temp tables, cached plans, sequence state,
+            // prepared statements, GUCs), so the session must pin to the node that ran it.
+            "DISCARD ALL",
+            "DISCARD PLANS",
+            "DISCARD TEMP",
         ] {
             let a = analyze_sql(sql);
             assert!(a.pins_session, "expected session pin: {sql}");
@@ -1543,9 +1671,69 @@ mod tests {
 
     #[test]
     fn test_analyze_unparseable_is_conservative() {
-        // Garbage that libpg_query rejects must never be called replica-safe.
+        // Garbage that libpg_query rejects must never be called replica-safe, and — because it could
+        // be a write to anything — must invalidate the whole cache.
         let a = analyze_sql("NOT VALID SQL @#$");
         assert!(!a.replica_safe);
+        assert!(a.opaque_write);
+        assert!(a.writes.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_cache_dependencies() {
+        // A pure read names its tables and is not any kind of write.
+        let read = analyze_sql("SELECT id FROM accounts JOIN orders USING (id)");
+        assert!(read.reads.contains(&"accounts".to_owned()));
+        assert!(read.reads.contains(&"orders".to_owned()));
+        assert!(read.writes.is_empty());
+        assert!(!read.opaque_write);
+
+        // Named DML surfaces its target for a targeted eviction, and is not opaque.
+        for (sql, table) in [
+            ("INSERT INTO t (a) VALUES (1)", "t"),
+            ("UPDATE t SET a = 1", "t"),
+            ("DELETE FROM t WHERE a = 1", "t"),
+        ] {
+            let a = analyze_sql(sql);
+            assert!(a.writes.contains(&table.to_owned()), "{sql} names {table}");
+            assert!(!a.opaque_write, "{sql} is not opaque");
+            assert!(a.reads.is_empty(), "{sql} caches nothing");
+        }
+
+        // A CTE-hidden write is still caught as a named write, not missed.
+        let cte = analyze_sql("WITH x AS (INSERT INTO audit VALUES (1) RETURNING *) SELECT * FROM x");
+        assert!(cte.writes.contains(&"audit".to_owned()));
+        assert!(!cte.opaque_write);
+
+        // Unenumerable writes evict everything: stored-procedure CALL, DO block, COPY FROM.
+        for sql in ["CALL do_stuff()", "DO $$ BEGIN END $$", "COPY t FROM STDIN"] {
+            assert!(analyze_sql(sql).opaque_write, "{sql} is opaque");
+        }
+
+        // COPY ... TO is a read direction — it must NOT evict the whole cache.
+        assert!(!analyze_sql("COPY t TO STDOUT").opaque_write);
+
+        // Called functions are surfaced (bare, lowercased) so the cache can judge a read's purity.
+        let f = analyze_sql("SELECT COUNT(*), Upper(name) FROM t");
+        assert!(f.functions.contains(&"count".to_owned()));
+        assert!(f.functions.contains(&"upper".to_owned()));
+        assert!(analyze_sql("SELECT log_ev('x')").functions.contains(&"log_ev".to_owned()));
+        assert!(analyze_sql("INSERT INTO t VALUES (1)").functions.is_empty());
+
+        // The cache-gutting false positives are excluded: transaction control, row locks, SET, and
+        // sequence bumps change no cached table, so they invalidate nothing.
+        for sql in [
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "SELECT * FROM t FOR UPDATE",
+            "SET search_path TO x",
+            "SELECT nextval('s')",
+        ] {
+            let a = analyze_sql(sql);
+            assert!(!a.opaque_write, "{sql} must not evict the whole cache");
+            assert!(a.writes.is_empty(), "{sql} names no write target");
+        }
     }
 
     #[test]
@@ -1572,20 +1760,6 @@ mod tests {
         frame
     }
 
-    fn request_state(startup: bool) -> PostgresCodecState {
-        PostgresCodecState {
-            is_request: true,
-            startup,
-        }
-    }
-
-    fn response_state() -> PostgresCodecState {
-        PostgresCodecState {
-            is_request: false,
-            startup: false,
-        }
-    }
-
     /// A startup message as sent by psql: protocol 3.0, user and database parameters.
     #[test]
     fn test_startup_round_trip() {
@@ -1601,7 +1775,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        let frame = round_trip(&bytes, request_state(true));
+        let frame = round_trip(&bytes, PostgresCodecState::request(true));
         match frame {
             PostgresFrame::Request(FrontendMessage::Startup {
                 protocol_version,
@@ -1624,7 +1798,7 @@ mod tests {
         .encode(&mut bytes)
         .unwrap();
         assert_eq!(bytes.len(), 16);
-        round_trip(&bytes, request_state(true));
+        round_trip(&bytes, PostgresCodecState::request(true));
     }
 
     #[test]
@@ -1636,7 +1810,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        let frame = round_trip(&bytes, request_state(false));
+        let frame = round_trip(&bytes, PostgresCodecState::request(false));
         assert_eq!(crate::message::QueryType::Read, query_type(&frame));
     }
 
@@ -1650,7 +1824,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        let frame = round_trip(&bytes, request_state(false));
+        let frame = round_trip(&bytes, PostgresCodecState::request(false));
         assert_eq!(crate::message::QueryType::Write, query_type(&frame));
 
         let mut bytes = BytesMut::new();
@@ -1663,7 +1837,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        round_trip(&bytes, request_state(false));
+        round_trip(&bytes, PostgresCodecState::request(false));
 
         for message in [
             FrontendMessage::Describe {
@@ -1684,7 +1858,7 @@ mod tests {
         ] {
             let mut bytes = BytesMut::new();
             message.encode(&mut bytes).unwrap();
-            round_trip(&bytes, request_state(false));
+            round_trip(&bytes, PostgresCodecState::request(false));
         }
     }
 
@@ -1731,7 +1905,7 @@ mod tests {
         ] {
             message.encode(&mut bytes).unwrap();
         }
-        let frame = round_trip(&bytes, response_state());
+        let frame = round_trip(&bytes, PostgresCodecState::response());
         match &frame {
             PostgresFrame::Response(messages) => {
                 assert_eq!(messages.len(), 5);
@@ -1766,7 +1940,7 @@ mod tests {
         ] {
             message.encode(&mut bytes).unwrap();
         }
-        round_trip(&bytes, response_state());
+        round_trip(&bytes, PostgresCodecState::response());
     }
 
     /// SASL authentication messages: SCRAM-SHA-256 offer, continue, final.
@@ -1778,7 +1952,7 @@ mod tests {
         })
         .encode(&mut bytes)
         .unwrap();
-        let frame = round_trip(&bytes, response_state());
+        let frame = round_trip(&bytes, PostgresCodecState::response());
         match frame {
             PostgresFrame::Response(messages) => match &messages[0] {
                 BackendMessage::Authentication(AuthenticationMessage::Sasl { mechanisms }) => {
@@ -1795,13 +1969,13 @@ mod tests {
         })
         .encode(&mut bytes)
         .unwrap();
-        round_trip(&bytes, response_state());
+        round_trip(&bytes, PostgresCodecState::response());
 
         let mut bytes = BytesMut::new();
         FrontendMessage::AuthenticationData(Bytes::from_static(b"n,,n=,r=clientnonce"))
             .encode(&mut bytes)
             .unwrap();
-        round_trip(&bytes, request_state(false));
+        round_trip(&bytes, PostgresCodecState::request(false));
     }
 
     #[test]
@@ -1820,7 +1994,7 @@ mod tests {
         ] {
             message.encode(&mut bytes).unwrap();
         }
-        let frame = round_trip(&bytes, response_state());
+        let frame = round_trip(&bytes, PostgresCodecState::response());
         match frame {
             PostgresFrame::Response(messages) => {
                 assert_eq!(
@@ -1841,7 +2015,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        round_trip(&bytes, response_state());
+        round_trip(&bytes, PostgresCodecState::response());
 
         let mut bytes = BytesMut::new();
         for message in [
@@ -1851,7 +2025,7 @@ mod tests {
             message.encode(&mut bytes).unwrap();
             let length = message_wire_length(&bytes, false).unwrap().unwrap();
             let message_bytes = bytes.split_to(length);
-            round_trip(&message_bytes, request_state(false));
+            round_trip(&message_bytes, PostgresCodecState::request(false));
         }
 
         let mut bytes = BytesMut::new();
@@ -1860,7 +2034,7 @@ mod tests {
         }
         .encode(&mut bytes)
         .unwrap();
-        round_trip(&bytes, request_state(false));
+        round_trip(&bytes, PostgresCodecState::request(false));
     }
 
     /// An unknown tag must parse to Raw and round trip byte identically.
@@ -1870,7 +2044,7 @@ mod tests {
         bytes.put_u8(b'!');
         bytes.put_i32(9);
         bytes.extend_from_slice(b"weird");
-        let frame = round_trip(&bytes, request_state(false));
+        let frame = round_trip(&bytes, PostgresCodecState::request(false));
         match frame {
             PostgresFrame::Request(FrontendMessage::Raw { tag, body }) => {
                 assert_eq!(tag, b'!');
@@ -1888,7 +2062,7 @@ mod tests {
         bytes.put_u8(b'T');
         bytes.put_i32(6);
         bytes.put_i16(999);
-        let frame = round_trip(&bytes, response_state());
+        let frame = round_trip(&bytes, PostgresCodecState::response());
         match frame {
             PostgresFrame::Response(messages) => {
                 assert!(matches!(messages[0], BackendMessage::Raw { tag: b'T', .. }));

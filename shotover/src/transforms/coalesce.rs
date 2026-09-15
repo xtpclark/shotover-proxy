@@ -74,6 +74,10 @@ impl TransformConfig for CoalesceConfig {
     fn get_sub_chain_configs(&self) -> Vec<(&crate::config::chain::TransformChainConfig, String)> {
         vec![]
     }
+
+    fn accepts_partial_responses(&self) -> bool {
+        true
+    }
 }
 
 impl TransformBuilder for CoalesceBuilder {

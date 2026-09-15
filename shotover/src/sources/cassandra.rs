@@ -48,6 +48,9 @@ impl CassandraSourceConfig {
             Arc::new(Semaphore::new(self.connection_limit.unwrap_or(512))),
             self.tls.as_ref().map(TlsAcceptor::new).transpose()?,
             self.timeout.map(Duration::from_secs),
+            // Response buffering: unbounded, as this source has always been. Only the postgres
+            // source exposes a bound, because only it streams a response in pieces.
+            None,
             self.transport.unwrap_or(Transport::Tcp),
             hot_reload_rx,
             hot_reload_listeners,

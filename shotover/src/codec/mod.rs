@@ -151,4 +151,15 @@ pub trait CodecBuilder: Clone + Send {
     fn new(direction: Direction, destination_name: String) -> Self;
 
     fn protocol(&self) -> MessageType;
+
+    /// How many response batches [`SinkConnection`](crate::connection::SinkConnection)'s reader task
+    /// may queue ahead of the transform chain.
+    ///
+    /// Defaults to [`DEFAULT_RESPONSE_BUFFER_BATCHES`](crate::connection::DEFAULT_RESPONSE_BUFFER_BATCHES),
+    /// which is effectively unbounded while a batch is one whole response. A codec configured to
+    /// emit a large response in pieces must override this, because then a batch is a chunk and the
+    /// queue's size in bytes is unbounded.
+    fn response_buffer_batches(&self) -> usize {
+        crate::connection::DEFAULT_RESPONSE_BUFFER_BATCHES
+    }
 }

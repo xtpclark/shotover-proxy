@@ -9,6 +9,7 @@
   - [Observability](./user-guide/observability.md)
   - [Hot Reload](./user-guide/hot_reload.md)
   - [Custom Transforms](./user-guide/writing-custom-transforms.md)
+  - [PostgreSQL Deployment](./user-guide/postgres-deployment.md)
 - [Sources](./sources.md)
 - [Transforms](./transforms.md)
 - [Examples]()

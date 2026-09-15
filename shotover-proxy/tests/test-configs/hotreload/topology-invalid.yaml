@@ -1,0 +1,36 @@
+# The hot reload topology plus a postgres chain that cannot start: Tee needs whole response trains,
+# and since streaming became the default the postgres sink beside it emits partial ones. Used to
+# check that shotover refuses this BEFORE asking the running instance for its listeners — that
+# handoff closes the originals, so a refusal after it would leave nothing bound to 6380.
+#
+# The sink addresses are deliberately ports nothing listens on: validation refuses this topology
+# before any sink connects, and an edit that made it valid should fail loudly rather than quietly
+# reach a real postgres.
+sources:
+- Valkey:
+    name: "valkey-source"
+    listen_addr: "127.0.0.1:6380"
+    chain:
+      - QueryCounter:
+          name: "query-counter"
+          counter_name: "valkey-query-counter"
+      - ValkeySinkSingle:
+          name: "valkey-sink"
+          remote_address: "127.0.0.1:6379"
+          connect_timeout_ms: 5000
+- Postgres:
+    name: "postgres-source"
+    listen_addr: "127.0.0.1:15432"
+    chain:
+      - Tee:
+          name: "tee"
+          chain:
+            - PostgresSinkSingle:
+                name: "teed-sink"
+                remote_address: "127.0.0.1:5499"
+                connect_timeout_ms: 3000
+                stream_threshold_bytes: 0
+      - PostgresSinkSingle:
+          name: "postgres-sink"
+          remote_address: "127.0.0.1:5499"
+          connect_timeout_ms: 3000

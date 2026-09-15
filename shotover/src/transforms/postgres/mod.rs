@@ -1,13 +1,31 @@
 #[cfg(feature = "alpha-transforms")]
+pub mod read_cache;
+#[cfg(feature = "alpha-transforms")]
 pub mod redact_column;
 pub mod sink_cluster;
 pub mod sink_single;
 
+use crate::codec::postgres::is_partial_response;
 use crate::connection::SinkConnection;
 use crate::frame::Frame;
 use crate::frame::postgres::{FrontendMessage, PostgresFrame};
 use crate::message::{Message, Messages};
 use anyhow::Result;
+use std::time::Duration;
+
+/// A backend accepted the connection but did not produce the next response within `read_timeout`.
+/// Typed so a sink can turn it into a client ErrorResponse + connection close rather than letting the
+/// client hang forever on a backend that stalls mid-answer.
+#[derive(Debug)]
+pub(crate) struct BackendReadTimeout;
+
+impl std::fmt::Display for BackendReadTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "postgres backend did not respond within read_timeout")
+    }
+}
+
+impl std::error::Error for BackendReadTimeout {}
 
 /// Returns true if a request makes the server produce output now.
 ///
@@ -50,6 +68,32 @@ fn trailing_unanswerable(requests: &mut [Message]) -> Option<usize> {
         .map(|last_flush| requests.len() - 1 - last_flush)
 }
 
+/// Waits for more of a backend's response, under the idle timeout the sink configured.
+///
+/// `read_timeout` is a true IDLE timeout: `recv_into_or_idle_timeout` resets the clock on every
+/// inbound socket chunk (`SinkConnection` stamps activity BELOW the frame layer, so a whole response
+/// train's progress is visible), so a large continuously-streaming result is never cut off — only a
+/// backend that produces nothing for the whole timeout trips it. Unset means wait forever, which is
+/// the documented default.
+pub(crate) async fn recv_under_idle_timeout(
+    connection: &mut SinkConnection,
+    responses: &mut Messages,
+    read_timeout: Option<Duration>,
+) -> Result<()> {
+    match read_timeout {
+        Some(timeout) => {
+            if !connection
+                .recv_into_or_idle_timeout(responses, timeout)
+                .await?
+            {
+                return Err(BackendReadTimeout.into());
+            }
+        }
+        None => connection.recv_into(responses).await?,
+    }
+    Ok(())
+}
+
 /// Sends one batch of requests to a backend and reads the responses the server produces for it.
 ///
 /// `outstanding` tracks requests still awaiting a response ACROSS batches (each request eventually
@@ -58,10 +102,15 @@ fn trailing_unanswerable(requests: &mut [Message]) -> Option<usize> {
 /// for this batch — everything up to and including its last flush point — and leaves any trailing
 /// partial pipeline outstanding for the batch that carries the next flush point. A batch with no
 /// flush point at all does not block: its responses arrive later.
+///
+/// It may also return with a response train still arriving, rather than holding a whole large
+/// result here — see [`train_in_flight`], which is how a caller must decide that, never by which
+/// path this took.
 pub(crate) async fn exchange(
     connection: &mut SinkConnection,
     mut requests: Messages,
     outstanding: &mut usize,
+    read_timeout: Option<Duration>,
 ) -> Result<Messages> {
     let trailing = trailing_unanswerable(&mut requests);
     *outstanding += requests.len();
@@ -72,9 +121,11 @@ pub(crate) async fn exchange(
         // The batch has a flush point: drain everything except the trailing partial pipeline.
         Some(trailing) => {
             while *outstanding > trailing {
-                let before = responses.len();
-                connection.recv_into(&mut responses).await?;
-                *outstanding = outstanding.saturating_sub(count_answered(&responses[before..]));
+                recv_and_account(connection, &mut responses, outstanding, read_timeout).await?;
+                // Hand chunks up the chain as they arrive instead of holding the whole train here.
+                if train_in_flight(&responses) {
+                    return Ok(responses);
+                }
             }
         }
         // No flush point: grab any responses already available (e.g. the dummy responses the
@@ -87,9 +138,37 @@ pub(crate) async fn exchange(
     Ok(responses)
 }
 
+/// Receives more of a response and reconciles `outstanding` with what arrived.
+///
+/// Both halves or neither: a response that answers a request but goes uncounted leaves
+/// `outstanding` high, and the next [`exchange`] then blocks for a reply already delivered.
+pub(crate) async fn recv_and_account(
+    connection: &mut SinkConnection,
+    responses: &mut Messages,
+    outstanding: &mut usize,
+    read_timeout: Option<Duration>,
+) -> Result<()> {
+    let before = responses.len();
+    recv_under_idle_timeout(connection, responses, read_timeout).await?;
+    *outstanding = outstanding.saturating_sub(count_answered(&responses[before..]));
+    Ok(())
+}
+
+/// Whether a response train is still arriving, judged from what was actually received: the last
+/// message in hand is one of its chunks.
+///
+/// This is the ONLY safe test. A train's chunks carry no request id and only its final message
+/// does, so "the last message is a partial" is exactly "more of this train is coming". Deriving it
+/// any other way has been wrong every time it was tried: counting id-carrying responses breaks when
+/// one receive delivers the end of one train and the start of the next, and asking which code path
+/// ran breaks when a batch with no flush point is sent while a train is still arriving.
+pub(crate) fn train_in_flight(responses: &[Message]) -> bool {
+    responses.last().is_some_and(is_partial_response)
+}
+
 /// The number of responses that answer a request (i.e. carry a request id). Unrequested responses
 /// (asynchronous notices, parameter-status changes, notifications) do not decrement `outstanding`.
-fn count_answered(responses: &[Message]) -> usize {
+pub(crate) fn count_answered(responses: &[Message]) -> usize {
     responses
         .iter()
         .filter(|r| r.request_id().is_some())

@@ -57,6 +57,18 @@ impl TransformConfig for QueryTypeFilterConfig {
     fn get_sub_chain_configs(&self) -> Vec<(&crate::config::chain::TransformChainConfig, String)> {
         vec![]
     }
+
+    /// `true`: filtering happens on the request side, and the response side only ever REPLACES a
+    /// response whose `request_id` matches a request this transform filtered out. A partial chunk
+    /// carries no request id, so it never matches and is forwarded untouched — no body is inspected
+    /// and nothing assumes a whole train. Same streaming argument as `RequestThrottling`.
+    ///
+    /// This says nothing about whether the transform is USEFUL in front of a given sink; the postgres
+    /// note in `docs/src/sources.md` covers that, and `AllowList` mode remains unusable there for
+    /// reasons unrelated to streaming.
+    fn accepts_partial_responses(&self) -> bool {
+        true
+    }
 }
 
 impl TransformBuilder for QueryTypeFilter {
