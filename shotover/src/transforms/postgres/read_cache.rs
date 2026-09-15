@@ -832,6 +832,13 @@ impl Transform for PostgresReadCache {
                     // is the cost, so gating it on `size` is the whole win — and it holds for a
                     // transform-MODIFIED train (e.g. one PostgresRedactColumn rewrote in place), whose
                     // raw wire form is gone but whose frame still measures.
+                    //
+                    // That measurement PREDATES streaming being on by default, and a 442 MB result no
+                    // longer reaches this branch at all under the shipped configuration — it streams,
+                    // and the chunked-tail guard above refuses it first. The clone gate still earns
+                    // its place in the two cases that do reach here: a sink opted out with
+                    // `stream_threshold_bytes: 0`, and a result under the streaming threshold but
+                    // over `max_bytes`. Do not read 4681 -> 2583 MB as current default behaviour.
                     if !is_chunked_train_tail(response) && response_is_cacheable(response) {
                         let size = estimate_response_size(response);
                         if size != 0 && size <= self.max_bytes {

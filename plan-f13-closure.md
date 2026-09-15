@@ -1,8 +1,10 @@
 # F13 streaming response trains — closed
 
 Steps 2 through 6 are done and cold-re-verified on an independent rig. Branch
-`f13-step6-stream-by-default` @ `6601aa34` on the **fork**
-(`github.com/xtpclark/shotover-proxy`); each step sits on the one before it.
+`f13-step6-stream-by-default` on the **fork** (`github.com/xtpclark/shotover-proxy`); each step sits
+on the one before it. No SHA here on purpose: this file is committed inside the commit it would name,
+so any hash it carries is wrong the moment it is written, and the stack has already been rebased once
+(from base `aa1716f4` onto `postgres-capabilities`) which invalidated every hash in circulation.
 
 | step | branch | what it did |
 |---|---|---|
